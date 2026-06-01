@@ -2,4 +2,4 @@
 //! so it can be exercised directly from tests.
 
 pub mod document;
-pub mod lexer;
+pub mod document_graph;
