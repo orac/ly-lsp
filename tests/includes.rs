@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use ly_lsp::document_graph::DocumentGraph;
-use tower_lsp::lsp_types::{Location, Position, Range, Url};
+use tower_lsp::lsp_types::{DiagnosticSeverity, Location, Position, Range, Url};
 
 fn url(path: &Path) -> Url {
     Url::from_file_path(path).expect("absolute path")
@@ -162,4 +162,100 @@ fn references_with_declaration_include_the_definition() {
 /// A single-line range from `start` to `end` columns.
 fn line_range(line: u32, start: u32, end: u32) -> Range {
     Range::new(Position::new(line, start), Position::new(line, end))
+}
+
+#[test]
+fn undefined_reference_is_flagged_but_builtins_and_includes_are_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let words = dir.path().join("lilypond-words");
+    let shared = dir.path().join("shared.ily");
+    let score = dir.path().join("score.ly");
+    // Built-in commands carry a backslash; note names don't.
+    fs::write(&words, "\\relative\n\\new\nc\ncis'\n").unwrap();
+    fs::write(&shared, "melody = { c }\n").unwrap();
+    // `\relative` is a builtin, `\melody` is defined in the include, `\wibble`
+    // is neither.
+    fs::write(
+        &score,
+        "\\include \"shared.ily\"\n\\relative c' { \\melody }\n\\wibble\n",
+    )
+    .unwrap();
+
+    let ws = DocumentGraph::new();
+    assert!(ws.load_builtins(&words));
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    let diagnostics = ws.diagnostics(&url(&score));
+    assert_eq!(diagnostics.len(), 1, "only \\wibble should be flagged");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert!(diagnostic.message.contains("\\wibble"));
+    assert_eq!(diagnostic.range, line_range(2, 0, 7));
+}
+
+#[test]
+fn include_resolves_through_search_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let lib = dir.path().join("lib");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&lib).unwrap();
+
+    let common = lib.join("common.ily");
+    let score = project.join("score.ly");
+    // common.ily lives only in the lib directory, reachable via `-I lib`.
+    fs::write(&common, "melody = { c }\n").unwrap();
+    fs::write(&score, "\\include \"common.ily\"\n\\melody\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.set_search_paths(vec![lib.clone()]);
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    // Go-to-definition on `\melody` finds the file in the search path.
+    let locations = ws.goto_definition(&url(&score), Position::new(1, 2));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, url(&common));
+
+    // And go-to-definition on the include path itself jumps there too.
+    let to_file = ws.goto_definition(&url(&score), Position::new(0, 12));
+    assert_eq!(to_file.len(), 1);
+    assert_eq!(to_file[0].uri, url(&common));
+}
+
+#[test]
+fn including_directory_takes_precedence_over_search_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let lib = dir.path().join("lib");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&lib).unwrap();
+
+    // The same filename exists in both places; the local one should win.
+    let local = project.join("common.ily");
+    fs::write(&local, "melody = { c }\n").unwrap();
+    fs::write(lib.join("common.ily"), "melody = { d }\n").unwrap();
+    let score = project.join("score.ly");
+    fs::write(&score, "\\include \"common.ily\"\n\\melody\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.set_search_paths(vec![lib]);
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    let locations = ws.goto_definition(&url(&score), Position::new(1, 2));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, url(&local));
+}
+
+#[test]
+fn undefined_reference_diagnostics_are_off_without_builtins() {
+    let dir = tempfile::tempdir().unwrap();
+    let score = dir.path().join("score.ly");
+    // `\wibble` is undefined, but with no builtin list we cannot tell it from a
+    // built-in command, so we stay silent.
+    fs::write(&score, "\\wibble\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    assert!(ws.diagnostics(&url(&score)).is_empty());
 }

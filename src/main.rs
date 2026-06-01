@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -17,11 +19,52 @@ impl Backend {
             documents: DocumentGraph::new(),
         }
     }
+
+    /// Computes and publishes syntax diagnostics for `uri`.
+    async fn publish_diagnostics(&self, uri: Url, version: Option<i32>) {
+        let diagnostics = self.documents.diagnostics(&uri);
+        self.client
+            .publish_diagnostics(uri, diagnostics, version)
+            .await;
+    }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // The client tells us where LilyPond's `lilypond-words` file lives so we
+        // can recognise built-in commands; without it, undefined-reference
+        // diagnostics stay off.
+        let options = params.initialization_options;
+
+        if let Some(path) = options
+            .as_ref()
+            .and_then(|opts| opts.get("lilypondWordsPath"))
+            .and_then(|value| value.as_str())
+            && !self.documents.load_builtins(Path::new(path))
+        {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("could not load LilyPond words from {path}"),
+                )
+                .await;
+        }
+
+        // The `-I` include search directories the user has configured.
+        if let Some(paths) = options
+            .as_ref()
+            .and_then(|opts| opts.get("includePaths"))
+            .and_then(|value| value.as_array())
+        {
+            let paths = paths
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(PathBuf::from)
+                .collect();
+            self.documents.set_search_paths(paths);
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -50,18 +93,24 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.documents.open(doc.uri, doc.text);
+        self.documents.open(doc.uri.clone(), doc.text);
+        self.publish_diagnostics(doc.uri, Some(doc.version)).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         // Incremental sync: apply each change in order, reparsing against the
         // previous tree.
-        self.documents
-            .change(&params.text_document.uri, params.content_changes);
+        let version = params.text_document.version;
+        let uri = params.text_document.uri;
+        self.documents.change(&uri, params.content_changes);
+        self.publish_diagnostics(uri, Some(version)).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents.close(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        self.documents.close(&uri);
+        // Clear any squiggles for the now-closed file.
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn goto_definition(

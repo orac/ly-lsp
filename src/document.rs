@@ -6,7 +6,9 @@
 use std::sync::OnceLock;
 
 use streaming_iterator::StreamingIterator;
-use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+use tower_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent,
+};
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
 /// A half-open byte range `[start, end)` into the source text.
@@ -126,6 +128,71 @@ impl Document {
 
     pub fn includes(&self) -> &[Include] {
         &self.includes
+    }
+
+    /// Syntax diagnostics from the parse tree. Tree-sitter's error recovery
+    /// marks regions it couldn't parse as ERROR nodes and tokens it expected
+    /// but didn't find as MISSING nodes; we surface both.
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let root = self.tree.root_node();
+        if root.has_error() {
+            self.collect_syntax_errors(root, &mut diagnostics);
+        }
+        diagnostics
+    }
+
+    /// A diagnostic for every `\foo` reference whose name `is_known` rejects.
+    ///
+    /// The caller supplies the notion of "known" — typically a built-in command
+    /// or a definition reachable through includes — so this stays oblivious to
+    /// both the builtin list and the include graph.
+    pub fn undefined_reference_diagnostics(
+        &self,
+        is_known: impl Fn(&str) -> bool,
+    ) -> Vec<Diagnostic> {
+        self.references
+            .iter()
+            .filter(|reference| !is_known(&reference.name))
+            .map(|reference| Diagnostic {
+                range: self.line_index.range_of(reference.span),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("ly-lsp".to_string()),
+                message: format!("undefined reference to `\\{}`", reference.name),
+                ..Diagnostic::default()
+            })
+            .collect()
+    }
+
+    /// Walks `node`, pushing a diagnostic for each ERROR and MISSING node and
+    /// pruning subtrees that contain no errors.
+    fn collect_syntax_errors(&self, node: Node, out: &mut Vec<Diagnostic>) {
+        if node.is_missing() {
+            out.push(self.syntax_error(node, format!("missing `{}`", node.kind())));
+            return;
+        }
+        if node.is_error() {
+            out.push(self.syntax_error(node, "syntax error".to_string()));
+            return;
+        }
+        if !node.has_error() {
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_syntax_errors(child, out);
+        }
+    }
+
+    fn syntax_error(&self, node: Node, message: String) -> Diagnostic {
+        let span = Span::new(node.start_byte(), node.end_byte());
+        Diagnostic {
+            range: self.line_index.range_of(span),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("ly-lsp".to_string()),
+            message,
+            ..Diagnostic::default()
+        }
     }
 
     /// Returns the include path under `position`, if the cursor is on one.
@@ -505,6 +572,23 @@ mod tests {
         assert_eq!(names(doc.definitions()), vec!["baz"]);
         assert_eq!(names(doc.references()), vec!["baz"]);
         assert!(doc.definition_ranges("foo").is_empty());
+    }
+
+    #[test]
+    fn well_formed_source_has_no_diagnostics() {
+        let doc = Document::new("foo = { c d e }\n\\foo\n".to_string());
+        assert!(doc.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn unclosed_brace_is_reported() {
+        let doc = Document::new("foo = { c d e\n".to_string());
+        let diagnostics = doc.diagnostics();
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for the unclosed brace"
+        );
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]

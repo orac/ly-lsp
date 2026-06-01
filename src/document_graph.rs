@@ -7,9 +7,13 @@
 //! open, even if a shared include is referenced from a hundred files on disk.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use dashmap::DashMap;
-use tower_lsp::lsp_types::{Location, Position, Range, TextDocumentContentChangeEvent, Url};
+use tower_lsp::lsp_types::{
+    Diagnostic, Location, Position, Range, TextDocumentContentChangeEvent, Url,
+};
 
 use crate::document::Document;
 
@@ -17,6 +21,14 @@ use crate::document::Document;
 pub struct DocumentGraph {
     /// Documents currently open in the editor, keyed by URI.
     open: DashMap<Url, Document>,
+    /// Built-in command names (without the leading backslash), loaded once from
+    /// LilyPond's `lilypond-words` file. Unset until successfully loaded, which
+    /// keeps undefined-reference diagnostics disabled rather than flagging every
+    /// command when the list is unavailable.
+    builtins: OnceLock<HashSet<String>>,
+    /// Directories from LilyPond's `-I` option, searched (after the including
+    /// file's own directory) when resolving `\include`.
+    search_paths: OnceLock<Vec<PathBuf>>,
 }
 
 impl DocumentGraph {
@@ -41,6 +53,63 @@ impl DocumentGraph {
         }
     }
 
+    /// Loads built-in command names from LilyPond's `lilypond-words` file.
+    ///
+    /// Returns whether loading succeeded. On any failure (missing file, read
+    /// error) the builtin set stays unset and undefined-reference diagnostics
+    /// remain off, so we never flag every command as undefined.
+    pub fn load_builtins(&self, path: &Path) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(text) => self.builtins.set(parse_builtin_words(&text)).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Sets the `-I` include search directories, in priority order.
+    pub fn set_search_paths(&self, paths: Vec<PathBuf>) {
+        let _ = self.search_paths.set(paths);
+    }
+
+    fn search_paths(&self) -> &[PathBuf] {
+        self.search_paths.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Diagnostics for an open document: always its syntax errors, plus
+    /// undefined-reference errors when the builtin list has been loaded.
+    pub fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
+        if !self.open.contains_key(uri) {
+            return Vec::new();
+        }
+
+        // Compute the reachable definition names *before* borrowing the open
+        // document below, so we never re-enter the document map while holding a
+        // reference into it.
+        let builtins = self.builtins.get();
+        let reachable = builtins.map(|_| self.reachable_definition_names(uri));
+
+        self.with_document(uri, |doc| {
+            let mut diagnostics = doc.diagnostics();
+            if let (Some(builtins), Some(reachable)) = (builtins, &reachable) {
+                diagnostics.extend(doc.undefined_reference_diagnostics(|name| {
+                    builtins.contains(name) || reachable.contains(name)
+                }));
+            }
+            diagnostics
+        })
+        .unwrap_or_default()
+    }
+
+    /// The names of every definition reachable from `uri` through includes.
+    fn reachable_definition_names(&self, uri: &Url) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for file in self.include_closure(uri) {
+            self.with_document(&file, |doc| {
+                names.extend(doc.definitions().iter().map(|d| d.name.clone()));
+            });
+        }
+        names
+    }
+
     /// Resolves go-to-definition at `position` in document `uri`.
     ///
     /// If the cursor is on an `\include` path, the target file is returned.
@@ -51,7 +120,7 @@ impl DocumentGraph {
         if let Some(Some(path)) =
             self.with_document(uri, |doc| doc.include_at(position).map(str::to_string))
         {
-            return resolve_include(uri, &path)
+            return resolve_include(uri, &path, self.search_paths())
                 .map(|target| vec![Location::new(target, start_of_file())])
                 .unwrap_or_default();
         }
@@ -137,7 +206,9 @@ impl DocumentGraph {
             order.push(current.clone());
             self.with_document(&current, |doc| {
                 for include in doc.includes() {
-                    if let Some(target) = resolve_include(&current, &include.path) {
+                    if let Some(target) =
+                        resolve_include(&current, &include.path, self.search_paths())
+                    {
                         stack.push(target);
                     }
                 }
@@ -164,18 +235,57 @@ impl DocumentGraph {
     }
 }
 
-/// Resolves an `\include` path relative to the including file's directory.
+/// Resolves an `\include` path, searching the including file's own directory
+/// first, then the `-I` search paths in order, and taking the first candidate
+/// that exists. If none exist, falls back to the directory-relative path (so an
+/// as-yet-uncreated include still has a sensible location).
 ///
-/// LilyPond also consults `-I` search paths; that's not modelled yet. Paths are
-/// joined but not canonicalised, so resolved URIs match what editors send for
-/// files in the same directory tree.
-fn resolve_include(base: &Url, path: &str) -> Option<Url> {
+/// Paths are joined but not canonicalised, so resolved URIs match what editors
+/// send. LilyPond's current-working-directory search is not modelled.
+fn resolve_include(base: &Url, path: &str, search_paths: &[PathBuf]) -> Option<Url> {
     let base_path = base.to_file_path().ok()?;
-    let dir = base_path.parent()?;
-    Url::from_file_path(dir.join(path)).ok()
+    let base_dir = base_path.parent()?;
+
+    let existing = std::iter::once(base_dir)
+        .chain(search_paths.iter().map(PathBuf::as_path))
+        .map(|dir| dir.join(path))
+        .find(|candidate| candidate.is_file());
+
+    let resolved = existing.unwrap_or_else(|| base_dir.join(path));
+    Url::from_file_path(resolved).ok()
 }
 
 /// The zero-width range at the start of a file.
 fn start_of_file() -> Range {
     Range::new(Position::new(0, 0), Position::new(0, 0))
+}
+
+/// Parses LilyPond's `lilypond-words` file into the set of built-in command
+/// names. The file lists one keyword per line; command entries carry a leading
+/// backslash (note names and the like don't), so we keep the backslashed lines
+/// and strip the backslash.
+fn parse_builtin_words(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix('\\'))
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_words_keeps_commands_and_drops_note_names() {
+        // Note names and reserved words without a backslash are dropped;
+        // backslashed commands are kept without the backslash.
+        let words = "\\relative\n\\new\ncis'\nc\n\\score\n";
+        let builtins = parse_builtin_words(words);
+        assert!(builtins.contains("relative"));
+        assert!(builtins.contains("new"));
+        assert!(builtins.contains("score"));
+        assert!(!builtins.contains("cis'"));
+        assert!(!builtins.contains("c"));
+        assert_eq!(builtins.len(), 3);
+    }
 }
