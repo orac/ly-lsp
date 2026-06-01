@@ -255,6 +255,34 @@ fn including_directory_takes_precedence_over_search_path() {
 }
 
 #[test]
+fn opening_a_cached_include_uses_the_live_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let common = dir.path().join("common.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(&common, "melody = { c }\n").unwrap();
+    fs::write(&score, "\\include \"common.ily\"\n\\melody\n\\tune\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    // Resolving through the include caches the on-disk common.ily.
+    assert_eq!(ws.goto_definition(&url(&score), Position::new(1, 2)).len(), 1);
+    assert!(ws.goto_definition(&url(&score), Position::new(2, 2)).is_empty());
+
+    // The editor opens common.ily, and its buffer differs from disk (melody
+    // renamed to tune). The live buffer must win over the cached parse.
+    ws.open(url(&common), "tune = { c }\n".to_string());
+
+    assert!(
+        ws.goto_definition(&url(&score), Position::new(1, 2)).is_empty(),
+        "\\melody should stop resolving once the open buffer drops it"
+    );
+    let tune = ws.goto_definition(&url(&score), Position::new(2, 2));
+    assert_eq!(tune.len(), 1, "\\tune from the open buffer should resolve");
+    assert_eq!(tune[0].uri, url(&common));
+}
+
+#[test]
 fn include_cache_serves_until_mtime_changes() {
     let dir = tempfile::tempdir().unwrap();
     let common = dir.path().join("common.ily");

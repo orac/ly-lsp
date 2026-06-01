@@ -48,6 +48,9 @@ impl DocumentGraph {
     }
 
     pub fn open(&self, uri: Url, text: String) {
+        // Once a file is open its live buffer supersedes any on-disk parse we
+        // cached while it was merely an include; drop the now-shadowed entry.
+        self.cache.remove(&uri);
         self.open.insert(uri, Document::new(text));
     }
 
