@@ -17,16 +17,17 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::Document;
+use crate::vocabulary::Vocabulary;
 
 #[derive(Debug, Default)]
 pub struct DocumentGraph {
     /// Documents currently open in the editor, keyed by URI.
     open: DashMap<Url, Document>,
-    /// Built-in command names (without the leading backslash), loaded once from
-    /// LilyPond's `lilypond-words` file. Unset until successfully loaded, which
-    /// keeps undefined-reference diagnostics disabled rather than flagging every
-    /// command when the list is unavailable.
-    builtins: OnceLock<HashSet<String>>,
+    /// The commands LilyPond recognises, loaded once from its `lilypond-words`
+    /// file. Unset until successfully loaded, which keeps undefined-reference
+    /// diagnostics disabled rather than flagging every command when the words
+    /// file is unavailable.
+    vocabulary: OnceLock<Vocabulary>,
     /// Directories from LilyPond's `-I` option, searched (after the including
     /// file's own directory) when resolving `\include`.
     search_paths: OnceLock<Vec<PathBuf>>,
@@ -67,15 +68,15 @@ impl DocumentGraph {
         }
     }
 
-    /// Loads built-in command names from LilyPond's `lilypond-words` file.
+    /// Loads the command vocabulary from LilyPond's `lilypond-words` file.
     ///
     /// Returns whether loading succeeded. On any failure (missing file, read
-    /// error) the builtin set stays unset and undefined-reference diagnostics
+    /// error) the vocabulary stays unset and undefined-reference diagnostics
     /// remain off, so we never flag every command as undefined.
-    pub fn load_builtins(&self, path: &Path) -> bool {
-        match std::fs::read_to_string(path) {
-            Ok(text) => self.builtins.set(parse_builtin_words(&text)).is_ok(),
-            Err(_) => false,
+    pub fn load_vocabulary(&self, path: &Path) -> bool {
+        match Vocabulary::load(path) {
+            Some(vocabulary) => self.vocabulary.set(vocabulary).is_ok(),
+            None => false,
         }
     }
 
@@ -89,7 +90,7 @@ impl DocumentGraph {
     }
 
     /// Diagnostics for an open document: always its syntax errors, plus
-    /// undefined-reference errors when the builtin list has been loaded.
+    /// undefined-reference errors when the vocabulary has been loaded.
     pub fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
         if !self.open.contains_key(uri) {
             return Vec::new();
@@ -98,14 +99,14 @@ impl DocumentGraph {
         // Compute the reachable definition names *before* borrowing the open
         // document below, so we never re-enter the document map while holding a
         // reference into it.
-        let builtins = self.builtins.get();
-        let reachable = builtins.map(|_| self.reachable_definition_names(uri));
+        let vocabulary = self.vocabulary.get();
+        let reachable = vocabulary.map(|_| self.reachable_definition_names(uri));
 
         self.with_document(uri, |doc| {
             let mut diagnostics = doc.diagnostics();
-            if let (Some(builtins), Some(reachable)) = (builtins, &reachable) {
+            if let (Some(vocabulary), Some(reachable)) = (vocabulary, &reachable) {
                 diagnostics.extend(doc.undefined_reference_diagnostics(|name| {
-                    builtins.contains(name) || reachable.contains(name)
+                    vocabulary.is_known(name) || reachable.contains(name)
                 }));
             }
             diagnostics
@@ -185,7 +186,11 @@ impl DocumentGraph {
             let ranges = self
                 .with_document(&open_uri, |doc| doc.reference_ranges(&name))
                 .unwrap_or_default();
-            locations.extend(ranges.into_iter().map(|r| Location::new(open_uri.clone(), r)));
+            locations.extend(
+                ranges
+                    .into_iter()
+                    .map(|r| Location::new(open_uri.clone(), r)),
+            );
         }
 
         if include_declaration {
@@ -286,36 +291,4 @@ fn resolve_include(base: &Url, path: &str, search_paths: &[PathBuf]) -> Option<U
 /// The zero-width range at the start of a file.
 fn start_of_file() -> Range {
     Range::new(Position::new(0, 0), Position::new(0, 0))
-}
-
-/// Parses LilyPond's `lilypond-words` file into the set of built-in command
-/// names. The file lists one keyword per line; command entries carry a *doubled*
-/// leading backslash (`\\relative`), whilst context, grob and engraver names
-/// (`Staff`, `Score`) have none. We keep the doubly-backslashed lines and strip
-/// both backslashes, so the names match the references we store without their
-/// single leading backslash.
-fn parse_builtin_words(text: &str) -> HashSet<String> {
-    text.lines()
-        .filter_map(|line| line.trim().strip_prefix(r"\\"))
-        .map(str::to_string)
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builtin_words_keeps_commands_and_drops_context_names() {
-        // Commands carry a doubled backslash and are kept with both stripped;
-        // context/grob names without a backslash are dropped.
-        let words = "\\\\relative\n\\\\new\nStaff\nScore\n\\\\score\n";
-        let builtins = parse_builtin_words(words);
-        assert!(builtins.contains("relative"));
-        assert!(builtins.contains("new"));
-        assert!(builtins.contains("score"));
-        assert!(!builtins.contains("Staff"));
-        assert!(!builtins.contains("Score"));
-        assert_eq!(builtins.len(), 3);
-    }
 }

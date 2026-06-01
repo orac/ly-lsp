@@ -190,7 +190,7 @@ fn undefined_reference_is_flagged_but_builtins_and_includes_are_not() {
     .unwrap();
 
     let ws = DocumentGraph::new();
-    assert!(ws.load_builtins(&words));
+    assert!(ws.load_vocabulary(&words));
     ws.open(url(&score), fs::read_to_string(&score).unwrap());
 
     let diagnostics = ws.diagnostics(&url(&score));
@@ -266,15 +266,22 @@ fn opening_a_cached_include_uses_the_live_buffer() {
     ws.open(url(&score), fs::read_to_string(&score).unwrap());
 
     // Resolving through the include caches the on-disk common.ily.
-    assert_eq!(ws.goto_definition(&url(&score), Position::new(1, 2)).len(), 1);
-    assert!(ws.goto_definition(&url(&score), Position::new(2, 2)).is_empty());
+    assert_eq!(
+        ws.goto_definition(&url(&score), Position::new(1, 2)).len(),
+        1
+    );
+    assert!(
+        ws.goto_definition(&url(&score), Position::new(2, 2))
+            .is_empty()
+    );
 
     // The editor opens common.ily, and its buffer differs from disk (melody
     // renamed to tune). The live buffer must win over the cached parse.
     ws.open(url(&common), "tune = { c }\n".to_string());
 
     assert!(
-        ws.goto_definition(&url(&score), Position::new(1, 2)).is_empty(),
+        ws.goto_definition(&url(&score), Position::new(1, 2))
+            .is_empty(),
         "\\melody should stop resolving once the open buffer drops it"
     );
     let tune = ws.goto_definition(&url(&score), Position::new(2, 2));
@@ -295,7 +302,10 @@ fn include_cache_serves_until_mtime_changes() {
     ws.open(url(&score), fs::read_to_string(&score).unwrap());
 
     // Populate the cache: `\melody` resolves into common.ily.
-    assert_eq!(ws.goto_definition(&url(&score), Position::new(1, 2)).len(), 1);
+    assert_eq!(
+        ws.goto_definition(&url(&score), Position::new(1, 2)).len(),
+        1
+    );
 
     // Rewrite the file (melody -> tune) but force the mtime back: the stale
     // cached parse should still be served.
@@ -307,14 +317,16 @@ fn include_cache_serves_until_mtime_changes() {
         "stale cache should still resolve \\melody"
     );
     assert!(
-        ws.goto_definition(&url(&score), Position::new(2, 2)).is_empty(),
+        ws.goto_definition(&url(&score), Position::new(2, 2))
+            .is_empty(),
         "the new \\tune definition is invisible while the cache is stale"
     );
 
     // Advance the mtime: the cache is invalidated and the new content wins.
     set_mtime(&common, t0 + Duration::from_secs(2));
     assert!(
-        ws.goto_definition(&url(&score), Position::new(1, 2)).is_empty(),
+        ws.goto_definition(&url(&score), Position::new(1, 2))
+            .is_empty(),
         "\\melody should be gone after the re-read"
     );
     assert_eq!(
@@ -325,11 +337,11 @@ fn include_cache_serves_until_mtime_changes() {
 }
 
 #[test]
-fn undefined_reference_diagnostics_are_off_without_builtins() {
+fn undefined_reference_diagnostics_are_off_without_vocabulary() {
     let dir = tempfile::tempdir().unwrap();
     let score = dir.path().join("score.ly");
-    // `\wibble` is undefined, but with no builtin list we cannot tell it from a
-    // built-in command, so we stay silent.
+    // `\wibble` is undefined, but with no vocabulary loaded we cannot tell it
+    // from a built-in command, so we stay silent.
     fs::write(&score, "\\wibble\n").unwrap();
 
     let ws = DocumentGraph::new();

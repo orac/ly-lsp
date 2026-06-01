@@ -41,7 +41,7 @@ impl LanguageServer for Backend {
             .as_ref()
             .and_then(|opts| opts.get("lilypondWordsPath"))
             .and_then(|value| value.as_str())
-            && !self.documents.load_builtins(Path::new(path))
+            && !self.documents.load_vocabulary(Path::new(path))
         {
             self.client
                 .log_message(

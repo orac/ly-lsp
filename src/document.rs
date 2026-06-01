@@ -101,7 +101,8 @@ impl Document {
         let start_position = point_at(&self.text, start_byte);
         let old_end_position = point_at(&self.text, old_end_byte);
 
-        self.text.replace_range(start_byte..old_end_byte, &change.text);
+        self.text
+            .replace_range(start_byte..old_end_byte, &change.text);
         let new_end_byte = start_byte + change.text.len();
         let new_end_position = point_at(&self.text, new_end_byte);
 
@@ -528,7 +529,10 @@ mod tests {
     fn incremental_edit_renames_definition() {
         let mut doc = Document::new("foo = { c }\n\\foo\n".to_string());
         // Replace the `foo` on line 0 (chars 0..3) with `bar`.
-        doc.apply_change(change(Range::new(Position::new(0, 0), Position::new(0, 3)), "bar"));
+        doc.apply_change(change(
+            Range::new(Position::new(0, 0), Position::new(0, 3)),
+            "bar",
+        ));
 
         assert_eq!(names(doc.definitions()), vec!["bar"]);
         assert_eq!(doc.definition_ranges("bar").len(), 1);
@@ -593,7 +597,8 @@ mod tests {
 
     #[test]
     fn parses_include_directives() {
-        let doc = Document::new("\\include \"notes.ily\"\n\\include \"parts/violin.ily\"\n".to_string());
+        let doc =
+            Document::new("\\include \"notes.ily\"\n\\include \"parts/violin.ily\"\n".to_string());
         let paths: Vec<&str> = doc.includes().iter().map(|i| i.path.as_str()).collect();
         assert_eq!(paths, vec!["notes.ily", "parts/violin.ily"]);
         // `\include` itself is not a reference.
@@ -614,7 +619,10 @@ mod tests {
         // Commenting out a definition by prefixing the line with `% ` should
         // make it disappear after reparsing.
         let mut doc = Document::new("foo = { c }\n".to_string());
-        doc.apply_change(change(Range::new(Position::new(0, 0), Position::new(0, 0)), "% "));
+        doc.apply_change(change(
+            Range::new(Position::new(0, 0), Position::new(0, 0)),
+            "% ",
+        ));
         assert!(doc.definitions().is_empty());
     }
 }

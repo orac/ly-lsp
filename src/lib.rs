@@ -3,3 +3,4 @@
 
 pub mod document;
 pub mod document_graph;
+pub mod vocabulary;
