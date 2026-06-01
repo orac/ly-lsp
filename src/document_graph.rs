@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{
@@ -29,6 +30,16 @@ pub struct DocumentGraph {
     /// Directories from LilyPond's `-I` option, searched (after the including
     /// file's own directory) when resolving `\include`.
     search_paths: OnceLock<Vec<PathBuf>>,
+    /// Parsed documents for files reached only through `\include` (i.e. not
+    /// open in the editor), so they aren't re-read and re-parsed on every
+    /// query. Invalidated when the file's modification time changes.
+    cache: DashMap<Url, CachedDocument>,
+}
+
+#[derive(Debug)]
+struct CachedDocument {
+    modified: SystemTime,
+    document: Document,
 }
 
 impl DocumentGraph {
@@ -222,16 +233,30 @@ impl DocumentGraph {
         self.open.iter().map(|entry| entry.key().clone()).collect()
     }
 
-    /// Runs `f` against the document at `uri`, whether it's open in the editor
-    /// or read freshly from disk. Returns `None` if the document is neither
-    /// open nor a readable file.
+    /// Runs `f` against the document at `uri`. Open documents are used directly;
+    /// others are read from disk and cached, the cache being reused while the
+    /// file's modification time is unchanged. Returns `None` if the document is
+    /// neither open nor a readable file.
     fn with_document<R>(&self, uri: &Url, f: impl FnOnce(&Document) -> R) -> Option<R> {
         if let Some(doc) = self.open.get(uri) {
             return Some(f(&doc));
         }
+
         let path = uri.to_file_path().ok()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        Some(f(&Document::new(text)))
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+
+        if let Some(cached) = self.cache.get(uri)
+            && cached.modified == modified
+        {
+            return Some(f(&cached.document));
+        }
+
+        // Absent or stale: (re)read and parse, then cache.
+        let document = Document::new(std::fs::read_to_string(&path).ok()?);
+        let result = f(&document);
+        self.cache
+            .insert(uri.clone(), CachedDocument { modified, document });
+        Some(result)
     }
 }
 

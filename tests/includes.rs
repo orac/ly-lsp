@@ -3,12 +3,20 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use ly_lsp::document_graph::DocumentGraph;
 use tower_lsp::lsp_types::{DiagnosticSeverity, Location, Position, Range, Url};
 
 fn url(path: &Path) -> Url {
     Url::from_file_path(path).expect("absolute path")
+}
+
+/// Forces a file's modification time, so cache-invalidation behaviour can be
+/// tested without depending on filesystem timestamp granularity.
+fn set_mtime(path: &Path, time: SystemTime) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(time).unwrap();
 }
 
 /// Sorts locations so that result order (which depends on map iteration) does
@@ -244,6 +252,48 @@ fn including_directory_takes_precedence_over_search_path() {
     let locations = ws.goto_definition(&url(&score), Position::new(1, 2));
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].uri, url(&local));
+}
+
+#[test]
+fn include_cache_serves_until_mtime_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let common = dir.path().join("common.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(&common, "melody = { c }\n").unwrap();
+    fs::write(&score, "\\include \"common.ily\"\n\\melody\n\\tune\n").unwrap();
+    let t0 = fs::metadata(&common).unwrap().modified().unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    // Populate the cache: `\melody` resolves into common.ily.
+    assert_eq!(ws.goto_definition(&url(&score), Position::new(1, 2)).len(), 1);
+
+    // Rewrite the file (melody -> tune) but force the mtime back: the stale
+    // cached parse should still be served.
+    fs::write(&common, "tune = { c }\n").unwrap();
+    set_mtime(&common, t0);
+    assert_eq!(
+        ws.goto_definition(&url(&score), Position::new(1, 2)).len(),
+        1,
+        "stale cache should still resolve \\melody"
+    );
+    assert!(
+        ws.goto_definition(&url(&score), Position::new(2, 2)).is_empty(),
+        "the new \\tune definition is invisible while the cache is stale"
+    );
+
+    // Advance the mtime: the cache is invalidated and the new content wins.
+    set_mtime(&common, t0 + Duration::from_secs(2));
+    assert!(
+        ws.goto_definition(&url(&score), Position::new(1, 2)).is_empty(),
+        "\\melody should be gone after the re-read"
+    );
+    assert_eq!(
+        ws.goto_definition(&url(&score), Position::new(2, 2)).len(),
+        1,
+        "\\tune should resolve after the re-read"
+    );
 }
 
 #[test]
