@@ -289,12 +289,14 @@ fn start_of_file() -> Range {
 }
 
 /// Parses LilyPond's `lilypond-words` file into the set of built-in command
-/// names. The file lists one keyword per line; command entries carry a leading
-/// backslash (note names and the like don't), so we keep the backslashed lines
-/// and strip the backslash.
+/// names. The file lists one keyword per line; command entries carry a *doubled*
+/// leading backslash (`\\relative`), whilst context, grob and engraver names
+/// (`Staff`, `Score`) have none. We keep the doubly-backslashed lines and strip
+/// both backslashes, so the names match the references we store without their
+/// single leading backslash.
 fn parse_builtin_words(text: &str) -> HashSet<String> {
     text.lines()
-        .filter_map(|line| line.trim().strip_prefix('\\'))
+        .filter_map(|line| line.trim().strip_prefix(r"\\"))
         .map(str::to_string)
         .collect()
 }
@@ -304,16 +306,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_words_keeps_commands_and_drops_note_names() {
-        // Note names and reserved words without a backslash are dropped;
-        // backslashed commands are kept without the backslash.
-        let words = "\\relative\n\\new\ncis'\nc\n\\score\n";
+    fn builtin_words_keeps_commands_and_drops_context_names() {
+        // Commands carry a doubled backslash and are kept with both stripped;
+        // context/grob names without a backslash are dropped.
+        let words = "\\\\relative\n\\\\new\nStaff\nScore\n\\\\score\n";
         let builtins = parse_builtin_words(words);
         assert!(builtins.contains("relative"));
         assert!(builtins.contains("new"));
         assert!(builtins.contains("score"));
-        assert!(!builtins.contains("cis'"));
-        assert!(!builtins.contains("c"));
+        assert!(!builtins.contains("Staff"));
+        assert!(!builtins.contains("Score"));
         assert_eq!(builtins.len(), 3);
     }
 }

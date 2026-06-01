@@ -178,8 +178,8 @@ fn undefined_reference_is_flagged_but_builtins_and_includes_are_not() {
     let words = dir.path().join("lilypond-words");
     let shared = dir.path().join("shared.ily");
     let score = dir.path().join("score.ly");
-    // Built-in commands carry a backslash; note names don't.
-    fs::write(&words, "\\relative\n\\new\nc\ncis'\n").unwrap();
+    // Built-in commands carry a doubled backslash; context/grob names don't.
+    fs::write(&words, "\\\\relative\n\\\\new\nStaff\nScore\n").unwrap();
     fs::write(&shared, "melody = { c }\n").unwrap();
     // `\relative` is a builtin, `\melody` is defined in the include, `\wibble`
     // is neither.
