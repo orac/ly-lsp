@@ -6,8 +6,10 @@ foo = {
     a' b
 }
 ---
-music = { c d
-    e f }
+music = {
+    c d
+    e f
+}
 
 foo = {
     a4 b \music g
@@ -22,9 +24,11 @@ foo = {
     <<<<<
 }
 ---
-music = { c
+music = {
+    c
     % comment
-    d e f }
+    d e f
+}
 
 foo = {
     a4 b \music g

@@ -205,7 +205,12 @@ impl Document {
 
         let content = &self.text[actual_start..actual_end];
         let music_text = if needs_braces {
-            format!("{{ {} }}", content)
+            if let Some((first, rest)) = content.split_once('\n') {
+                let indent: String = rest.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+                format!("{{\n{}{}\n{}\n}}", indent, first, rest)
+            } else {
+                format!("{{ {} }}", content)
+            }
         } else {
             content.to_string()
         };
