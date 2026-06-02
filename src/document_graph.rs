@@ -13,7 +13,8 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{
-    Diagnostic, Location, Position, Range, TextDocumentContentChangeEvent, Url,
+    Diagnostic, DocumentHighlight, DocumentHighlightKind, Location, Position, Range,
+    TextDocumentContentChangeEvent, Url,
 };
 
 use crate::document::Document;
@@ -123,6 +124,42 @@ impl DocumentGraph {
             });
         }
         names
+    }
+
+    /// Document highlights for `position` in `uri`: matched bracket ranges, or
+    /// all definitions/references of the symbol under the cursor, within the
+    /// same document only.
+    pub fn document_highlights(&self, uri: &Url, position: Position) -> Vec<DocumentHighlight> {
+        if let Some(Some(pair)) = self.with_document(uri, |doc| doc.bracket_at(position)) {
+            return pair
+                .into_iter()
+                .map(|range| DocumentHighlight {
+                    range,
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect();
+        }
+
+        let Some(Some(name)) =
+            self.with_document(uri, |doc| doc.symbol_at(position).map(str::to_string))
+        else {
+            return Vec::new();
+        };
+
+        let mut highlights = Vec::new();
+        if let Some(ranges) = self.with_document(uri, |doc| doc.definition_ranges(&name)) {
+            highlights.extend(ranges.into_iter().map(|range| DocumentHighlight {
+                range,
+                kind: Some(DocumentHighlightKind::WRITE),
+            }));
+        }
+        if let Some(ranges) = self.with_document(uri, |doc| doc.reference_ranges(&name)) {
+            highlights.extend(ranges.into_iter().map(|range| DocumentHighlight {
+                range,
+                kind: Some(DocumentHighlightKind::READ),
+            }));
+        }
+        highlights
     }
 
     /// Resolves go-to-definition at `position` in document `uri`.

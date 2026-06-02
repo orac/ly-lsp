@@ -205,6 +205,46 @@ impl Document {
             .map(|i| i.path.as_str())
     }
 
+    /// Returns the ranges of a matched bracket pair `[bracket, match]` if
+    /// `position` is on a bracket token, or `None` if it is not.
+    pub fn bracket_at(&self, position: Position) -> Option<[Range; 2]> {
+        let offset = self.line_index.offset_at(position)?;
+        let node = self.tree.root_node().descendant_for_byte_range(offset, offset)?;
+
+        let target_kind = match node.kind() {
+            "{" => "}",
+            "}" => "{",
+            "<<" => ">>",
+            ">>" => "<<",
+            "<" => ">",
+            ">" => "<",
+            _ => return None,
+        };
+        let is_open = matches!(node.kind(), "{" | "<<" | "<");
+
+        let node_span = Span::new(node.start_byte(), node.end_byte());
+        let parent = node.parent()?;
+        let mut cursor = parent.walk();
+        let children: Vec<_> = parent.children(&mut cursor).collect();
+
+        let match_node = if is_open {
+            children
+                .into_iter()
+                .find(|c| c.kind() == target_kind && c.start_byte() > node.start_byte())
+        } else {
+            children
+                .into_iter()
+                .filter(|c| c.kind() == target_kind && c.start_byte() < node.start_byte())
+                .last()
+        }?;
+
+        Some([
+            self.line_index.range_of(node_span),
+            self.line_index
+                .range_of(Span::new(match_node.start_byte(), match_node.end_byte())),
+        ])
+    }
+
     /// Returns the name of the definition or reference under `position`, if any.
     pub fn symbol_at(&self, position: Position) -> Option<&str> {
         let offset = self.line_index.offset_at(position)?;
@@ -612,6 +652,44 @@ mod tests {
         assert_eq!(doc.include_at(Position::new(0, 12)), Some("notes.ily"));
         // Cursor on the `\include` keyword resolves to no include.
         assert_eq!(doc.include_at(Position::new(0, 2)), None);
+    }
+
+    #[test]
+    fn bracket_at_sequential_music() {
+        let doc = Document::new("foo = { c d e }\n".to_string());
+        // Cursor on `{` (char 6).
+        let [open, close] = doc.bracket_at(Position::new(0, 6)).expect("bracket pair");
+        assert_eq!(open, Range::new(Position::new(0, 6), Position::new(0, 7)));
+        assert_eq!(close, Range::new(Position::new(0, 14), Position::new(0, 15)));
+        // Cursor on `}` (char 14) — same pair, reversed.
+        let [close2, open2] = doc.bracket_at(Position::new(0, 14)).expect("bracket pair");
+        assert_eq!(close2, Range::new(Position::new(0, 14), Position::new(0, 15)));
+        assert_eq!(open2, Range::new(Position::new(0, 6), Position::new(0, 7)));
+    }
+
+    #[test]
+    fn bracket_at_simultaneous_music() {
+        let doc = Document::new("<< { c } { d } >>\n".to_string());
+        // Cursor on first `<` of `<<` (char 0).
+        let [open, close] = doc.bracket_at(Position::new(0, 0)).expect("bracket pair");
+        assert_eq!(open, Range::new(Position::new(0, 0), Position::new(0, 2)));
+        assert_eq!(close, Range::new(Position::new(0, 15), Position::new(0, 17)));
+    }
+
+    #[test]
+    fn bracket_at_chord() {
+        let doc = Document::new("{ <c e g> }\n".to_string());
+        // Cursor on `<` (char 2).
+        let [open, close] = doc.bracket_at(Position::new(0, 2)).expect("chord bracket pair");
+        assert_eq!(open, Range::new(Position::new(0, 2), Position::new(0, 3)));
+        assert_eq!(close, Range::new(Position::new(0, 8), Position::new(0, 9)));
+    }
+
+    #[test]
+    fn bracket_at_note_returns_none() {
+        let doc = Document::new("{ c d e }\n".to_string());
+        // Cursor on `c` (a note, char 2) — not a bracket.
+        assert!(doc.bracket_at(Position::new(0, 2)).is_none());
     }
 
     #[test]

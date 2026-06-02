@@ -72,6 +72,7 @@ impl LanguageServer for Backend {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -122,6 +123,17 @@ impl LanguageServer for Backend {
             .documents
             .goto_definition(&pos.text_document.uri, pos.position);
         Ok((!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations)))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let pos = params.text_document_position_params;
+        let highlights = self
+            .documents
+            .document_highlights(&pos.text_document.uri, pos.position);
+        Ok(Some(highlights))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
