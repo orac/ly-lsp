@@ -11,22 +11,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
-/// A half-open byte range `[start, end)` into the source text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl Span {
-    fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
-    }
-
-    fn contains(&self, offset: usize) -> bool {
-        self.start <= offset && offset < self.end
-    }
-}
+use crate::line_struct::{LineIndex, Span};
 
 /// A named occurrence in the source: either a definition (`foo = ...`) or a
 /// reference (`\foo`). `span` covers the clickable extent of the occurrence.
@@ -209,7 +194,10 @@ impl Document {
     /// `position` is on a bracket token, or `None` if it is not.
     pub fn bracket_at(&self, position: Position) -> Option<[Range; 2]> {
         let offset = self.line_index.offset_at(position)?;
-        let node = self.tree.root_node().descendant_for_byte_range(offset, offset)?;
+        let node = self
+            .tree
+            .root_node()
+            .descendant_for_byte_range(offset, offset)?;
 
         let target_kind = match node.kind() {
             "{" => "}",
@@ -376,76 +364,6 @@ fn point_at(text: &str, byte: usize) -> Point {
     let row = before.bytes().filter(|&b| b == b'\n').count();
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     Point::new(row, byte - line_start)
-}
-
-/// Maps byte offsets to LSP positions and back. LSP positions count UTF-16
-/// code units within a line, so we convert carefully rather than assuming
-/// ASCII.
-#[derive(Debug)]
-struct LineIndex {
-    text: String,
-    /// Byte offset of the start of each line.
-    line_starts: Vec<usize>,
-}
-
-impl LineIndex {
-    fn new(text: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (offset, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(offset + 1);
-            }
-        }
-        Self {
-            text: text.to_string(),
-            line_starts,
-        }
-    }
-
-    /// Converts a byte offset to an LSP position.
-    fn position_at(&self, offset: usize) -> Position {
-        // The line is the last line start that is <= offset.
-        let line = match self.line_starts.binary_search(&offset) {
-            Ok(line) => line,
-            Err(next) => next - 1,
-        };
-        let line_start = self.line_starts[line];
-        let character = self.text[line_start..offset].encode_utf16().count() as u32;
-        Position::new(line as u32, character)
-    }
-
-    /// Converts an LSP position to a byte offset, or `None` if it falls outside
-    /// the text.
-    fn offset_at(&self, position: Position) -> Option<usize> {
-        let line_start = *self.line_starts.get(position.line as usize)?;
-        let line_end = self
-            .line_starts
-            .get(position.line as usize + 1)
-            .copied()
-            .unwrap_or(self.text.len());
-
-        // Walk the line, counting UTF-16 units, to find the byte offset for the
-        // requested character.
-        let mut utf16 = 0u32;
-        for (byte_offset, ch) in self.text[line_start..line_end].char_indices() {
-            if utf16 >= position.character {
-                return Some(line_start + byte_offset);
-            }
-            utf16 += ch.len_utf16() as u32;
-        }
-        // Position is at (or past) the end of the line; clamp to line end.
-        Some(line_end)
-    }
-
-    /// Like [`offset_at`](Self::offset_at) but clamps an out-of-range position
-    /// to the end of the document, so applying an edit can't fail.
-    fn offset_clamped(&self, position: Position) -> usize {
-        self.offset_at(position).unwrap_or(self.text.len())
-    }
-
-    fn range_of(&self, span: Span) -> Range {
-        Range::new(self.position_at(span.start), self.position_at(span.end))
-    }
 }
 
 #[cfg(test)]
@@ -660,10 +578,16 @@ mod tests {
         // Cursor on `{` (char 6).
         let [open, close] = doc.bracket_at(Position::new(0, 6)).expect("bracket pair");
         assert_eq!(open, Range::new(Position::new(0, 6), Position::new(0, 7)));
-        assert_eq!(close, Range::new(Position::new(0, 14), Position::new(0, 15)));
+        assert_eq!(
+            close,
+            Range::new(Position::new(0, 14), Position::new(0, 15))
+        );
         // Cursor on `}` (char 14) — same pair, reversed.
         let [close2, open2] = doc.bracket_at(Position::new(0, 14)).expect("bracket pair");
-        assert_eq!(close2, Range::new(Position::new(0, 14), Position::new(0, 15)));
+        assert_eq!(
+            close2,
+            Range::new(Position::new(0, 14), Position::new(0, 15))
+        );
         assert_eq!(open2, Range::new(Position::new(0, 6), Position::new(0, 7)));
     }
 
@@ -673,14 +597,19 @@ mod tests {
         // Cursor on first `<` of `<<` (char 0).
         let [open, close] = doc.bracket_at(Position::new(0, 0)).expect("bracket pair");
         assert_eq!(open, Range::new(Position::new(0, 0), Position::new(0, 2)));
-        assert_eq!(close, Range::new(Position::new(0, 15), Position::new(0, 17)));
+        assert_eq!(
+            close,
+            Range::new(Position::new(0, 15), Position::new(0, 17))
+        );
     }
 
     #[test]
     fn bracket_at_chord() {
         let doc = Document::new("{ <c e g> }\n".to_string());
         // Cursor on `<` (char 2).
-        let [open, close] = doc.bracket_at(Position::new(0, 2)).expect("chord bracket pair");
+        let [open, close] = doc
+            .bracket_at(Position::new(0, 2))
+            .expect("chord bracket pair");
         assert_eq!(open, Range::new(Position::new(0, 2), Position::new(0, 3)));
         assert_eq!(close, Range::new(Position::new(0, 8), Position::new(0, 9)));
     }
