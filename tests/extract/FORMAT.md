@@ -94,7 +94,33 @@ Test labels are `<filename>[<index>]`, e.g. `basic.extract[0]`. The index is zer
 - Trace `insert_before`: which line does the insertion land on? For nested sources, remember the function walks up to the direct child of `lilypond_program` then back through siblings to find the assignment start.
 - Recheck the expected output by simulating the two edits by hand on the source string.
 
-## Current limitations
+## Multi-line selections
 
-- Only single-line selections are supported: the `^` annotation refers to the immediately preceding source line and the selection is confined to that line. Multi-line selections (spanning two or more source lines) cannot currently be expressed in this format.
+Use a `>` annotation below the start line and a `<` annotation below the end line:
+
+- `>` line: leading spaces give the **start column** on the annotated source line.
+- `<` line: leading spaces plus the count of `<` characters give the **end column** (exclusive) on the annotated source line.
+
+```
+foo = {
+    a4 b c d
+         >
+    e f g
+    <<<
+    a' b
+}
+---
+music = { c d
+    e f }
+
+foo = {
+    a4 b \music g
+    a' b
+}
+```
+
+Here the selection starts at `c` (col 9 of the second line) and ends just after `f` (col 4 + 3 = 7 of the third line).
+
+## Limitations
+
 - The case separator `===` and section separator `---` must appear on their own lines; they cannot appear in source text or expected output.

@@ -32,38 +32,48 @@ fn parse_file(content: &str) -> Vec<Case> {
         .collect()
 }
 
-// A case block contains the source with `^` annotation lines interleaved, then
-// `---`, then the expected output (or the word INVALID).  `^` lines consist
-// entirely of `^` characters (plus leading spaces for column alignment) and
-// annotate the source line immediately above them.
+// A case block contains the source with annotation lines interleaved, then
+// `---`, then the expected output (or the word INVALID).
+//
+// Single-line selection: one `^` line immediately below the source line.
+// Leading spaces give the start column; total length gives the end column.
+//
+// Multi-line selection: a `>` line below the start source line (leading spaces
+// = start column) and a `<` line below the end source line (leading spaces +
+// count = end column).
 fn parse_case(text: &str) -> Case {
     let (annotated, expected_raw) = text
         .split_once("\n---\n")
         .unwrap_or_else(|| panic!("case missing '---' separator:\n{text}"));
 
     let mut source_lines: Vec<&str> = Vec::new();
-    let mut annotation: Option<(usize, u32, u32)> = None;
+    let mut start_mark: Option<(usize, u32)> = None;
+    let mut end_mark: Option<(usize, u32)> = None;
 
     for line in annotated.lines() {
         let trimmed = line.trim();
+        let leading = (line.len() - line.trim_start().len()) as u32;
+        let row = source_lines.len().saturating_sub(1);
         if !trimmed.is_empty() && trimmed.chars().all(|c| c == '^') {
-            let leading = (line.len() - line.trim_start().len()) as u32;
-            annotation = Some((
-                source_lines.len().saturating_sub(1),
-                leading,
-                leading + trimmed.len() as u32,
-            ));
+            start_mark = Some((row, leading));
+            end_mark = Some((row, leading + trimmed.len() as u32));
+        } else if !trimmed.is_empty() && trimmed.chars().all(|c| c == '>') {
+            start_mark = Some((row, leading));
+        } else if !trimmed.is_empty() && trimmed.chars().all(|c| c == '<') {
+            end_mark = Some((row, leading + trimmed.len() as u32));
         } else {
             source_lines.push(line);
         }
     }
 
-    let (row, start_col, end_col) =
-        annotation.unwrap_or_else(|| panic!("case missing '^' annotation:\n{text}"));
+    let (start_row, start_col) =
+        start_mark.unwrap_or_else(|| panic!("case missing start annotation:\n{text}"));
+    let (end_row, end_col) =
+        end_mark.unwrap_or_else(|| panic!("case missing end annotation:\n{text}"));
     let source = source_lines.join("\n") + "\n";
     let selection = Range::new(
-        Position::new(row as u32, start_col),
-        Position::new(row as u32, end_col),
+        Position::new(start_row as u32, start_col),
+        Position::new(end_row as u32, end_col),
     );
     let expected_str = expected_raw.trim();
     Case {

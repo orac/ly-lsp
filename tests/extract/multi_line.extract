@@ -1,0 +1,15 @@
+foo = {
+    a4 b c d
+         >
+    e f g
+    <<<
+    a' b
+}
+---
+music = { c d
+    e f }
+
+foo = {
+    a4 b \music g
+    a' b
+}
