@@ -13,3 +13,38 @@ foo = {
     a4 b \music g
     a' b
 }
+===
+foo = {
+    a4 b c
+         >
+    % comment
+    d e f g
+    <<<<<
+}
+---
+music = { c
+    % comment
+    d e f }
+
+foo = {
+    a4 b \music g
+}
+===
+foo = {
+    a4 b % note
+           >
+    c d e
+    <<<
+}
+---
+INVALID
+===
+foo = {
+    a4 b c
+         >
+    d e % note
+         <
+    f g
+}
+---
+INVALID
