@@ -1,0 +1,20 @@
+foo = { { c d } e }
+        ^^^^^^^
+---
+music = { c d }
+
+foo = { \music e }
+===
+foo = { \repeat unfold 2 { a b c } }
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+---
+music = \repeat unfold 2 { a b c }
+
+foo = { \music }
+===
+foo = { \bar }
+        ^^^^
+---
+music = \bar
+
+foo = { \music }

@@ -1,0 +1,14 @@
+foo = { <c e g> }
+        ^^^
+---
+INVALID
+===
+foo = { c16:32 g8 }
+            ^^^^^
+---
+INVALID
+===
+foo = { c d
+        ^^^
+---
+INVALID

@@ -1,0 +1,8 @@
+foo = { c }
+bar = { d e f }
+        ^^^^^
+---
+foo = { c }
+music = { d e f }
+
+bar = { \music }

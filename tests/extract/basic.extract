@@ -1,0 +1,20 @@
+foo = { c d e }
+      ^^^^^^^^^
+---
+music = { c d e }
+
+foo = \music
+===
+foo = { c d e }
+        ^^^^^
+---
+music = { c d e }
+
+foo = { \music }
+===
+foo = { c d e }
+        ^
+---
+music = { c }
+
+foo = { \music d e }

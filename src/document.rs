@@ -29,6 +29,16 @@ pub struct Include {
     pub span: Span,
 }
 
+/// The information needed to perform an extract-to-variable refactoring.
+pub struct MusicExtractInfo {
+    /// Replace this range in the document with `\name`.
+    pub replace_range: Range,
+    /// Insert `name = music_text\n\n` at this position (always the start of a line).
+    pub insert_before: Position,
+    /// The formatted RHS text for the new definition, e.g. `{ c d e }`.
+    pub music_text: String,
+}
+
 /// The outcome of analysing a parse tree.
 struct Analysis {
     definitions: Vec<Symbol>,
@@ -102,6 +112,157 @@ impl Document {
 
         let tree = parse(&self.text, Some(&self.tree));
         *self = Self::from_parts(std::mem::take(&mut self.text), tree);
+    }
+
+    /// Returns extraction information if `selection` covers a valid sequential
+    /// music expression, or `None` if the refactoring would not be safe.
+    ///
+    /// Valid selections are a whole `{ }` block, a single named music event
+    /// inside a `{ }` block, or a contiguous run of such events (none partially
+    /// covered). The selection boundaries may include surrounding whitespace.
+    pub fn music_extract_info(&self, selection: Range) -> Option<MusicExtractInfo> {
+        let start_byte = self.line_index.offset_at(selection.start)?;
+        let end_byte = self.line_index.offset_at(selection.end)?;
+
+        if start_byte >= end_byte {
+            return None;
+        }
+
+        let root = self.tree.root_node();
+        let container = root.descendant_for_byte_range(start_byte, end_byte)?;
+
+        if container.has_error() {
+            return None;
+        }
+
+        let needs_braces = if container.start_byte() == start_byte
+            && container.end_byte() == end_byte
+        {
+            // Case A: selection exactly matches a single node.
+            if container.kind() == "expression_block" {
+                false
+            } else if container.is_named()
+                && container.kind() != "punctuation"
+                && container.parent().map(|p| p.kind()) == Some("expression_block")
+            {
+                // A \command already forms a complete music expression on its
+                // own; a bare note or chord needs wrapping.
+                container.kind() != "escaped_word"
+            } else {
+                return None;
+            }
+        } else {
+            // Case B: selection is a sub-range within an expression_block.
+            if container.kind() != "expression_block" || container.child_count() < 2 {
+                return None;
+            }
+
+            let open = container.child(0)?;
+            let close = container.child(container.child_count() - 1)?;
+
+            // The { and } must lie fully outside the selection.
+            if start_byte < open.end_byte() || end_byte > close.start_byte() {
+                return None;
+            }
+
+            // No named child may straddle a selection boundary.
+            let mut cur = container.walk();
+            let has_partial = container.named_children(&mut cur).any(|child| {
+                let overlaps =
+                    child.start_byte() < end_byte && child.end_byte() > start_byte;
+                let inside =
+                    child.start_byte() >= start_byte && child.end_byte() <= end_byte;
+                overlaps && !inside
+            });
+            if has_partial {
+                return None;
+            }
+
+            // A selection beginning with \command is taken as "command plus
+            // arguments" — a single expression that needs no extra braces.
+            let mut cur2 = container.walk();
+            let first_selected = container
+                .named_children(&mut cur2)
+                .find(|c| c.start_byte() >= start_byte && c.end_byte() <= end_byte);
+            first_selected.map(|n| n.kind()) != Some("escaped_word")
+        };
+
+        // Trim whitespace at the selection edges.
+        let raw = &self.text[start_byte..end_byte];
+        let leading = raw.len() - raw.trim_start().len();
+        let trailing = raw.len() - raw.trim_end().len();
+        let actual_start = start_byte + leading;
+        let actual_end = end_byte - trailing;
+        if actual_start >= actual_end {
+            return None;
+        }
+
+        // Reject if the selection starts immediately after `:`, which indicates
+        // it cuts through a tremolo specification (e.g. c16:32).
+        if actual_start > 0 && self.text.as_bytes()[actual_start - 1] == b':' {
+            return None;
+        }
+
+        let content = &self.text[actual_start..actual_end];
+        let music_text = if needs_braces {
+            format!("{{ {} }}", content)
+        } else {
+            content.to_string()
+        };
+
+        let replace_range = Range::new(
+            self.line_index.position_at(actual_start),
+            self.line_index.position_at(actual_end),
+        );
+
+        let insert_line_byte = self.statement_start_byte(container)?;
+        let insert_before = self.line_index.position_at(insert_line_byte);
+
+        Some(MusicExtractInfo {
+            replace_range,
+            insert_before,
+            music_text,
+        })
+    }
+
+    /// Returns the byte offset of the start of the line before which a new
+    /// top-level definition should be inserted given that `node` is inside or
+    /// equal to the selected music.
+    fn statement_start_byte(&self, node: Node<'_>) -> Option<usize> {
+        // Walk up to the direct child of lilypond_program.
+        let mut top = node;
+        loop {
+            let parent = top.parent()?;
+            if parent.kind() == "lilypond_program" {
+                break;
+            }
+            top = parent;
+        }
+
+        // Walk backwards through siblings to find the statement start.
+        // Stop when we hit another block (a natural statement boundary) or
+        // when we find the assignment_lhs that owns this statement.
+        let mut stmt = top;
+        let mut scan = top;
+        loop {
+            match scan.prev_sibling() {
+                None => break,
+                Some(prev) => match prev.kind() {
+                    "expression_block" | "parallel_music" => break,
+                    "assignment_lhs" => {
+                        stmt = prev;
+                        break;
+                    }
+                    _ => {
+                        stmt = prev;
+                        scan = prev;
+                    }
+                },
+            }
+        }
+
+        let byte = stmt.start_byte();
+        Some(self.text[..byte].rfind('\n').map_or(0, |i| i + 1))
     }
 
     pub fn definitions(&self) -> &[Symbol] {
@@ -632,4 +793,5 @@ mod tests {
         ));
         assert!(doc.definitions().is_empty());
     }
+
 }

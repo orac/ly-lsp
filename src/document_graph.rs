@@ -6,18 +6,18 @@
 //! eagerly scanned: find-references reports only occurrences in files you have
 //! open, even if a shared include is referenced from a hundred files on disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{
-    Diagnostic, DocumentHighlight, DocumentHighlightKind, Location, Position, Range,
-    TextDocumentContentChangeEvent, Url,
+    Diagnostic, DocumentHighlight, DocumentHighlightKind, Location, Position, Range, TextEdit,
+    TextDocumentContentChangeEvent, Url, WorkspaceEdit,
 };
 
-use crate::document::Document;
+use crate::document::{Document, MusicExtractInfo};
 use crate::vocabulary::Vocabulary;
 
 #[derive(Debug, Default)]
@@ -276,6 +276,59 @@ impl DocumentGraph {
     /// The URIs of all currently open documents.
     fn open_uris(&self) -> Vec<Url> {
         self.open.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// Delegates to [`Document::music_extract_info`] for the document at `uri`.
+    pub fn music_extract_info(&self, uri: &Url, range: Range) -> Option<MusicExtractInfo> {
+        self.with_document(uri, |doc| doc.music_extract_info(range))?
+    }
+
+    /// Renames all definitions and references of the symbol at `position` in
+    /// `uri` to `new_name`, across all open documents that share the same
+    /// definition through their include closure.
+    ///
+    /// Returns `None` if the symbol has no user-defined definition (e.g. a
+    /// built-in command), since renaming those is not meaningful.
+    pub fn rename(&self, uri: &Url, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
+        let name = self.with_document(uri, |doc| {
+            doc.symbol_at(position).map(str::to_string)
+        })??;
+
+        let definitions = self.definitions_of(&name, uri);
+        if definitions.is_empty() {
+            return None;
+        }
+
+        let anchors: HashSet<Url> = definitions.iter().map(|l| l.uri.clone()).collect();
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        for loc in definitions {
+            changes.entry(loc.uri).or_default().push(TextEdit {
+                range: loc.range,
+                new_text: new_name.to_string(),
+            });
+        }
+
+        for open_uri in self.open_uris() {
+            let closure: HashSet<Url> = self.include_closure(&open_uri).into_iter().collect();
+            if closure.is_disjoint(&anchors) {
+                continue;
+            }
+            let ranges = self
+                .with_document(&open_uri, |doc| doc.reference_ranges(&name))
+                .unwrap_or_default();
+            for range in ranges {
+                changes.entry(open_uri.clone()).or_default().push(TextEdit {
+                    range,
+                    new_text: format!("\\{new_name}"),
+                });
+            }
+        }
+
+        Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..WorkspaceEdit::default()
+        })
     }
 
     /// Runs `f` against the document at `uri`. Open documents are used directly;
