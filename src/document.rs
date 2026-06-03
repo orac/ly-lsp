@@ -135,57 +135,7 @@ impl Document {
             return None;
         }
 
-        let needs_braces = if container.start_byte() == start_byte
-            && container.end_byte() == end_byte
-        {
-            // Case A: selection exactly matches a single node.
-            if container.kind() == "expression_block" {
-                false
-            } else if container.is_named()
-                && container.kind() != "punctuation"
-                && container.parent().map(|p| p.kind()) == Some("expression_block")
-            {
-                // A \command already forms a complete music expression on its
-                // own; a bare note or chord needs wrapping.
-                container.kind() != "escaped_word"
-            } else {
-                return None;
-            }
-        } else {
-            // Case B: selection is a sub-range within an expression_block.
-            if container.kind() != "expression_block" || container.child_count() < 2 {
-                return None;
-            }
-
-            let open = container.child(0)?;
-            let close = container.child(container.child_count() - 1)?;
-
-            // The { and } must lie fully outside the selection.
-            if start_byte < open.end_byte() || end_byte > close.start_byte() {
-                return None;
-            }
-
-            // No named child may straddle a selection boundary.
-            let mut cur = container.walk();
-            let has_partial = container.named_children(&mut cur).any(|child| {
-                let overlaps =
-                    child.start_byte() < end_byte && child.end_byte() > start_byte;
-                let inside =
-                    child.start_byte() >= start_byte && child.end_byte() <= end_byte;
-                overlaps && !inside
-            });
-            if has_partial {
-                return None;
-            }
-
-            // A selection beginning with \command is taken as "command plus
-            // arguments" — a single expression that needs no extra braces.
-            let mut cur2 = container.walk();
-            let first_selected = container
-                .named_children(&mut cur2)
-                .find(|c| c.start_byte() >= start_byte && c.end_byte() <= end_byte);
-            first_selected.map(|n| n.kind()) != Some("escaped_word")
-        };
+        let wrapping = music_wrapping(container, &self.text, start_byte, end_byte)?;
 
         // Trim whitespace at the selection edges.
         let raw = &self.text[start_byte..end_byte];
@@ -204,16 +154,7 @@ impl Document {
         }
 
         let content = &self.text[actual_start..actual_end];
-        let music_text = if needs_braces {
-            if let Some((first, rest)) = content.split_once('\n') {
-                let indent: String = rest.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
-                format!("{{\n{}{}\n{}\n}}", indent, first, rest)
-            } else {
-                format!("{{ {} }}", content)
-            }
-        } else {
-            content.to_string()
-        };
+        let music_text = format_music_text(content, wrapping);
 
         let replace_range = Range::new(
             self.line_index.position_at(actual_start),
@@ -389,7 +330,7 @@ impl Document {
             children
                 .into_iter()
                 .filter(|c| c.kind() == target_kind && c.start_byte() < node.start_byte())
-                .last()
+                .next_back()
         }?;
 
         Some([
@@ -530,6 +471,181 @@ fn point_at(text: &str, byte: usize) -> Point {
     let row = before.bytes().filter(|&b| b == b'\n').count();
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     Point::new(row, byte - line_start)
+}
+
+/// Decides whether the music covered by `start_byte..end_byte` must be wrapped
+/// in `{ }` to stand alone as the RHS of a definition, given the smallest node
+/// `container` that encloses the selection.
+///
+/// Returns `None` when the selection is not a valid sequential music expression
+/// to extract: a partially covered event, a selection that swallows a `{` or
+/// `}`, or anything other than a whole `{ }` block or a run of complete events.
+fn needs_braces(container: Node<'_>, start_byte: usize, end_byte: usize) -> Option<bool> {
+    if container.start_byte() == start_byte && container.end_byte() == end_byte {
+        // Case A: selection exactly matches a single node.
+        if container.kind() == "expression_block" {
+            Some(false)
+        } else if container.is_named()
+            && container.kind() != "punctuation"
+            && container.parent().map(|p| p.kind()) == Some("expression_block")
+        {
+            // A \command already forms a complete music expression on its own;
+            // a bare note or chord needs wrapping.
+            Some(container.kind() != "escaped_word")
+        } else {
+            None
+        }
+    } else {
+        // Case B: selection is a sub-range within an expression_block.
+        if container.kind() != "expression_block" || container.child_count() < 2 {
+            return None;
+        }
+
+        let open = container.child(0)?;
+        let close = container.child(container.child_count() - 1)?;
+
+        // The { and } must lie fully outside the selection.
+        if start_byte < open.end_byte() || end_byte > close.start_byte() {
+            return None;
+        }
+
+        // No named child may straddle a selection boundary.
+        let mut cur = container.walk();
+        let has_partial = container.named_children(&mut cur).any(|child| {
+            let overlaps =
+                child.start_byte() < end_byte && child.end_byte() > start_byte;
+            let inside =
+                child.start_byte() >= start_byte && child.end_byte() <= end_byte;
+            overlaps && !inside
+        });
+        if has_partial {
+            return None;
+        }
+
+        // A selection beginning with \command is taken as "command plus
+        // arguments" — a single expression that needs no extra braces.
+        let mut cur2 = container.walk();
+        let first_selected = container
+            .named_children(&mut cur2)
+            .find(|c| c.start_byte() >= start_byte && c.end_byte() <= end_byte);
+        Some(first_selected.map(|n| n.kind()) != Some("escaped_word"))
+    }
+}
+
+/// How an extracted selection must be wrapped to stand alone as the RHS of a
+/// definition.
+enum Wrapping {
+    /// The selection is already a complete expression; use it verbatim.
+    Verbatim,
+    /// Wrap in `{ }`.
+    Braces,
+    /// Wrap in a mode command's block, e.g. `\lyricmode { ... }`. The mode is
+    /// re-established so the content parses correctly wherever the variable is
+    /// referenced, not just at the original site.
+    Mode(&'static str),
+}
+
+/// Decides how the selection covered by `start_byte..end_byte` must be wrapped,
+/// or `None` if it is not a valid music expression to extract.
+fn music_wrapping(
+    container: Node<'_>,
+    src: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<Wrapping> {
+    if !needs_braces(container, start_byte, end_byte)? {
+        return Some(Wrapping::Verbatim);
+    }
+    // Bare events inside a mode block (`\lyricmode { la la }`) are parsed in
+    // that mode, so the extracted definition must restate it.
+    Some(match enclosing_mode(container, src) {
+        Some(mode) => Wrapping::Mode(mode),
+        None => Wrapping::Braces,
+    })
+}
+
+/// If `node` sits inside a mode or context command's block, returns the mode
+/// command the extracted music should be wrapped in. `\lyrics`/`\chords` map to
+/// their mode forms `\lyricmode`/`\chordmode`.
+///
+/// The mode set by the innermost enclosing block is in force, so we ascend
+/// through enclosing `{ }` blocks until one is the argument of a mode command.
+/// Plain music-taking commands like `\repeat` preserve the ambient mode, so a
+/// chord selected inside `\chordmode { \repeat 2 { c:m } }` still extracts as
+/// `\chordmode`. A nested `\notemode` resets to the default mode and halts the
+/// ascent, so music inside it extracts with plain braces even within a mode.
+fn enclosing_mode(node: Node<'_>, src: &str) -> Option<&'static str> {
+    let mut block = if node.kind() == "expression_block" {
+        node
+    } else {
+        // A bare note or chord selected on its own; its parent is the block.
+        enclosing_block(node)?
+    };
+    loop {
+        if let Some(command) = block.prev_sibling()
+            && command.kind() == "escaped_word"
+            && let Some(effect) = mode_command(command.utf8_text(src.as_bytes()).ok()?)
+        {
+            return match effect {
+                ModeEffect::Restate(mode) => Some(mode),
+                ModeEffect::NoteMode => None,
+            };
+        }
+        block = enclosing_block(block)?;
+    }
+}
+
+/// The nearest ancestor `expression_block` of `node`, if any.
+fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cur = node.parent()?;
+    while cur.kind() != "expression_block" {
+        cur = cur.parent()?;
+    }
+    Some(cur)
+}
+
+/// The effect a mode or context command has on how nested music is parsed.
+enum ModeEffect {
+    /// Establishes a non-default mode an extracted definition must restate.
+    Restate(&'static str),
+    /// Returns to the default note mode, which needs no restating.
+    NoteMode,
+}
+
+/// Classifies a mode or context command (with its leading backslash), or
+/// returns `None` for any command that does not change the parsing mode.
+fn mode_command(word: &str) -> Option<ModeEffect> {
+    use ModeEffect::{NoteMode, Restate};
+    match word {
+        "\\lyricmode" | "\\lyrics" => Some(Restate("\\lyricmode")),
+        "\\chordmode" | "\\chords" => Some(Restate("\\chordmode")),
+        "\\figuremode" | "\\figures" => Some(Restate("\\figuremode")),
+        "\\drummode" | "\\drums" => Some(Restate("\\drummode")),
+        "\\markup" => Some(Restate("\\markup")),
+        "\\notemode" | "\\notes" => Some(NoteMode),
+        _ => None,
+    }
+}
+
+/// Formats `content` as a standalone music expression for the RHS of a new
+/// definition, according to `wrapping`. Brace wrapping preserves the
+/// indentation of a multi-line selection.
+fn format_music_text(content: &str, wrapping: Wrapping) -> String {
+    match wrapping {
+        Wrapping::Verbatim => content.to_string(),
+        Wrapping::Braces => braced(content),
+        Wrapping::Mode(mode) => format!("{mode} {}", braced(content)),
+    }
+}
+
+/// Wraps `content` in `{ }`, keeping a multi-line selection's indentation.
+fn braced(content: &str) -> String {
+    if let Some((first, rest)) = content.split_once('\n') {
+        let indent: String = rest.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        format!("{{\n{}{}\n{}\n}}", indent, first, rest)
+    } else {
+        format!("{{ {} }}", content)
+    }
 }
 
 #[cfg(test)]

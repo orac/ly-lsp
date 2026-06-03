@@ -1,0 +1,76 @@
+foo = \lyricmode { la la la }
+                   ^^^^^
+---
+music = \lyricmode { la la }
+
+foo = \lyricmode { \music la }
+===
+foo = \chordmode { c f g }
+                   ^^^
+---
+music = \chordmode { c f }
+
+foo = \chordmode { \music g }
+===
+\chordmode { \repeat unfold 2 { c:m g:7 }}
+                                ^^^
+---
+music = \chordmode { c:m }
+
+\chordmode { \repeat unfold 2 { \music g:7 }}
+===
+foo = \lyrics { la la la }
+                ^^^^^
+---
+music = \lyricmode { la la }
+
+foo = \lyrics { \music la }
+===
+foo = \chords { c f g }
+                ^^^
+---
+music = \chordmode { c f }
+
+foo = \chords { \music g }
+===
+foo = \drummode { bd sn hh }
+                  ^^^^^
+---
+music = \drummode { bd sn }
+
+foo = \drummode { \music hh }
+===
+foo = \drums { bd sn hh }
+               ^^^^^
+---
+music = \drummode { bd sn }
+
+foo = \drums { \music hh }
+===
+foo = \figuremode { <4> <6> <5> }
+                    ^^^^^^^
+---
+music = \figuremode { <4> <6> }
+
+foo = \figuremode { \music <5> }
+===
+foo = \figures { <4> <6> <5> }
+                 ^^^^^^^
+---
+music = \figuremode { <4> <6> }
+
+foo = \figures { \music <5> }
+===
+foo = \markup { hello world now }
+                ^^^^^^^^^^^
+---
+music = \markup { hello world }
+
+foo = \markup { \music now }
+===
+\chordmode { \notemode { c d e } }
+                         ^^^
+---
+music = { c d }
+
+\chordmode { \notemode { \music e } }
