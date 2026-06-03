@@ -12,6 +12,7 @@ use tower_lsp::lsp_types::{
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::line_struct::{LineIndex, Span};
+use crate::notes::{self, Event, NoteAnalysis, Problem};
 
 /// A named occurrence in the source: either a definition (`foo = ...`) or a
 /// reference (`\foo`). `span` covers the clickable extent of the occurrence.
@@ -57,6 +58,7 @@ pub struct Document {
     definitions: Vec<Symbol>,
     references: Vec<Symbol>,
     includes: Vec<Include>,
+    notes: NoteAnalysis,
 }
 
 impl Document {
@@ -69,6 +71,7 @@ impl Document {
     fn from_parts(text: String, tree: Tree) -> Self {
         let line_index = LineIndex::new(&text);
         let analysis = extract(&tree, &text);
+        let notes = notes::analyse(&tree, &text);
         Self {
             text,
             tree,
@@ -76,6 +79,7 @@ impl Document {
             definitions: analysis.definitions,
             references: analysis.references,
             includes: analysis.includes,
+            notes,
         }
     }
 
@@ -223,6 +227,11 @@ impl Document {
         &self.includes
     }
 
+    /// The lexically resolved music events, in source order.
+    pub fn notes(&self) -> &[Event] {
+        &self.notes.events
+    }
+
     /// Syntax diagnostics from the parse tree. Tree-sitter's error recovery
     /// marks regions it couldn't parse as ERROR nodes and tokens it expected
     /// but didn't find as MISSING nodes; we surface both.
@@ -231,6 +240,26 @@ impl Document {
         let root = self.tree.root_node();
         if root.has_error() {
             self.collect_syntax_errors(root, &mut diagnostics);
+        }
+        for &problem in &self.notes.problems {
+            let span = problem.span();
+            let (severity, message) = match problem {
+                Problem::NotANote(_) => (
+                    DiagnosticSeverity::WARNING,
+                    format!("`{}` is not a note name", &self.text[span.start..span.end]),
+                ),
+                Problem::DanglingColon(_) => (
+                    DiagnosticSeverity::ERROR,
+                    "expected a chord modifier or tremolo after `:`".to_string(),
+                ),
+            };
+            diagnostics.push(Diagnostic {
+                range: self.line_index.range_of(span),
+                severity: Some(severity),
+                source: Some("ly-lsp".to_string()),
+                message,
+                ..Diagnostic::default()
+            });
         }
         diagnostics
     }
