@@ -94,7 +94,10 @@ fn extract_cases() {
         })
         .collect();
     paths.sort();
-    assert!(!paths.is_empty(), "no .extract files found in tests/extract/");
+    assert!(
+        !paths.is_empty(),
+        "no .extract files found in tests/extract/"
+    );
 
     for path in &paths {
         let content = std::fs::read_to_string(path).unwrap();
@@ -108,8 +111,7 @@ fn extract_cases() {
             match case.expected {
                 None => assert!(result.is_none(), "{label}: expected INVALID"),
                 Some(exp) => {
-                    let info = result
-                        .unwrap_or_else(|| panic!("{label}: expected Some, got None"));
+                    let info = result.unwrap_or_else(|| panic!("{label}: expected Some, got None"));
                     let actual = apply_extract(&case.source, &info);
                     assert_eq!(actual.trim_end(), exp, "{label}");
                 }

@@ -12,3 +12,8 @@ foo = { c d
         ^^^
 ---
 INVALID
+===
+foo = { c4 d }
+        ^
+---
+INVALID

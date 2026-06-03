@@ -13,8 +13,8 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{
-    Diagnostic, DocumentHighlight, DocumentHighlightKind, Location, Position, Range, TextEdit,
-    TextDocumentContentChangeEvent, Url, WorkspaceEdit,
+    Diagnostic, DocumentHighlight, DocumentHighlightKind, Location, Position, Range,
+    TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::document::{Document, MusicExtractInfo};
@@ -290,9 +290,7 @@ impl DocumentGraph {
     /// Returns `None` if the symbol has no user-defined definition (e.g. a
     /// built-in command), since renaming those is not meaningful.
     pub fn rename(&self, uri: &Url, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
-        let name = self.with_document(uri, |doc| {
-            doc.symbol_at(position).map(str::to_string)
-        })??;
+        let name = self.with_document(uri, |doc| doc.symbol_at(position).map(str::to_string))??;
 
         let definitions = self.definitions_of(&name, uri);
         if definitions.is_empty() {

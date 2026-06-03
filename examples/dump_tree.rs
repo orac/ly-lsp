@@ -18,8 +18,9 @@ use tree_sitter::{Node, Parser};
 
 fn main() {
     let src = match std::env::args().nth(1) {
-        Some(path) => std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {path}: {e}")),
+        Some(path) => {
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+        }
         None => {
             let mut buf = String::new();
             std::io::stdin()

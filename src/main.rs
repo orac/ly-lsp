@@ -149,10 +149,7 @@ impl LanguageServer for Backend {
         Ok(Some(locations))
     }
 
-    async fn code_action(
-        &self,
-        params: CodeActionParams,
-    ) -> Result<Option<CodeActionResponse>> {
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
         let Some(info) = self.documents.music_extract_info(uri, params.range) else {
             return Ok(None);

@@ -12,7 +12,8 @@ use tower_lsp::lsp_types::{
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::line_struct::{LineIndex, Span};
-use crate::notes::{self, Event, NoteAnalysis, Problem};
+use crate::note_analyser;
+use crate::notes::{Events, NoteAnalysis, Problem};
 
 /// A named occurrence in the source: either a definition (`foo = ...`) or a
 /// reference (`\foo`). `span` covers the clickable extent of the occurrence.
@@ -71,7 +72,7 @@ impl Document {
     fn from_parts(text: String, tree: Tree) -> Self {
         let line_index = LineIndex::new(&text);
         let analysis = extract(&tree, &text);
-        let notes = notes::analyse(&tree, &text);
+        let notes = note_analyser::analyse(&tree, &text);
         Self {
             text,
             tree,
@@ -151,9 +152,17 @@ impl Document {
             return None;
         }
 
-        // Reject if the selection starts immediately after `:`, which indicates
-        // it cuts through a tremolo specification (e.g. c16:32).
-        if actual_start > 0 && self.text.as_bytes()[actual_start - 1] == b':' {
+        // Reject a selection that cuts through a note, chord or rest: every
+        // event it touches must lie wholly inside it. This catches a boundary
+        // landing inside a multi-token event the tree would otherwise let
+        // through, e.g. partway through a `c16:32` tremolo or a `<c e g>` chord.
+        if self
+            .notes
+            .events
+            .overlapping(actual_start, actual_end)
+            .iter()
+            .any(|event| event.span.start < actual_start || event.span.end > actual_end)
+        {
             return None;
         }
 
@@ -227,8 +236,8 @@ impl Document {
         &self.includes
     }
 
-    /// The lexically resolved music events, in source order.
-    pub fn notes(&self) -> &[Event] {
+    /// The lexically resolved music events, queryable by position or span.
+    pub fn notes(&self) -> &Events {
         &self.notes.events
     }
 
@@ -358,8 +367,7 @@ impl Document {
         } else {
             children
                 .into_iter()
-                .filter(|c| c.kind() == target_kind && c.start_byte() < node.start_byte())
-                .next_back()
+                .rfind(|c| c.kind() == target_kind && c.start_byte() < node.start_byte())
         }?;
 
         Some([
@@ -541,10 +549,8 @@ fn needs_braces(container: Node<'_>, start_byte: usize, end_byte: usize) -> Opti
         // No named child may straddle a selection boundary.
         let mut cur = container.walk();
         let has_partial = container.named_children(&mut cur).any(|child| {
-            let overlaps =
-                child.start_byte() < end_byte && child.end_byte() > start_byte;
-            let inside =
-                child.start_byte() >= start_byte && child.end_byte() <= end_byte;
+            let overlaps = child.start_byte() < end_byte && child.end_byte() > start_byte;
+            let inside = child.start_byte() >= start_byte && child.end_byte() <= end_byte;
             overlaps && !inside
         });
         if has_partial {
@@ -670,7 +676,10 @@ fn format_music_text(content: &str, wrapping: Wrapping) -> String {
 /// Wraps `content` in `{ }`, keeping a multi-line selection's indentation.
 fn braced(content: &str) -> String {
     if let Some((first, rest)) = content.split_once('\n') {
-        let indent: String = rest.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let indent: String = rest
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
         format!("{{\n{}{}\n{}\n}}", indent, first, rest)
     } else {
         format!("{{ {} }}", content)
@@ -943,5 +952,4 @@ mod tests {
         ));
         assert!(doc.definitions().is_empty());
     }
-
 }

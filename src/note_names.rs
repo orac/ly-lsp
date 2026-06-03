@@ -1114,4 +1114,3 @@ static VLAAMS_NAMES: &[(&str, u8, i8)] = &[
     ("solkhk", 4, 3),
     ("solkk", 4, 4),
 ];
-

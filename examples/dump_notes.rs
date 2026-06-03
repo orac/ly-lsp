@@ -11,17 +11,21 @@
 
 use std::io::Read;
 
-use ly_lsp::notes::{self, EventKind};
+use ly_lsp::note_analyser::analyse;
+use ly_lsp::notes::{ChordNote, EventKind};
 
 use tree_sitter::Parser;
 
 fn main() {
     let src = match std::env::args().nth(1) {
-        Some(path) => std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {path}: {e}")),
+        Some(path) => {
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+        }
         None => {
             let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf).expect("read stdin");
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .expect("read stdin");
             buf
         }
     };
@@ -31,11 +35,15 @@ fn main() {
         .set_language(&tree_sitter_lilypond::LANGUAGE_LILYPOND.into())
         .expect("load LilyPond grammar");
     let tree = parser.parse(&src, None).expect("parser produces a tree");
-    let analysis = notes::analyse(&tree, &src);
+    let analysis = analyse(&tree, &src);
 
-    for event in &analysis.events {
+    for event in analysis.events.iter() {
         let text = &src[event.span.start..event.span.end];
-        let inherited = if event.duration_written { "" } else { " (inherited)" };
+        let inherited = if event.duration_written {
+            ""
+        } else {
+            " (inherited)"
+        };
         let kind = match &event.kind {
             EventKind::Note { pitch, .. } => format!("note {pitch:?}"),
             EventKind::Chord(notes) => format!("chord {:?}", pitch_list(notes)),
@@ -53,7 +61,7 @@ fn main() {
     }
 }
 
-fn pitch_list(notes: &[notes::ChordNote]) -> Vec<(u8, i32, i8)> {
+fn pitch_list(notes: &[ChordNote]) -> Vec<(u8, i32, i8)> {
     notes
         .iter()
         .map(|n| (n.pitch.note_name, n.pitch.octave, n.pitch.alteration))
