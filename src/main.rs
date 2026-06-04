@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tower_lsp::jsonrpc::Result;
@@ -74,7 +73,13 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        // Edits are computed lazily, in `code_action_resolve`.
+                        resolve_provider: Some(true),
+                        ..CodeActionOptions::default()
+                    },
+                )),
                 rename_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
@@ -150,45 +155,14 @@ impl LanguageServer for Backend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let uri = &params.text_document.uri;
-        let Some(info) = self.documents.music_extract_info(uri, params.range) else {
-            return Ok(None);
-        };
+        let actions = self
+            .documents
+            .code_actions(&params.text_document.uri, params.range);
+        Ok((!actions.is_empty()).then_some(actions))
+    }
 
-        let default_name = "music";
-        let insert_text = format!("{} = {}\n\n", default_name, info.music_text);
-
-        let mut edits = vec![
-            TextEdit {
-                range: Range::new(info.insert_before, info.insert_before),
-                new_text: insert_text,
-            },
-            TextEdit {
-                range: info.replace_range,
-                new_text: format!("\\{}", default_name),
-            },
-        ];
-        edits.extend(info.following_edits);
-
-        let mut changes = HashMap::new();
-        changes.insert(uri.clone(), edits);
-
-        let action = CodeAction {
-            title: "Extract to variable".to_string(),
-            kind: Some(CodeActionKind::REFACTOR_EXTRACT),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..WorkspaceEdit::default()
-            }),
-            command: Some(Command {
-                title: "Rename".to_string(),
-                command: "editor.action.rename".to_string(),
-                arguments: None,
-            }),
-            ..CodeAction::default()
-        };
-
-        Ok(Some(vec![CodeActionOrCommand::CodeAction(action)]))
+    async fn code_action_resolve(&self, action: CodeAction) -> Result<CodeAction> {
+        Ok(self.documents.resolve_code_action(action))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {

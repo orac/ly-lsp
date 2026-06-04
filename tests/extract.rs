@@ -1,37 +1,29 @@
-use ly_lsp::document::{Document, MusicExtractInfo};
+use ly_lsp::code_action::CodeAction;
+use ly_lsp::code_action::extract_to_variable::ExtractToVariable;
+use ly_lsp::document::Document;
 use ly_lsp::line_struct::LineIndex;
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
-// Applies every extract edit to `src` using the fixed default name "music":
-// the new definition, the `\music` replacement, and any following-note fixes.
-// Edits are non-overlapping, so applying them from the latest offset to the
-// earliest keeps the untouched offsets valid.
-fn apply_extract(src: &str, info: &MusicExtractInfo) -> String {
+// Applies the action's edits to `src`. The edits are non-overlapping, so
+// applying them from the latest offset to the earliest keeps the untouched
+// offsets valid.
+fn apply_edits(src: &str, edits: &[TextEdit]) -> String {
     let idx = LineIndex::new(src);
-    let mut edits: Vec<(usize, usize, String)> = vec![
-        (
-            idx.offset_at(info.insert_before).unwrap(),
-            idx.offset_at(info.insert_before).unwrap(),
-            format!("music = {}\n\n", info.music_text),
-        ),
-        (
-            idx.offset_at(info.replace_range.start).unwrap(),
-            idx.offset_at(info.replace_range.end).unwrap(),
-            "\\music".to_string(),
-        ),
-    ];
-    for edit in &info.following_edits {
-        edits.push((
-            idx.offset_at(edit.range.start).unwrap(),
-            idx.offset_at(edit.range.end).unwrap(),
-            edit.new_text.clone(),
-        ));
-    }
-    edits.sort_by_key(|&(start, ..)| std::cmp::Reverse(start));
+    let mut spliced: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|edit| {
+            (
+                idx.offset_at(edit.range.start).unwrap(),
+                idx.offset_at(edit.range.end).unwrap(),
+                edit.new_text.as_str(),
+            )
+        })
+        .collect();
+    spliced.sort_by_key(|&(start, ..)| std::cmp::Reverse(start));
 
     let mut out = src.to_string();
-    for (start, end, text) in edits {
-        out.replace_range(start..end, &text);
+    for (start, end, text) in spliced {
+        out.replace_range(start..end, text);
     }
     out
 }
@@ -125,13 +117,18 @@ fn extract_cases() {
         for (i, case) in parse_file(&content).into_iter().enumerate() {
             let label = format!("{file}[{i}]");
             let doc = Document::new(case.source.clone());
-            let result = doc.music_extract_info(case.selection);
+            let offered = ExtractToVariable::offer(&doc, case.selection).is_some();
 
             match case.expected {
-                None => assert!(result.is_none(), "{label}: expected INVALID"),
+                // `offer` and `apply` share the validity check, so an invalid
+                // selection must be neither offered nor applied — no dead menu
+                // entries.
+                None => assert!(!offered, "{label}: expected INVALID"),
                 Some(exp) => {
-                    let info = result.unwrap_or_else(|| panic!("{label}: expected Some, got None"));
-                    let actual = apply_extract(&case.source, &info);
+                    assert!(offered, "{label}: expected the action to be offered");
+                    let resolved = ExtractToVariable::resolve(&doc, case.selection)
+                        .unwrap_or_else(|| panic!("{label}: expected edits, got None"));
+                    let actual = apply_edits(&case.source, &resolved.edits);
                     assert_eq!(actual.trim_end(), exp, "{label}");
                 }
             }

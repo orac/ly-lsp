@@ -13,11 +13,11 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{
-    Diagnostic, DocumentHighlight, DocumentHighlightKind, Location, Position, Range,
-    TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
+    CodeAction, CodeActionOrCommand, Diagnostic, DocumentHighlight, DocumentHighlightKind,
+    Location, Position, Range, TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
 };
 
-use crate::document::{Document, MusicExtractInfo};
+use crate::document::Document;
 use crate::vocabulary::Vocabulary;
 
 #[derive(Debug, Default)]
@@ -278,9 +278,22 @@ impl DocumentGraph {
         self.open.iter().map(|entry| entry.key().clone()).collect()
     }
 
-    /// Delegates to [`Document::music_extract_info`] for the document at `uri`.
-    pub fn music_extract_info(&self, uri: &Url, range: Range) -> Option<MusicExtractInfo> {
-        self.with_document(uri, |doc| doc.music_extract_info(range))?
+    /// The code actions on offer for `range` in the document at `uri`, as
+    /// unresolved actions whose edits are filled in later by
+    /// [`resolve_code_action`](Self::resolve_code_action).
+    pub fn code_actions(&self, uri: &Url, range: Range) -> Vec<CodeActionOrCommand> {
+        self.with_document(uri, |doc| crate::code_action::offer_all(doc, uri, range))
+            .unwrap_or_default()
+    }
+
+    /// Fills in the edits for a previously offered `action`, looking up the
+    /// document it targets. Returns it unchanged if that document is gone.
+    pub fn resolve_code_action(&self, action: CodeAction) -> CodeAction {
+        let Some(uri) = crate::code_action::target_uri(&action) else {
+            return action;
+        };
+        self.with_document(&uri, |doc| crate::code_action::resolve(doc, action.clone()))
+            .unwrap_or(action)
     }
 
     /// Renames all definitions and references of the symbol at `position` in
