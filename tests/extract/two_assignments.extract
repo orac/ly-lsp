@@ -3,6 +3,6 @@ bar = { d e f }
         ^^^^^
 ---
 foo = { c }
-music = { d e f }
+music = { d4 e f }
 
 bar = { \music }

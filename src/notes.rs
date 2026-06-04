@@ -109,6 +109,15 @@ pub enum EventKind {
     ChordRepetition(Vec<ChordNote>),
 }
 
+/// The `\relative` reference in force just before an event: the reference
+/// pitch (for octave arithmetic) and a spelling of it in the active note-name
+/// language (for a generated `\relative` wrapper, e.g. `c'`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelativeRef {
+    pub pitch: Pitch,
+    pub text: String,
+}
+
 /// A single rhythmic event in the music, with its lexically resolved state.
 ///
 /// The `span` covers the written event — pitch, octave marks, accidental
@@ -123,6 +132,11 @@ pub struct Event {
     /// Whether the source wrote a duration here, or it was inherited from an
     /// earlier event.
     pub duration_written: bool,
+    /// In `\relative` mode, the reference in force just before this event;
+    /// `None` in absolute and `\fixed` modes, where octaves don't depend on a
+    /// reference. Lets a refactoring re-establish the octave when the event's
+    /// surroundings change.
+    pub relative: Option<RelativeRef>,
 }
 
 /// The resolved music events of a document, kept in source order. Events never
@@ -210,6 +224,7 @@ mod tests {
             kind: EventKind::Rest,
             duration: Duration::DEFAULT,
             duration_written: false,
+            relative: None,
         }
     }
 

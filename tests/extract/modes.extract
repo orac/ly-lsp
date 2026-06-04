@@ -71,6 +71,6 @@ foo = \markup { \music now }
 \chordmode { \notemode { c d e } }
                          ^^^
 ---
-music = { c d }
+music = { c4 d }
 
 \chordmode { \notemode { \music e } }

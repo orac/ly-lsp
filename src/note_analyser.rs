@@ -63,7 +63,9 @@ use tree_sitter::{Node, Tree};
 
 use crate::line_struct::Span;
 use crate::note_names::Language;
-use crate::notes::{ChordNote, Duration, Event, EventKind, Events, NoteAnalysis, Pitch, Problem};
+use crate::notes::{
+    ChordNote, Duration, Event, EventKind, Events, NoteAnalysis, Pitch, Problem, RelativeRef,
+};
 
 /// The octave-entry mode in force for a span of music. The default at the top
 /// level (and inside a plain `{ }`) is [`Mode::Absolute`].
@@ -383,6 +385,7 @@ impl<'a> Analyser<'a> {
         let symbol = children[start];
         let name = self.text(symbol);
         let begin = symbol.start_byte();
+        let relative = self.relative_ref(*mode);
         let mut i = start + 1;
 
         // `r`/`R`/`s`/`q` are never note names; check them before the language.
@@ -397,7 +400,7 @@ impl<'a> Analyser<'a> {
             let (duration, written) = self.parse_duration(children, &mut i);
             let after_duration = children[i - 1].end_byte();
             let end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
-            self.push_event(begin, end, kind, duration, written);
+            self.push_event(begin, end, kind, duration, written, relative);
             return i;
         }
 
@@ -433,6 +436,7 @@ impl<'a> Analyser<'a> {
             },
             duration,
             written,
+            relative,
         );
         i
     }
@@ -441,6 +445,7 @@ impl<'a> Analyser<'a> {
     /// that follows it, returning the next index.
     fn read_chord(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
         let chord = children[start];
+        let relative = self.relative_ref(*mode);
         let notes = self.read_chord_notes(chord, *mode);
 
         // The reference for the next note is the chord's first note.
@@ -465,6 +470,7 @@ impl<'a> Analyser<'a> {
             EventKind::Chord(notes),
             duration,
             written,
+            relative,
         );
         i
     }
@@ -661,6 +667,7 @@ impl<'a> Analyser<'a> {
         (duration, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_event(
         &mut self,
         start: usize,
@@ -668,20 +675,46 @@ impl<'a> Analyser<'a> {
         kind: EventKind,
         duration: Duration,
         duration_written: bool,
+        relative: Option<RelativeRef>,
     ) {
         self.events.push(Event {
             span: Span::new(start, end),
             kind,
             duration,
             duration_written,
+            relative,
         });
+    }
+
+    /// The `\relative` reference in force in `mode`, spelled in the active
+    /// language, or `None` outside `\relative`.
+    fn relative_ref(&self, mode: Mode) -> Option<RelativeRef> {
+        match mode {
+            Mode::Relative(pitch) => Some(RelativeRef {
+                pitch,
+                text: self.spell_pitch(pitch),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Spells `pitch` as absolute LilyPond text (e.g. `cis'`) in the active
+    /// language, falling back to the bare note letter for a pitch the language
+    /// cannot name.
+    fn spell_pitch(&self, pitch: Pitch) -> String {
+        const LETTERS: [&str; 7] = ["c", "d", "e", "f", "g", "a", "b"];
+        let name = self
+            .language
+            .spell(pitch.note_name, pitch.alteration)
+            .unwrap_or(LETTERS[(pitch.note_name % 7) as usize]);
+        format!("{name}{}", absolute_octave_marks(pitch.octave))
     }
 }
 
 /// LilyPond's relative-octave rule (`Pitch::to_relative_octave`): place the new
 /// note name in whichever octave is closest in diatonic steps to `reference`
 /// (ties going down), then apply the net written marks.
-fn relative_octave(reference: Pitch, note_name: u8, net_marks: i32) -> i32 {
+pub fn relative_octave(reference: Pitch, note_name: u8, net_marks: i32) -> i32 {
     let here = reference.note_name as i32 + reference.octave * 7;
     let up_octave = reference.octave + i32::from(reference.note_name as i32 > note_name as i32);
     let down_octave = reference.octave - i32::from((reference.note_name as i32) < note_name as i32);
@@ -693,6 +726,16 @@ fn relative_octave(reference: Pitch, note_name: u8, net_marks: i32) -> i32 {
         down_octave
     };
     chosen + net_marks
+}
+
+/// Spells an absolute octave as LilyPond marks: middle C (`octave 0`) is one
+/// `'`, the bare `c` (`octave -1`) is none, each step adds a `'` or `,`.
+fn absolute_octave_marks(octave: i32) -> String {
+    if octave >= 0 {
+        "'".repeat((octave + 1) as usize)
+    } else {
+        ",".repeat((-octave - 1) as usize)
+    }
 }
 
 fn is_block(kind: &str) -> bool {

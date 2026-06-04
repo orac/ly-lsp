@@ -84,6 +84,16 @@ impl Language {
                 (note, alt)
             })
     }
+
+    /// A spelling for the pitch `(note name, alteration)` in this language, or
+    /// `None` if it has no name for it. The table lists the canonical spelling
+    /// before any alternatives, so the first match is the canonical one.
+    pub fn spell(self, note_name: u8, alteration: i8) -> Option<&'static str> {
+        self.table()
+            .iter()
+            .find(|&&(_, note, alt)| note == note_name && alt == alteration)
+            .map(|&(name, _, _)| name)
+    }
 }
 
 #[rustfmt::skip]

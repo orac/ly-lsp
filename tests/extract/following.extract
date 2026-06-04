@@ -1,0 +1,6 @@
+foo = { c8 d16 e f }
+           ^^^^^
+---
+music = { d16 e }
+
+foo = { c8 \music f16 }

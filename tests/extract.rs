@@ -2,18 +2,37 @@ use ly_lsp::document::{Document, MusicExtractInfo};
 use ly_lsp::line_struct::LineIndex;
 use tower_lsp::lsp_types::{Position, Range};
 
-// Applies the two extract edits to `src` using the fixed default name "music".
-// The replace is applied first (it comes later in the text and doesn't shift
-// the insert position, which is always <= the replace start).
+// Applies every extract edit to `src` using the fixed default name "music":
+// the new definition, the `\music` replacement, and any following-note fixes.
+// Edits are non-overlapping, so applying them from the latest offset to the
+// earliest keeps the untouched offsets valid.
 fn apply_extract(src: &str, info: &MusicExtractInfo) -> String {
     let idx = LineIndex::new(src);
-    let replace_start = idx.offset_at(info.replace_range.start).unwrap();
-    let replace_end = idx.offset_at(info.replace_range.end).unwrap();
-    let insert_pos = idx.offset_at(info.insert_before).unwrap();
+    let mut edits: Vec<(usize, usize, String)> = vec![
+        (
+            idx.offset_at(info.insert_before).unwrap(),
+            idx.offset_at(info.insert_before).unwrap(),
+            format!("music = {}\n\n", info.music_text),
+        ),
+        (
+            idx.offset_at(info.replace_range.start).unwrap(),
+            idx.offset_at(info.replace_range.end).unwrap(),
+            "\\music".to_string(),
+        ),
+    ];
+    for edit in &info.following_edits {
+        edits.push((
+            idx.offset_at(edit.range.start).unwrap(),
+            idx.offset_at(edit.range.end).unwrap(),
+            edit.new_text.clone(),
+        ));
+    }
+    edits.sort_by_key(|&(start, ..)| std::cmp::Reverse(start));
 
     let mut out = src.to_string();
-    out.replace_range(replace_start..replace_end, "\\music");
-    out.insert_str(insert_pos, &format!("music = {}\n\n", info.music_text));
+    for (start, end, text) in edits {
+        out.replace_range(start..end, &text);
+    }
     out
 }
 

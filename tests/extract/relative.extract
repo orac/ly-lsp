@@ -1,0 +1,46 @@
+relativeMiddle = \relative c' { c d e f }
+                                  ^^^
+---
+music = \relative c' { d4 e }
+
+relativeMiddle = \relative c' { c \music f }
+===
+correctOctaveAfter = \relative c' { c g e }
+                                      ^
+---
+music = \relative c' { g4 }
+
+correctOctaveAfter = \relative c' { c \music e, }
+===
+removeOctaveAfter = \relative c' { c g e' }
+                                     ^
+---
+music = \relative c' { g4 }
+
+removeOctaveAfter = \relative c' { c \music e }
+===
+octaveOfChordAfter = \relative c' { c g <e g> }
+                                      ^
+---
+music = \relative c' { g4 }
+
+octaveOfChordAfter = \relative c' { c \music <e, g> }
+===
+adjustOctave = \relative c' { c' g e' }
+                                 ^
+---
+music = \relative c'' { g4 }
+
+adjustOctave = \relative c' { c' \music e }
+===
+extractFirstInRelative = \relative c' { c' e }
+                                        ^^^
+---
+music = \relative c' { c'4 }
+
+extractFirstInRelative = \relative c' { \music e' }
+===
+cantExtractAnchor = \relative c' { c }
+                              ^
+---
+INVALID

@@ -1,14 +1,14 @@
 foo = { { c d } e }
         ^^^^^^^
 ---
-music = { c d }
+music = { c4 d }
 
 foo = { \music e }
 ===
 foo = { \repeat unfold 2 { a b c } }
         ^^^^^^^^^^^^^^^^^^^^^^^^^^
 ---
-music = \repeat unfold 2 { a b c }
+music = \repeat unfold 2 { a4 b c }
 
 foo = { \music }
 ===

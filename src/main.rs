@@ -158,20 +158,20 @@ impl LanguageServer for Backend {
         let default_name = "music";
         let insert_text = format!("{} = {}\n\n", default_name, info.music_text);
 
+        let mut edits = vec![
+            TextEdit {
+                range: Range::new(info.insert_before, info.insert_before),
+                new_text: insert_text,
+            },
+            TextEdit {
+                range: info.replace_range,
+                new_text: format!("\\{}", default_name),
+            },
+        ];
+        edits.extend(info.following_edits);
+
         let mut changes = HashMap::new();
-        changes.insert(
-            uri.clone(),
-            vec![
-                TextEdit {
-                    range: Range::new(info.insert_before, info.insert_before),
-                    new_text: insert_text,
-                },
-                TextEdit {
-                    range: info.replace_range,
-                    new_text: format!("\\{}", default_name),
-                },
-            ],
-        );
+        changes.insert(uri.clone(), edits);
 
         let action = CodeAction {
             title: "Extract to variable".to_string(),

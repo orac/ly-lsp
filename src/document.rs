@@ -7,13 +7,13 @@ use std::sync::OnceLock;
 
 use streaming_iterator::StreamingIterator;
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent,
+    Diagnostic, DiagnosticSeverity, Position, Range, TextDocumentContentChangeEvent, TextEdit,
 };
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::line_struct::{LineIndex, Span};
-use crate::note_analyser;
-use crate::notes::{Events, NoteAnalysis, Problem};
+use crate::note_analyser::{self, relative_octave};
+use crate::notes::{Duration, Event, EventKind, Events, NoteAnalysis, Pitch, Problem};
 
 /// A named occurrence in the source: either a definition (`foo = ...`) or a
 /// reference (`\foo`). `span` covers the clickable extent of the occurrence.
@@ -37,8 +37,14 @@ pub struct MusicExtractInfo {
     pub replace_range: Range,
     /// Insert `name = music_text\n\n` at this position (always the start of a line).
     pub insert_before: Position,
-    /// The formatted RHS text for the new definition, e.g. `{ c d e }`.
+    /// The formatted RHS for the new definition, e.g. `{ c4 d e }` or
+    /// `\relative c' { c4 d e }`.
     pub music_text: String,
+    /// Edits to music left behind that keep its meaning once the selection
+    /// moves into the variable — currently making the following note's pitch or
+    /// duration explicit where extraction would otherwise change it. Applied
+    /// alongside the insert and replace.
+    pub following_edits: Vec<TextEdit>,
 }
 
 /// The outcome of analysing a parse tree.
@@ -152,22 +158,38 @@ impl Document {
             return None;
         }
 
+        let selected = self.notes.events.overlapping(actual_start, actual_end);
+
         // Reject a selection that cuts through a note, chord or rest: every
         // event it touches must lie wholly inside it. This catches a boundary
         // landing inside a multi-token event the tree would otherwise let
         // through, e.g. partway through a `c16:32` tremolo or a `<c e g>` chord.
-        if self
-            .notes
-            .events
-            .overlapping(actual_start, actual_end)
+        if selected
             .iter()
             .any(|event| event.span.start < actual_start || event.span.end > actual_end)
         {
             return None;
         }
 
-        let content = &self.text[actual_start..actual_end];
-        let music_text = format_music_text(content, wrapping);
+        // Make the variable's first event carry an explicit duration: once it is
+        // detached from its surroundings, an omitted duration would inherit from
+        // wherever the variable is defined instead of from the original context.
+        let mut content = self.text[actual_start..actual_end].to_string();
+        if let Some(first) = selected.first()
+            && !first.duration_written
+        {
+            content.insert_str(first.span.end - actual_start, &first.duration.to_string());
+        }
+
+        let mut music_text = format_music_text(&content, wrapping);
+
+        // If the selection sits inside `\relative`, give the variable its own
+        // `\relative` so its notes keep their octaves wherever it is used. The
+        // reference in force before the selection makes the first note resolve
+        // exactly as it did originally.
+        if let Some(reference) = selected.first().and_then(|e| e.relative.as_ref()) {
+            music_text = format!("\\relative {} {}", reference.text, music_text);
+        }
 
         let replace_range = Range::new(
             self.line_index.position_at(actual_start),
@@ -177,10 +199,91 @@ impl Document {
         let insert_line_byte = self.statement_start_byte(container)?;
         let insert_before = self.line_index.position_at(insert_line_byte);
 
+        let following_edits = self.following_note_edits(selected, actual_start, actual_end);
+
         Some(MusicExtractInfo {
             replace_range,
             insert_before,
             music_text,
+            following_edits,
+        })
+    }
+
+    /// Edits that keep the note *after* the selection meaning the same once the
+    /// selection is behind a `\music` reference (which leaks neither duration
+    /// nor relative octave). The note inherits the duration in force *before*
+    /// the selection, and resolves its octave from the reference there, so an
+    /// omitted duration or octave that those would change is made explicit.
+    fn following_note_edits(
+        &self,
+        selected: &[Event],
+        actual_start: usize,
+        actual_end: usize,
+    ) -> Vec<TextEdit> {
+        let mut edits = Vec::new();
+        let Some(next) = self.notes.events.iter().find(|e| e.span.start >= actual_end) else {
+            return edits;
+        };
+
+        // The next note will now follow the music before the selection, so it
+        // is that music's state — not the selection's — that it inherits.
+        let before = self
+            .notes
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.span.end <= actual_start);
+        let duration_before = before.map_or(Duration::DEFAULT, |e| e.duration);
+
+        if !next.duration_written && duration_before != next.duration {
+            let pos = self.line_index.position_at(next.span.end);
+            edits.push(TextEdit {
+                range: Range::new(pos, pos),
+                new_text: next.duration.to_string(),
+            });
+        }
+
+        // The next note's octave only shifts when the selection was relative and
+        // the note follows the selection's last note directly in that chain (so
+        // its reference was that note, which extraction now replaces with the
+        // reference from before the selection). For a chord it is the first note
+        // that carries the reference; the rest follow it.
+        if let Some(outer) = selected.first().and_then(|e| e.relative.as_ref())
+            && next.relative.as_ref().map(|r| r.pitch) == selected.iter().rev().find_map(pitch_of)
+            && let Some((span, pitch)) = leading_note(next)
+            && let Some(edit) = self.octave_fix(span, pitch, outer.pitch)
+        {
+            edits.push(edit);
+        }
+
+        edits
+    }
+
+    /// An edit re-spelling the octave marks of the note at `span` (resolved
+    /// pitch `pitch`) so it still resolves to `pitch` against reference `outer`,
+    /// or `None` if its marks are already right or its octave is pinned by a
+    /// `=` check. Covers adding, changing and removing marks.
+    fn octave_fix(&self, span: Span, pitch: Pitch, outer: Pitch) -> Option<TextEdit> {
+        let text = &self.text[span.start..span.end];
+        // An octave check (`c='`) pins the octave regardless of reference.
+        if text.contains('=') {
+            return None;
+        }
+        let head = leading_letters(text);
+        let marks_len = text[head..]
+            .bytes()
+            .take_while(|b| matches!(b, b'\'' | b','))
+            .count();
+        let wanted = relative_marks(pitch.octave - relative_octave(outer, pitch.note_name, 0));
+        if text[head..head + marks_len] == wanted {
+            return None;
+        }
+        Some(TextEdit {
+            range: Range::new(
+                self.line_index.position_at(span.start + head),
+                self.line_index.position_at(span.start + head + marks_len),
+            ),
+            new_text: wanted,
         })
     }
 
@@ -670,6 +773,45 @@ fn format_music_text(content: &str, wrapping: Wrapping) -> String {
         Wrapping::Verbatim => content.to_string(),
         Wrapping::Braces => braced(content),
         Wrapping::Mode(mode) => format!("{mode} {}", braced(content)),
+    }
+}
+
+/// The resolved pitch carried by an event for relative-octave purposes: a
+/// note's pitch, or a chord's first note. `None` for rests, skips and the like.
+fn pitch_of(event: &Event) -> Option<Pitch> {
+    match &event.kind {
+        EventKind::Note { pitch, .. } => Some(*pitch),
+        EventKind::Chord(notes) | EventKind::ChordRepetition(notes) => {
+            notes.first().map(|n| n.pitch)
+        }
+        _ => None,
+    }
+}
+
+/// The length in bytes of a note's leading name and accidental (`cis` of
+/// `cis'8`), i.e. its run of ASCII letters, after which octave marks go.
+fn leading_letters(text: &str) -> usize {
+    text.bytes().take_while(u8::is_ascii_alphabetic).count()
+}
+
+/// The note whose octave marks carry an event's relative reference — the note
+/// itself, or a chord's first note — as its source span and resolved pitch.
+/// `None` for events with no such note (rests, skips, chord repetitions).
+fn leading_note(event: &Event) -> Option<(Span, Pitch)> {
+    match &event.kind {
+        EventKind::Note { pitch, .. } => Some((event.span, *pitch)),
+        EventKind::Chord(notes) => notes.first().map(|n| (n.span, n.pitch)),
+        _ => None,
+    }
+}
+
+/// Octave marks that adjust a relative note by `delta` octaves: `delta` `'`s
+/// upward, or `-delta` `,`s downward.
+fn relative_marks(delta: i32) -> String {
+    if delta >= 0 {
+        "'".repeat(delta as usize)
+    } else {
+        ",".repeat((-delta) as usize)
     }
 }
 
