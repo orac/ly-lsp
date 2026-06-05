@@ -1362,7 +1362,10 @@ mod tests {
         let EventKind::Chord(notes) = &analysis.events[0].kind else {
             panic!("expected a chord");
         };
-        let spans: Vec<&str> = notes.iter().map(|n| &src[n.span.start..n.span.end]).collect();
+        let spans: Vec<&str> = notes
+            .iter()
+            .map(|n| &src[n.span.start..n.span.end])
+            .collect();
         assert_eq!(spans, vec!["c-1", "e-3"]);
     }
 

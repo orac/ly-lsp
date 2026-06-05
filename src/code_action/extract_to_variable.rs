@@ -188,6 +188,21 @@ fn validate(document: &Document, selection: Range) -> Option<Validated<'_>> {
         return None;
     }
 
+    // Reject a selection that contains only comments and whitespace. Only
+    // applies inside an expression_block; a container that IS the selected node
+    // is already a named music node by definition.
+    if container.kind() == "expression_block" {
+        let mut cur = container.walk();
+        let has_music_content = container.named_children(&mut cur).any(|child| {
+            child.kind() != "comment"
+                && child.start_byte() < actual_end
+                && child.end_byte() > actual_start
+        });
+        if !has_music_content {
+            return None;
+        }
+    }
+
     Some(Validated {
         container,
         braces,

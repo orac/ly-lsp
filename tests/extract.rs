@@ -189,9 +189,9 @@ fn extract_cases() {
                         continue;
                     }
                     match ExtractToVariable::resolve(&doc, case.selection) {
-                        None => failures.push(format!(
-                            "{label}: expected edits, got None\n{rendered}"
-                        )),
+                        None => {
+                            failures.push(format!("{label}: expected edits, got None\n{rendered}"))
+                        }
                         Some(resolved) => {
                             let actual = apply_edits(&case.source, &resolved.edits);
                             if actual.trim_end() != exp {
@@ -208,6 +208,10 @@ fn extract_cases() {
     }
 
     if !failures.is_empty() {
-        panic!("{} case(s) failed:\n\n{}", failures.len(), failures.join("\n\n"));
+        panic!(
+            "{} case(s) failed:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
     }
 }

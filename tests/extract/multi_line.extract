@@ -52,3 +52,12 @@ foo = {
 }
 ---
 INVALID
+===
+foo = {
+    % don't dream it
+   >
+    b e
+  <
+}
+---
+INVALID
