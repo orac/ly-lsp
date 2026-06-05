@@ -8,7 +8,7 @@ It's implemented in Rust, so use all the regular `cargo` commands to build, test
 
 Parsing is handled by the [tree-sitter LilyPond grammar](https://github.com/nwhetsell/tree-sitter-lilypond), which gives us incremental reparsing and error recovery — both essential when parsing source that's mid-edit. The grammar ships as C, so **building requires a C compiler** (MSVC on Windows, or `cc`/`clang` elsewhere); `cargo` compiles it for you via the `cc` crate.
 
-The refactorings and quick fixes (extract-to-variable and friends) follow a two-step offer/resolve pattern so listing the menu stays cheap. See [`src/code_action/README.md`](src/code_action/README.md) for the trait, the lifecycle, and how to add a new action.
+The refactorings and quick fixes (extract-to-variable and friends) follow a two-step offer/resolve pattern. See [`src/code_action/README.md`](src/code_action/README.md) for the trait, the lifecycle, and how to add a new action.
 
 ## Testing
 
