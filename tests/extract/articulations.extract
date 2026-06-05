@@ -1,0 +1,42 @@
+foo = { c4-. d }
+        ^^
+---
+INVALID
+===
+foo = { c4-. d }
+        ^^^^
+---
+music = { c4-. }
+
+foo = { \music d }
+===
+foo = { c4 d4-. e }
+        ^^^^^
+---
+INVALID
+===
+foo = { c4 d-. e }
+           ^^^
+---
+music = { d4-. }
+
+foo = { c4 \music e }
+===
+foo = { c8 d16 e-. }
+           ^^^
+---
+music = { d16 }
+
+foo = { c8 \music e16-. }
+===
+foo = { c4^\markup { x } d }
+        ^^
+---
+INVALID
+===
+foo = { c4^\markup { x } d }
+        ^^^^^^^^^^^^^^^^
+---
+music = { c4^\markup { x } }
+
+foo = { \music d }

@@ -58,6 +58,12 @@
 //!   recognised, so a following note inherits the previous numeric duration.
 //! - Inside nested `{ }` in `\relative` mode, the reference pitch does not
 //!   propagate back out of the inner block.
+//! - Post-events (articulations, fingerings, dynamics, slurs, ties and text or
+//!   markup scripts) are folded into the event's span but only when attached: a
+//!   neutral dynamic or articulation set off by whitespace, such as `c4 \f`, is
+//!   read as a following command instead. A markup post-event written with a
+//!   chained command (`c-\markup \italic foo`) keeps only the `\markup` in the
+//!   span; the rest is left loose.
 
 use tree_sitter::{Node, Tree};
 
@@ -399,8 +405,9 @@ impl<'a> Analyser<'a> {
         if let Some(kind) = special {
             let (duration, written) = self.parse_duration(children, &mut i);
             let after_duration = children[i - 1].end_byte();
-            let end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
-            self.push_event(begin, end, kind, duration, written, relative);
+            let value_end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
+            let end = self.consume_post_events(children, &mut i, value_end);
+            self.push_event(begin, end, value_end, kind, duration, written, relative);
             return i;
         }
 
@@ -422,7 +429,8 @@ impl<'a> Analyser<'a> {
         };
         let (duration, written) = self.parse_duration(children, &mut i);
         let after_duration = children[i - 1].end_byte();
-        let end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
+        let value_end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
+        let end = self.consume_post_events(children, &mut i, value_end);
 
         if let Mode::Relative(_) = mode {
             *mode = Mode::Relative(pitch);
@@ -430,6 +438,7 @@ impl<'a> Analyser<'a> {
         self.push_event(
             begin,
             end,
+            value_end,
             EventKind::Note {
                 pitch,
                 octave_written: octave_written || check.is_some(),
@@ -463,10 +472,12 @@ impl<'a> Analyser<'a> {
         } else {
             chord.end_byte()
         };
-        let end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
+        let value_end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
+        let end = self.consume_post_events(children, &mut i, value_end);
         self.push_event(
             chord.start_byte(),
             end,
+            value_end,
             EventKind::Chord(notes),
             duration,
             written,
@@ -505,6 +516,87 @@ impl<'a> Analyser<'a> {
             return event_end;
         }
         end
+    }
+
+    /// Consumes the post-events attached to the event whose value ends at
+    /// `value_end` — articulations, fingerings, dynamics, slurs, ties, beams and
+    /// text or markup scripts — so they count towards the event's span rather
+    /// than being mistaken for the music that follows. Their content is not
+    /// interpreted. Returns the byte at which the event ends once they are
+    /// included.
+    fn consume_post_events(&self, children: &[Node], i: &mut usize, value_end: usize) -> usize {
+        let mut end = value_end;
+        while let Some(&node) = children.get(*i) {
+            match node.kind() {
+                // A direction indicator (`-`/`^`/`_`) always introduces a script —
+                // an articulation, fingering, text or markup — and is invalid
+                // alone, so its target is consumed with it.
+                "punctuation" if self.is_direction(node) => {
+                    *i += 1;
+                    end = self.consume_script(children, i, node.end_byte());
+                }
+                // Slurs, ties and beams attach with no introducer.
+                "punctuation" if is_spanner_punct(self.text(node)) => {
+                    end = node.end_byte();
+                    *i += 1;
+                }
+                // `\<`/`\>`/`\!`: crescendo, decrescendo and the dynamic stop.
+                "dynamic" => {
+                    end = node.end_byte();
+                    *i += 1;
+                }
+                // A neutral named articulation or dynamic (`\staccato`, `\f`)
+                // carries no direction; we recognise it by its butting directly
+                // against the event, so a space-separated command that follows is
+                // left for the main loop.
+                "escaped_word" if node.start_byte() == end => {
+                    end = self.consume_command_post_event(children, i);
+                }
+                _ => break,
+            }
+        }
+        end
+    }
+
+    /// Consumes the script after a direction indicator (`-`/`^`/`_`): a script
+    /// glyph (`.`, `>`, …), a fingering number, a quoted text string, or a named
+    /// articulation or markup command. Returns where it ends, or `indicator_end`
+    /// unchanged for a dangling indicator with nothing after it.
+    fn consume_script(&self, children: &[Node], i: &mut usize, indicator_end: usize) -> usize {
+        let Some(&node) = children.get(*i) else {
+            return indicator_end;
+        };
+        match node.kind() {
+            "escaped_word" => self.consume_command_post_event(children, i),
+            "punctuation" | "unsigned_integer" | "string" => {
+                *i += 1;
+                node.end_byte()
+            }
+            _ => indicator_end,
+        }
+    }
+
+    /// Consumes an `escaped_word` acting as a post-event — a named articulation
+    /// or dynamic (`\trill`, `\f`), or a markup script (`\markup { … }`) — at
+    /// `children[*i]`, taking a markup command's block, string or Scheme argument
+    /// with it. Returns its end byte. A markup written with a chained command
+    /// (`\markup \italic …`) keeps only the `\markup` itself.
+    fn consume_command_post_event(&self, children: &[Node], i: &mut usize) -> usize {
+        let word = children[*i];
+        *i += 1;
+        let mut end = word.end_byte();
+        if matches!(self.text(word), "\\markup" | "\\markuplist")
+            && let Some(&arg) = children.get(*i).filter(|n| is_markup_argument(n.kind()))
+        {
+            end = arg.end_byte();
+            *i += 1;
+        }
+        end
+    }
+
+    /// True if `node` is an articulation direction indicator, `-`, `^` or `_`.
+    fn is_direction(&self, node: Node) -> bool {
+        node.kind() == "punctuation" && matches!(self.text(node), "-" | "^" | "_")
     }
 
     /// Resolves the pitches inside a `<…>` chord node. In relative mode the
@@ -549,8 +641,10 @@ impl<'a> Analyser<'a> {
             if reference.is_some() {
                 reference = Some(pitch);
             }
+            let value_end = inner[k - 1].end_byte();
+            let end = self.consume_post_events(&inner, &mut k, value_end);
             notes.push(ChordNote {
-                span: Span::new(begin, inner[k - 1].end_byte()),
+                span: Span::new(begin, end),
                 pitch,
                 octave_written: octave_written || check.is_some(),
             });
@@ -672,6 +766,7 @@ impl<'a> Analyser<'a> {
         &mut self,
         start: usize,
         end: usize,
+        value_end: usize,
         kind: EventKind,
         duration: Duration,
         duration_written: bool,
@@ -680,6 +775,7 @@ impl<'a> Analyser<'a> {
         self.events.push(Event {
             span: Span::new(start, end),
             kind,
+            value_end,
             duration,
             duration_written,
             relative,
@@ -740,6 +836,18 @@ fn absolute_octave_marks(octave: i32) -> String {
 
 fn is_block(kind: &str) -> bool {
     kind == "expression_block" || kind == "parallel_music"
+}
+
+/// Punctuation that attaches a slur, tie or beam to a note with no introducing
+/// direction: `(`/`)`, `~`, `[`/`]` and the phrasing slurs `\(`/`\)`.
+fn is_spanner_punct(text: &str) -> bool {
+    matches!(text, "(" | ")" | "~" | "[" | "]" | "\\(" | "\\)")
+}
+
+/// Node kinds that can stand as the argument of a `\markup` post-event: a `{ }`
+/// block, a quoted string, or embedded Scheme.
+fn is_markup_argument(kind: &str) -> bool {
+    matches!(kind, "expression_block" | "string" | "embedded_scheme")
 }
 
 /// Collects the byte spans of the outermost `ERROR` nodes in the tree, pruning
@@ -1057,6 +1165,116 @@ mod tests {
                 analysis.problems
             );
         }
+    }
+
+    /// The source text covered by event `n`'s span, and by its note value.
+    fn span_and_value<'a>(src: &'a str, analysis: &NoteAnalysis, n: usize) -> (&'a str, &'a str) {
+        let event = &analysis.events[n];
+        (
+            &src[event.span.start..event.span.end],
+            &src[event.span.start..event.value_end],
+        )
+    }
+
+    #[test]
+    fn articulation_punctuation_extends_the_span() {
+        let src = "{ c4-. d4-> }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0), ("c4-.", "c4"));
+        assert_eq!(span_and_value(src, &analysis, 1), ("d4->", "d4"));
+    }
+
+    #[test]
+    fn fingering_and_text_scripts_extend_the_span() {
+        let src = "{ c-1 d-\"text\" }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0).0, "c-1");
+        assert_eq!(span_and_value(src, &analysis, 1).0, "d-\"text\"");
+    }
+
+    #[test]
+    fn named_articulations_and_dynamics_extend_the_span() {
+        // `\staccato` (with a direction) and the bare dynamics `\f`, `\<`, `\!`
+        // all attach to their note, not to the music after it.
+        let src = "{ c4-\\staccato d4\\f e\\< f\\! }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0).0, "c4-\\staccato");
+        assert_eq!(span_and_value(src, &analysis, 1).0, "d4\\f");
+        assert_eq!(span_and_value(src, &analysis, 2).0, "e\\<");
+        assert_eq!(span_and_value(src, &analysis, 3).0, "f\\!");
+    }
+
+    #[test]
+    fn markup_script_block_is_part_of_the_span() {
+        // The markup block must be swallowed whole: its words are not notes, and
+        // the span reaches the closing brace.
+        let src = "{ c4^\\markup { italic \"x\" } d }";
+        let analysis = run(src);
+        assert!(
+            analysis.problems.is_empty(),
+            "markup words flagged: {:?}",
+            analysis.problems
+        );
+        assert_eq!(
+            span_and_value(src, &analysis, 0).0,
+            "c4^\\markup { italic \"x\" }"
+        );
+        assert_eq!(pitches(&analysis), vec![(0, -1), (1, -1)]);
+    }
+
+    #[test]
+    fn slurs_ties_and_beams_attach_to_their_note() {
+        let src = "{ c4( d) e~ f[ g] }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0).0, "c4(");
+        assert_eq!(span_and_value(src, &analysis, 1).0, "d)");
+        assert_eq!(span_and_value(src, &analysis, 2).0, "e~");
+        assert_eq!(span_and_value(src, &analysis, 3).0, "f[");
+        assert_eq!(span_and_value(src, &analysis, 4).0, "g]");
+    }
+
+    #[test]
+    fn space_separated_command_is_not_a_post_event() {
+        // A command set off by whitespace belongs to the music, not the note, so
+        // the note's span ends at its value.
+        let src = "{ c4 \\break d }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0).0, "c4");
+        assert_eq!(pitches(&analysis), vec![(0, -1), (1, -1)]);
+    }
+
+    #[test]
+    fn rests_carry_their_post_events() {
+        let src = "{ r4\\fermata s1\\< }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0).0, "r4\\fermata");
+        assert_eq!(span_and_value(src, &analysis, 1).0, "s1\\<");
+    }
+
+    #[test]
+    fn chord_inner_notes_carry_their_fingerings() {
+        let src = "{ <c-1 e-3>4 }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        let EventKind::Chord(notes) = &analysis.events[0].kind else {
+            panic!("expected a chord");
+        };
+        let spans: Vec<&str> = notes.iter().map(|n| &src[n.span.start..n.span.end]).collect();
+        assert_eq!(spans, vec!["c-1", "e-3"]);
+    }
+
+    #[test]
+    fn post_events_after_a_chord_extend_its_span() {
+        let src = "{ <c e>4\\f-> }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(span_and_value(src, &analysis, 0), ("<c e>4\\f->", "<c e>4"));
     }
 
     #[test]

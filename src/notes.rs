@@ -77,6 +77,10 @@ impl fmt::Display for Duration {
 /// One pitch within a chord (`<c e g>`). Each carries its own span because a
 /// refactoring may want to annotate inner notes individually, and in `\relative`
 /// mode each inner note is resolved relative to the one before it.
+///
+/// The `span` extends over any post-events attached to the inner note — a
+/// fingering or articulation such as the `-1` of `<c-1 e>` — so the note and
+/// what hangs off it are treated as one unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChordNote {
     pub span: Span,
@@ -120,13 +124,22 @@ pub struct RelativeRef {
 
 /// A single rhythmic event in the music, with its lexically resolved state.
 ///
-/// The `span` covers the written event — pitch, octave marks, accidental
-/// reminders and duration — but not trailing post-events (articulations,
-/// dynamics, slurs, ties), which are separate sibling tokens.
+/// The `span` covers the whole written event: its note value — pitch, octave
+/// marks, accidental reminders and duration — together with any post-events
+/// attached to it (articulations, fingerings, dynamics, slurs, ties and text or
+/// markup scripts), which the grammar leaves as separate sibling tokens. A
+/// refactoring can therefore treat the run as one unit and refuse to split a
+/// note from its articulations. The post-events' content is not interpreted;
+/// only their extent is recorded. [`value_end`](Self::value_end) marks where
+/// the note value stops and the post-events begin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub span: Span,
     pub kind: EventKind,
+    /// The byte offset at which the note value ends and any post-events begin,
+    /// equal to `span.end` when there are none. An omitted duration must be
+    /// written here — on the value, before the post-events — not at `span.end`.
+    pub value_end: usize,
     /// The duration in force for this event, whether written or inherited.
     pub duration: Duration,
     /// Whether the source wrote a duration here, or it was inherited from an
@@ -222,6 +235,7 @@ mod tests {
         Event {
             span: Span::new(start, end),
             kind: EventKind::Rest,
+            value_end: end,
             duration: Duration::DEFAULT,
             duration_written: false,
             relative: None,

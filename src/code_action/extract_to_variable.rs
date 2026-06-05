@@ -64,7 +64,10 @@ impl CodeAction for ExtractToVariable {
         if let Some(first) = selected.first()
             && !first.duration_written
         {
-            content.insert_str(first.span.end - actual_start, &first.duration.to_string());
+            // The duration goes on the note value, before any post-events, so
+            // insert at `value_end` rather than the end of the (possibly
+            // articulated) span.
+            content.insert_str(first.value_end - actual_start, &first.duration.to_string());
         }
 
         let mut music_text = format_music_text(&content, wrapping);
@@ -219,7 +222,9 @@ fn following_note_edits(
     let duration_before = before.map_or(Duration::DEFAULT, |e| e.duration);
 
     if !next.duration_written && duration_before != next.duration {
-        let pos = line_index.position_at(next.span.end);
+        // As above, the duration belongs on the note value, before its
+        // post-events.
+        let pos = line_index.position_at(next.value_end);
         edits.push(TextEdit {
             range: Range::new(pos, pos),
             new_text: next.duration.to_string(),
@@ -491,10 +496,14 @@ fn leading_letters(text: &str) -> usize {
 
 /// The note whose octave marks carry an event's relative reference — the note
 /// itself, or a chord's first note — as its source span and resolved pitch.
-/// `None` for events with no such note (rests, skips, chord repetitions).
+/// `None` for events with no such note (rests, skips, chord repetitions). The
+/// span is the note value only, excluding post-events, so re-spelling its octave
+/// marks never strays into an attached articulation or markup.
 fn leading_note(event: &Event) -> Option<(Span, Pitch)> {
     match &event.kind {
-        EventKind::Note { pitch, .. } => Some((event.span, *pitch)),
+        EventKind::Note { pitch, .. } => {
+            Some((Span::new(event.span.start, event.value_end), *pitch))
+        }
         EventKind::Chord(notes) => notes.first().map(|n| (n.span, n.pitch)),
         _ => None,
     }
