@@ -51,6 +51,7 @@ fn main() {
             EventKind::Rest => "rest".to_string(),
             EventKind::MultiMeasureRest => "multi-measure rest".to_string(),
             EventKind::Skip => "skip".to_string(),
+            EventKind::ChordModeEvent => "chord-mode entry".to_string(),
         };
         println!("{text:<16} {kind}  dur {}{inherited}", event.duration);
     }

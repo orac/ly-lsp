@@ -8,16 +8,46 @@ foo = \lyricmode { \music la }
 foo = \chordmode { c f g }
                    ^^^
 ---
-music = \chordmode { c f }
+music = \chordmode { c4 f }
 
 foo = \chordmode { \music g }
 ===
 \chordmode { \repeat unfold 2 { c:m g:7 }}
                                 ^^^
 ---
-music = \chordmode { c:m }
+music = \chordmode { c4:m }
 
 \chordmode { \repeat unfold 2 { \music g:7 }}
+===
+onlyDuration = \chordmode { c2 a4 }
+                             ^
+---
+INVALID
+===
+loseDuration = \chordmode { c2 a4 }
+                            ^
+---
+INVALID
+===
+onlyShape = \chordmode { c2 a:m f g }
+                             ^^^
+---
+INVALID
+===
+loseShape = \chordmode { c2 a:m f g }
+                            ^
+---
+INVALID
+===
+onlyInversion = \chordmode { c/e f g }
+                              ^^^
+---
+INVALID
+===
+loseInversion =  = \chordmode { c/e f g }
+                                ^
+---
+INVALID
 ===
 foo = \lyrics { la la la }
                 ^^^^^
@@ -29,7 +59,7 @@ foo = \lyrics { \music la }
 foo = \chords { c f g }
                 ^^^
 ---
-music = \chordmode { c f }
+music = \chordmode { c4 f }
 
 foo = \chords { \music g }
 ===

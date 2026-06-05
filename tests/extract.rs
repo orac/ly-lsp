@@ -28,19 +28,66 @@ fn apply_edits(src: &str, edits: &[TextEdit]) -> String {
     out
 }
 
+// Renders `source` with the selected region highlighted using ANSI underline.
+// Positions are in LSP (line, UTF-16 char) units; test files are ASCII so
+// char counts equal byte counts.
+fn render_with_underline(source: &str, sel: Range) -> String {
+    const UL: &str = "\x1b[4m";
+    const RESET: &str = "\x1b[0m";
+
+    let s_line = sel.start.line as usize;
+    let s_col = sel.start.character as usize;
+    let e_line = sel.end.line as usize;
+    let e_col = sel.end.character as usize;
+
+    source
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i < s_line || i > e_line {
+                return format!("{line}\n");
+            }
+            let n = line.chars().count();
+            let from = if i == s_line { s_col.min(n) } else { 0 };
+            let to = if i == e_line { e_col.min(n) } else { n };
+            let before: String = line.chars().take(from).collect();
+            let mid: String = line
+                .chars()
+                .skip(from)
+                .take(to.saturating_sub(from))
+                .collect();
+            let after: String = line.chars().skip(to).collect();
+            if mid.is_empty() {
+                format!("{before}{after}\n")
+            } else {
+                format!("{before}{UL}{mid}{RESET}{after}\n")
+            }
+        })
+        .collect()
+}
+
 struct Case {
     source: String,
     selection: Range,
     expected: Option<String>,
+    line: usize,
 }
 
 fn parse_file(content: &str) -> Vec<Case> {
-    content
-        .split("\n===\n")
-        .map(|b| b.trim_matches('\n'))
-        .filter(|b| !b.is_empty())
-        .map(parse_case)
-        .collect()
+    let mut current_line = 1usize;
+    let mut cases = Vec::new();
+
+    for block in content.split("\n===\n") {
+        let leading_newlines = block.bytes().take_while(|&b| b == b'\n').count();
+        let trimmed = block.trim_matches('\n');
+        if !trimmed.is_empty() {
+            cases.push(parse_case(trimmed, current_line + leading_newlines));
+        }
+        // newlines in block + 1 for the content line that had no trailing \n
+        // + 1 for the === separator line
+        current_line += block.bytes().filter(|&b| b == b'\n').count() + 2;
+    }
+    cases
 }
 
 // A case block contains the source with annotation lines interleaved, then
@@ -52,7 +99,7 @@ fn parse_file(content: &str) -> Vec<Case> {
 // Multi-line selection: a `>` line below the start source line (leading spaces
 // = start column) and a `<` line below the end source line (leading spaces +
 // count = end column).
-fn parse_case(text: &str) -> Case {
+fn parse_case(text: &str, line: usize) -> Case {
     let (annotated, expected_raw) = text
         .split_once("\n---\n")
         .unwrap_or_else(|| panic!("case missing '---' separator:\n{text}"));
@@ -91,6 +138,7 @@ fn parse_case(text: &str) -> Case {
         source,
         selection,
         expected: (expected_str != "INVALID").then(|| expected_str.to_string()),
+        line,
     }
 }
 
@@ -110,12 +158,15 @@ fn extract_cases() {
         "no .extract files found in tests/extract/"
     );
 
+    let mut failures: Vec<String> = Vec::new();
+
     for path in &paths {
         let content = std::fs::read_to_string(path).unwrap();
         let file = path.file_name().unwrap().to_string_lossy();
 
-        for (i, case) in parse_file(&content).into_iter().enumerate() {
-            let label = format!("{file}[{i}]");
+        for case in parse_file(&content) {
+            let label = format!("{file}:{}", case.line);
+            let rendered = render_with_underline(&case.source, case.selection);
             let doc = Document::new(case.source.clone());
             let offered = ExtractToVariable::offer(&doc, case.selection).is_some();
 
@@ -123,15 +174,40 @@ fn extract_cases() {
                 // `offer` and `apply` share the validity check, so an invalid
                 // selection must be neither offered nor applied — no dead menu
                 // entries.
-                None => assert!(!offered, "{label}: expected INVALID"),
+                None => {
+                    if offered {
+                        failures.push(format!(
+                            "{label}: expected INVALID but action was offered\n{rendered}"
+                        ));
+                    }
+                }
                 Some(exp) => {
-                    assert!(offered, "{label}: expected the action to be offered");
-                    let resolved = ExtractToVariable::resolve(&doc, case.selection)
-                        .unwrap_or_else(|| panic!("{label}: expected edits, got None"));
-                    let actual = apply_edits(&case.source, &resolved.edits);
-                    assert_eq!(actual.trim_end(), exp, "{label}");
+                    if !offered {
+                        failures.push(format!(
+                            "{label}: expected the action to be offered but it wasn't\n{rendered}"
+                        ));
+                        continue;
+                    }
+                    match ExtractToVariable::resolve(&doc, case.selection) {
+                        None => failures.push(format!(
+                            "{label}: expected edits, got None\n{rendered}"
+                        )),
+                        Some(resolved) => {
+                            let actual = apply_edits(&case.source, &resolved.edits);
+                            if actual.trim_end() != exp {
+                                failures.push(format!(
+                                    "{label}: output mismatch\n{rendered}\n--- expected ---\n{exp}\n--- actual ---\n{}",
+                                    actual.trim_end()
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if !failures.is_empty() {
+        panic!("{} case(s) failed:\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }

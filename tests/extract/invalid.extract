@@ -17,3 +17,13 @@ foo = { c4 d }
         ^
 ---
 INVALID
+===
+starDuration = { c1*2 }
+                 ^^
+---
+INVALID
+===
+starDurationOnly = { c1*2 }
+                        ^
+---
+INVALID

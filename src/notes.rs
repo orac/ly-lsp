@@ -111,6 +111,15 @@ pub enum EventKind {
     /// repeated pitches are filled in here for convenience, though `q` itself
     /// does not change the `\relative` reference pitch.
     ChordRepetition(Vec<ChordNote>),
+    /// A chord-mode entry: a root with its chord-quality modifier and
+    /// bass/inversion (`c:maj7/e`). Chord mode gives symbols chord meanings
+    /// rather than pitches, so the root is not resolved to a [`Pitch`] — only
+    /// the entry's extent and its (possibly inherited) [`Duration`] are
+    /// recorded, enough for a refactoring to keep the entry whole and write its
+    /// duration explicitly when detaching it. The duration sits between the root
+    /// and the `:`/`/`, so [`value_end`](Event::value_end) marks the point
+    /// before them, not the end of the whole entry.
+    ChordModeEvent,
 }
 
 /// The `\relative` reference in force just before an event: the reference
@@ -139,6 +148,8 @@ pub struct Event {
     /// The byte offset at which the note value ends and any post-events begin,
     /// equal to `span.end` when there are none. An omitted duration must be
     /// written here — on the value, before the post-events — not at `span.end`.
+    /// For a [`ChordModeEvent`](EventKind::ChordModeEvent) it marks the point
+    /// before the `:quality`/`/bass`, so an inserted duration reads `c4:m`.
     pub value_end: usize,
     /// The duration in force for this event, whether written or inherited.
     pub duration: Duration,

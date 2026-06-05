@@ -31,8 +31,10 @@
 //! The active language follows `\language "…"` and `\include "….ly"` directives
 //! as they appear, starting from LilyPond's default (Dutch). Pitch resolution is
 //! only attempted in note mode (the default, `\notemode`, `\relative`,
-//! `\fixed`); `\chordmode`, `\drummode` and `\figuremode` give symbols different
-//! meanings and are left alone for now.
+//! `\fixed`); `\chordmode` gives symbols chord meanings rather than pitches, so
+//! its entries are recorded for their extent and duration but not resolved to a
+//! pitch (an [`EventKind::ChordModeEvent`]). `\drummode` and `\figuremode` give
+//! symbols yet other meanings and are left alone for now.
 //!
 //! # Known limitations
 //!
@@ -94,23 +96,24 @@ enum Region {
     /// Bare symbols and chords here are read as note events; nested bare blocks
     /// stay note-music.
     NoteMusic,
+    /// `\chordmode`: bare symbols here are chord-mode entries (a root with a
+    /// `:quality`/`/bass`), read for their extent and duration but not their
+    /// pitch; nested bare blocks stay chord-music.
+    ChordMusic,
     /// Not itself an event stream (the top level, a music-function argument),
     /// but nested bare blocks are note-music.
     NoteContext,
-    /// A non-note region (`\chordmode`, `\header`, …); symbols are not notes and
+    /// A non-note region (`\header`, `\lyricmode`, …); symbols are not events and
     /// nested bare blocks stay non-note.
     NonNote,
 }
 
 impl Region {
-    fn reads_events(self) -> bool {
-        matches!(self, Region::NoteMusic)
-    }
-
     /// The region a nested bare block (one with no governing command) inherits.
     fn nested_block(self) -> Region {
         match self {
             Region::NonNote => Region::NonNote,
+            Region::ChordMusic => Region::ChordMusic,
             Region::NoteMusic | Region::NoteContext => Region::NoteMusic,
         }
     }
@@ -184,7 +187,6 @@ impl<'a> Analyser<'a> {
     /// symbols and chords are read as music events resolved against `mode`;
     /// otherwise the children are scanned only for nested music and directives.
     fn walk(&mut self, parent: Node, mut mode: Mode, region: Region) {
-        let read_events = region.reads_events();
         let mut cursor = parent.walk();
         let children: Vec<Node> = parent.children(&mut cursor).collect();
         // The region a `\new`/`\context` set for the bare block that follows it.
@@ -200,11 +202,14 @@ impl<'a> Analyser<'a> {
                     self.walk(child, mode, block_region);
                     i += 1;
                 }
-                "chord" if read_events => {
+                "chord" if region == Region::NoteMusic => {
                     i = self.read_chord(&children, i, &mut mode);
                 }
-                "symbol" if read_events => {
+                "symbol" if region == Region::NoteMusic => {
                     i = self.read_symbol(&children, i, &mut mode);
+                }
+                "symbol" if region == Region::ChordMusic => {
+                    i = self.read_chord_mode_event(&children, i);
                 }
                 "escaped_word" => {
                     i = self.handle_command(&children, i, mode);
@@ -273,11 +278,19 @@ impl<'a> Analyser<'a> {
                 self.enter_block(children, &mut i, Mode::Absolute);
                 i
             }
+            // Chord mode: bare symbols are chord-mode entries, read for their
+            // extent and duration (but not pitch). Nested bare blocks stay in
+            // chord mode.
+            "\\chordmode" | "\\chords" => {
+                let mut i = start + 1;
+                self.enter_chord_block(children, &mut i, ambient);
+                i
+            }
             // Modes where a bare symbol is not a note; scan for nested music but
             // don't read events.
-            "\\chordmode" | "\\chords" | "\\drummode" | "\\drums" | "\\figuremode"
-            | "\\figures" | "\\lyricmode" | "\\lyrics" | "\\addlyrics" | "\\markup"
-            | "\\markuplist" | "\\header" | "\\paper" | "\\layout" | "\\midi" | "\\with" => {
+            "\\drummode" | "\\drums" | "\\figuremode" | "\\figures" | "\\lyricmode"
+            | "\\lyrics" | "\\addlyrics" | "\\markup" | "\\markuplist" | "\\header" | "\\paper"
+            | "\\layout" | "\\midi" | "\\with" => {
                 let mut i = start + 1;
                 self.enter_non_event_block(children, &mut i, ambient);
                 i
@@ -357,6 +370,17 @@ impl<'a> Analyser<'a> {
     fn enter_non_event_block(&mut self, children: &[Node], i: &mut usize, ambient: Mode) {
         if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
             self.walk(*block, ambient, Region::NonNote);
+            *i += 1;
+        }
+    }
+
+    /// Like [`enter_block`](Self::enter_block) but for a `\chordmode` block: bare
+    /// symbols inside are read as chord-mode entries. The mode is carried only
+    /// for nested `\notemode`/`\relative` blocks, which reset it; chord-mode
+    /// entries themselves resolve no octave.
+    fn enter_chord_block(&mut self, children: &[Node], i: &mut usize, ambient: Mode) {
+        if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
+            self.walk(*block, ambient, Region::ChordMusic);
             *i += 1;
         }
     }
@@ -484,6 +508,57 @@ impl<'a> Analyser<'a> {
             relative,
         );
         i
+    }
+
+    /// Reads a chord-mode entry whose root symbol is at `children[start]`: the
+    /// root with its octave marks and duration, then the chord-quality modifier
+    /// (`:maj7`) and bass/inversion (`/e`) and any post-events, returning the
+    /// next index. Nothing is resolved — chord mode gives symbols chord meanings,
+    /// not pitches — so no note-name lookup is done and no diagnostics are
+    /// raised; the entry is recorded only for its extent and (inherited)
+    /// duration. [`value_end`](Event::value_end) is left before the `:`/`/`, so
+    /// an extracted entry that omits its duration has it written as `c4:m`.
+    fn read_chord_mode_event(&mut self, children: &[Node], start: usize) -> usize {
+        let root = children[start];
+        let begin = root.start_byte();
+        let mut i = start + 1;
+        // Octave marks carry no pitch here, but consuming them keeps them out of
+        // the following duration and quality.
+        self.parse_octave(children, &mut i);
+        let (duration, written) = self.parse_duration(children, &mut i);
+        let value_end = children[i - 1].end_byte();
+        let qualifier_end = self.consume_chord_qualifiers(children, &mut i, value_end);
+        let end = self.consume_post_events(children, &mut i, qualifier_end);
+        self.push_event(
+            begin,
+            end,
+            value_end,
+            EventKind::ChordModeEvent,
+            duration,
+            written,
+            None,
+        );
+        i
+    }
+
+    /// Consumes the chord-quality modifier (`:maj7`) and bass/inversion (`/e`,
+    /// `/+e`) that may follow a chord-mode root, together with the run of tokens
+    /// butting against each `:`/`/`, so they are not mistaken for the entries
+    /// that follow. Their content is not interpreted. Returns the byte at which
+    /// the entry now ends.
+    fn consume_chord_qualifiers(&self, children: &[Node], i: &mut usize, mut end: usize) -> usize {
+        while let Some(intro) = children
+            .get(*i)
+            .filter(|n| self.is_punct(**n, ":") || self.is_punct(**n, "/"))
+        {
+            end = intro.end_byte();
+            *i += 1;
+            while let Some(node) = children.get(*i).filter(|n| n.start_byte() == end) {
+                end = node.end_byte();
+                *i += 1;
+            }
+        }
+        end
     }
 
     /// Consumes a trailing `:` and its chord-modifier or tremolo specification
@@ -1133,21 +1208,43 @@ mod tests {
     }
 
     #[test]
-    fn chordmode_symbols_are_left_alone() {
-        // We do not resolve pitches in chordmode; the chord-quality symbols
-        // (`maj`) must not be flagged as bad notes.
-        let analysis = run("\\chordmode { c2:maj7 }");
+    fn chordmode_entry_is_recorded_without_resolving_pitch() {
+        // A chord-mode entry is one event spanning the whole `c2:maj7`, with the
+        // value ending before the `:maj7` so a duration would read `c4:maj7`.
+        // The chord-quality symbols (`maj`) are not flagged as bad notes.
+        let src = "\\chordmode { c2:maj7 }";
+        let analysis = run(src);
         assert!(analysis.problems.is_empty());
-        assert!(analysis.events.is_empty());
+        assert_eq!(analysis.events.len(), 1);
+        assert!(matches!(analysis.events[0].kind, EventKind::ChordModeEvent));
+        assert_eq!(span_and_value(src, &analysis, 0), ("c2:maj7", "c2"));
+    }
+
+    #[test]
+    fn chordmode_inversion_is_part_of_the_entry() {
+        // The `/e` bass keeps the entry whole, so a selection can't cut between
+        // the root and its inversion.
+        let src = "\\chordmode { c:m/e d }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(analysis.events.len(), 2);
+        assert_eq!(span_and_value(src, &analysis, 0), ("c:m/e", "c"));
     }
 
     #[test]
     fn chordmode_propagates_into_nested_blocks() {
         // A bare block nested in chordmode (here a `\repeat` body) stays in
-        // chord mode, so its `:min` modifier is not read as a note.
+        // chord mode, so its entries are read as chord-mode entries, not notes,
+        // and the `:min` modifier is not flagged.
         let analysis = run("\\chordmode { \\repeat unfold 2 { c2:min d } }");
         assert!(analysis.problems.is_empty());
-        assert!(analysis.events.is_empty());
+        assert_eq!(analysis.events.len(), 2);
+        assert!(
+            analysis
+                .events
+                .iter()
+                .all(|e| matches!(e.kind, EventKind::ChordModeEvent))
+        );
     }
 
     #[test]
