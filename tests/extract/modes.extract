@@ -39,6 +39,11 @@ loseShape = \chordmode { c2 a:m f g }
 ---
 INVALID
 ===
+loseShape = \chordmode { c2 a:m f g }
+                            ^^
+---
+INVALID
+===
 onlyInversion = \chordmode { c/e f g }
                               ^^^
 ---
@@ -46,6 +51,11 @@ INVALID
 ===
 loseInversion =  = \chordmode { c/e f g }
                                 ^
+---
+INVALID
+===
+loseInversion =  = \chordmode { c/e f g }
+                                ^^
 ---
 INVALID
 ===
