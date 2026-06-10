@@ -149,7 +149,7 @@ fn extract_cases() {
         .expect("tests/extract/ directory missing")
         .filter_map(|e| {
             let p = e.unwrap().path();
-            p.extension().map_or(false, |e| e == "extract").then_some(p)
+            p.extension().is_some_and(|e| e == "extract").then_some(p)
         })
         .collect();
     paths.sort();

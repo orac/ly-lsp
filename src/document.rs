@@ -203,7 +203,17 @@ impl Document {
             return;
         }
         if node.is_error() {
-            out.push(self.syntax_error(node, "syntax error".to_string()));
+            // Tree-sitter wraps a region it couldn't parse in a single ERROR
+            // node, which on its own only tells us "something is wrong here".
+            // An unbalanced bracket or quote is by far the most common cause,
+            // so look for the offending delimiter and point at it directly;
+            // fall back to the generic message when nothing stands out.
+            let unbalanced = self.unbalanced_delimiters(node);
+            if unbalanced.is_empty() {
+                out.push(self.syntax_error(node, "syntax error".to_string()));
+            } else {
+                out.extend(unbalanced);
+            }
             return;
         }
         if !node.has_error() {
@@ -213,6 +223,47 @@ impl Document {
         for child in node.children(&mut cursor) {
             self.collect_syntax_errors(child, out);
         }
+    }
+
+    /// Pairs off the bracket and quote tokens directly under an ERROR node and
+    /// returns a diagnostic for each one left unmatched. Well-formed nested
+    /// structures are folded into named children, so the loose delimiter tokens
+    /// we see here are exactly the ones the parser couldn't balance.
+    fn unbalanced_delimiters(&self, node: Node) -> Vec<Diagnostic> {
+        let mut pending: Vec<Node> = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "{" | "<<" | "<" => pending.push(child),
+                "}" | ">>" | ">" => {
+                    if pending
+                        .last()
+                        .is_some_and(|open| closes(open.kind(), child.kind()))
+                    {
+                        pending.pop();
+                    } else {
+                        diagnostics.push(
+                            self.syntax_error(child, format!("unmatched `{}`", child.kind())),
+                        );
+                    }
+                }
+                // A quote is its own closer: it closes a string already open,
+                // otherwise it opens one.
+                "\"" => {
+                    if pending.last().is_some_and(|open| open.kind() == "\"") {
+                        pending.pop();
+                    } else {
+                        pending.push(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for open in pending {
+            diagnostics.push(self.syntax_error(open, format!("unclosed `{}`", open.kind())));
+        }
+        diagnostics
     }
 
     fn syntax_error(&self, node: Node, message: String) -> Diagnostic {
@@ -410,6 +461,11 @@ fn point_at(text: &str, byte: usize) -> Point {
     Point::new(row, byte - line_start)
 }
 
+/// Whether `close` is the closing delimiter matching the opener `open`.
+fn closes(open: &str, close: &str) -> bool {
+    matches!((open, close), ("{", "}") | ("<<", ">>") | ("<", ">"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,14 +643,39 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_brace_is_reported() {
+    fn unclosed_brace_is_reported_at_the_brace() {
         let doc = Document::new("foo = { c d e\n".to_string());
         let diagnostics = doc.diagnostics();
-        assert!(
-            !diagnostics.is_empty(),
-            "expected a diagnostic for the unclosed brace"
-        );
+        assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostics[0].message, "unclosed `{`");
+        // Localised to the `{` itself, not the whole region after it.
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 6), Position::new(0, 7))
+        );
+    }
+
+    #[test]
+    fn unclosed_quote_is_reported_at_the_quote() {
+        let doc = Document::new("foo = { c \"hello\n".to_string());
+        let messages: Vec<String> = doc.diagnostics().into_iter().map(|d| d.message).collect();
+        assert!(
+            messages.iter().any(|m| m == "unclosed `\"`"),
+            "expected an unclosed-quote diagnostic, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn unmatched_close_brace_is_reported_at_the_brace() {
+        let doc = Document::new("foo = { c d } }\n".to_string());
+        let diagnostics = doc.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "unmatched `}`");
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 14), Position::new(0, 15))
+        );
     }
 
     #[test]
