@@ -5,6 +5,13 @@ editor's lightbulb menu. Each action lives in its own submodule and implements
 the [`CodeAction`](mod.rs) trait; [`extract_to_variable`](extract_to_variable.rs)
 is the worked example.
 
+[`inline_variable`](inline_variable.rs) is its inverse, and shows two further
+patterns: a single submodule can register more than one action (it offers both
+`InlineAll` and `InlineHere`), and machinery common to several actions — here the
+note-state re-spelling that keeps durations and octaves correct when music moves
+between contexts — lives in a shared sibling module ([`note_state`](note_state.rs))
+rather than in any one action.
+
 ## The two-step lifecycle
 
 Listing the menu must stay cheap however many actions exist, so an action is

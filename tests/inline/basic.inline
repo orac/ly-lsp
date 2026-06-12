@@ -1,0 +1,50 @@
+music = { c4 d e }
+
+foo = { \music f }
+          ^here
+---
+music = { c4 d e }
+
+foo = { c4 d e f }
+===
+music = { c4 d e }
+
+foo = { \music f }
+          ^all
+---
+foo = { c4 d e f }
+===
+music = { c4 d e }
+  ^all
+
+foo = { \music f }
+---
+foo = { c4 d e f }
+===
+music = { c4 d e }
+
+foo = \music
+        ^here
+---
+music = { c4 d e }
+
+foo = { c4 d e }
+===
+music = \bar
+
+foo = { \music c }
+          ^here
+---
+music = \bar
+
+foo = { \bar c }
+
+===
+music = { c4 d }
+  ^all
+
+a = { \music e }
+b = { f \music }
+---
+a = { c4 d e }
+b = { f c4 d }

@@ -1,0 +1,14 @@
+foo = \relative c' { c d e }
+         ^here
+---
+NONE
+===
+foo = { c d e }
+        ^here
+---
+NONE
+===
+foo = { c d e }
+   ^all
+---
+NONE

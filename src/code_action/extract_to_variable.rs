@@ -5,10 +5,9 @@ use tower_lsp::lsp_types::{CodeActionKind, Command, Range, TextEdit};
 use tree_sitter::Node;
 
 use crate::document::Document;
-use crate::line_struct::Span;
-use crate::note_analyser::relative_octave;
-use crate::notes::{Duration, Event, EventKind, Pitch};
+use crate::notes::{Duration, Event};
 
+use super::note_state::{leading_note, octave_fix, pitch_of};
 use super::{CodeAction, Offer, Resolved};
 
 /// The name the new variable is given before the editor prompts to rename it.
@@ -262,35 +261,6 @@ fn following_note_edits(
     edits
 }
 
-/// An edit re-spelling the octave marks of the note at `span` (resolved pitch
-/// `pitch`) so it still resolves to `pitch` against reference `outer`, or `None`
-/// if its marks are already right or its octave is pinned by a `=` check. Covers
-/// adding, changing and removing marks.
-fn octave_fix(document: &Document, span: Span, pitch: Pitch, outer: Pitch) -> Option<TextEdit> {
-    let text = &document.text()[span.start..span.end];
-    // An octave check (`c='`) pins the octave regardless of reference.
-    if text.contains('=') {
-        return None;
-    }
-    let head = leading_letters(text);
-    let marks_len = text[head..]
-        .bytes()
-        .take_while(|b| matches!(b, b'\'' | b','))
-        .count();
-    let wanted = relative_marks(pitch.octave - relative_octave(outer, pitch.note_name, 0));
-    if text[head..head + marks_len] == wanted {
-        return None;
-    }
-    let line_index = document.line_index();
-    Some(TextEdit {
-        range: Range::new(
-            line_index.position_at(span.start + head),
-            line_index.position_at(span.start + head + marks_len),
-        ),
-        new_text: wanted,
-    })
-}
-
 /// Returns the byte offset of the start of the line before which a new top-level
 /// definition should be inserted given that `node` is inside or equal to the
 /// selected music.
@@ -488,49 +458,6 @@ fn format_music_text(content: &str, wrapping: Wrapping) -> String {
         Wrapping::Verbatim => content.to_string(),
         Wrapping::Braces => braced(content),
         Wrapping::Mode(mode) => format!("{mode} {}", braced(content)),
-    }
-}
-
-/// The resolved pitch carried by an event for relative-octave purposes: a note's
-/// pitch, or a chord's first note. `None` for rests, skips and the like.
-fn pitch_of(event: &Event) -> Option<Pitch> {
-    match &event.kind {
-        EventKind::Note { pitch, .. } => Some(*pitch),
-        EventKind::Chord(notes) | EventKind::ChordRepetition(notes) => {
-            notes.first().map(|n| n.pitch)
-        }
-        _ => None,
-    }
-}
-
-/// The length in bytes of a note's leading name and accidental (`cis` of
-/// `cis'8`), i.e. its run of ASCII letters, after which octave marks go.
-fn leading_letters(text: &str) -> usize {
-    text.bytes().take_while(u8::is_ascii_alphabetic).count()
-}
-
-/// The note whose octave marks carry an event's relative reference — the note
-/// itself, or a chord's first note — as its source span and resolved pitch.
-/// `None` for events with no such note (rests, skips, chord repetitions). The
-/// span is the note value only, excluding post-events, so re-spelling its octave
-/// marks never strays into an attached articulation or markup.
-fn leading_note(event: &Event) -> Option<(Span, Pitch)> {
-    match &event.kind {
-        EventKind::Note { pitch, .. } => {
-            Some((Span::new(event.span.start, event.value_end), *pitch))
-        }
-        EventKind::Chord(notes) => notes.first().map(|n| (n.span, n.pitch)),
-        _ => None,
-    }
-}
-
-/// Octave marks that adjust a relative note by `delta` octaves: `delta` `'`s
-/// upward, or `-delta` `,`s downward.
-fn relative_marks(delta: i32) -> String {
-    if delta >= 0 {
-        "'".repeat(delta as usize)
-    } else {
-        ",".repeat((-delta) as usize)
     }
 }
 

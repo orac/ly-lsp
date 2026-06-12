@@ -1,7 +1,9 @@
 use ly_lsp::code_action::CodeAction;
 use ly_lsp::code_action::extract_to_variable::ExtractToVariable;
+use ly_lsp::code_action::inline_variable::InlineAll;
 use ly_lsp::document::Document;
 use ly_lsp::line_struct::LineIndex;
+use ly_lsp::notes::EventKind;
 use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
 // Applies the action's edits to `src`. The edits are non-overlapping, so
@@ -203,6 +205,121 @@ fn extract_cases() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} case(s) failed:\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+}
+
+// A span-independent summary of a document's resolved music: each event's kind
+// and resolved pitch(es) and duration, ignoring byte positions. Extract and
+// inline rewrite the text (and so the spans) but must preserve this.
+fn resolved_signature(doc: &Document) -> Vec<String> {
+    fn pitches(notes: &[ly_lsp::notes::ChordNote]) -> String {
+        let parts: Vec<String> = notes
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}/{}/{}",
+                    n.pitch.note_name, n.pitch.octave, n.pitch.alteration
+                )
+            })
+            .collect();
+        parts.join(",")
+    }
+
+    doc.notes()
+        .iter()
+        .map(|e| {
+            let kind = match &e.kind {
+                EventKind::Note { pitch, .. } => {
+                    format!(
+                        "note {}/{}/{}",
+                        pitch.note_name, pitch.octave, pitch.alteration
+                    )
+                }
+                EventKind::Chord(notes) => format!("chord [{}]", pitches(notes)),
+                EventKind::ChordRepetition(notes) => format!("q [{}]", pitches(notes)),
+                EventKind::Rest => "rest".to_string(),
+                EventKind::MultiMeasureRest => "mmrest".to_string(),
+                EventKind::Skip => "skip".to_string(),
+                EventKind::ChordModeEvent => "chordmode".to_string(),
+            };
+            format!("{kind} dur {}", e.duration)
+        })
+        .collect()
+}
+
+// Extract-then-inline should be a semantic round-trip: applying every `.extract`
+// case's extraction and then inlining the `\music` it creates must leave the
+// resolved music unchanged. The text need not match — inline only *adds* the
+// durations and octaves needed to preserve meaning, so it differs from the
+// pre-extract original by the odd explicit marker — but the pitches and
+// durations every note resolves to must be identical.
+#[test]
+fn extract_then_inline_round_trips() {
+    let dir = std::path::Path::new("tests/extract");
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .expect("tests/extract/ directory missing")
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            p.extension().is_some_and(|e| e == "extract").then_some(p)
+        })
+        .collect();
+    paths.sort();
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for path in &paths {
+        let content = std::fs::read_to_string(path).unwrap();
+        let file = path.file_name().unwrap().to_string_lossy();
+
+        for case in parse_file(&content) {
+            // Only valid extractions produce a `\music` to inline back.
+            if case.expected.is_none() {
+                continue;
+            }
+            let label = format!("{file}:{}", case.line);
+
+            let doc = Document::new(case.source.clone());
+            let Some(extracted) = ExtractToVariable::resolve(&doc, case.selection) else {
+                continue;
+            };
+            let extracted_src = apply_edits(&case.source, &extracted.edits);
+
+            let extracted_doc = Document::new(extracted_src.clone());
+            let Some(reference) = extracted_doc
+                .references()
+                .iter()
+                .find(|s| s.name == "music")
+            else {
+                failures.push(format!("{label}: no \\music reference after extract"));
+                continue;
+            };
+            let cursor = LineIndex::new(&extracted_src).position_at(reference.span.start);
+            let selection = Range::new(cursor, cursor);
+
+            let Some(inlined) = InlineAll::resolve(&extracted_doc, selection) else {
+                failures.push(format!("{label}: inline-all not resolved\n{extracted_src}"));
+                continue;
+            };
+            let round_tripped = apply_edits(&extracted_src, &inlined.edits);
+
+            let before = resolved_signature(&doc);
+            let after = resolved_signature(&Document::new(round_tripped.clone()));
+            if before != after {
+                failures.push(format!(
+                    "{label}: music changed by round-trip\n--- source ---\n{}\n--- round-tripped ---\n{}\n--- before ---\n{before:?}\n--- after ---\n{after:?}",
+                    case.source.trim_end(),
+                    round_tripped.trim_end(),
+                ));
             }
         }
     }

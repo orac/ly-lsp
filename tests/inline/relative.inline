@@ -1,0 +1,31 @@
+music = \relative c' { g4 }
+
+removeOctaveAfter = \relative c' { c \music e }
+                                     ^here
+---
+music = \relative c' { g4 }
+
+removeOctaveAfter = \relative c' { c g4 e' }
+===
+music = \relative c' { g4 }
+
+correctOctaveAfter = \relative c' { c \music e, }
+                                      ^all
+---
+correctOctaveAfter = \relative c' { c g4 e }
+===
+music = \relative c'' { d4 e }
+
+foo = \relative c' { c \music f }
+                       ^here
+---
+music = \relative c'' { d4 e }
+
+foo = \relative c' { c d'4 e f, }
+===
+music = \relative c' { c4 d e f }
+
+foo = \music
+        ^all
+---
+foo = \relative c' { c4 d e f }

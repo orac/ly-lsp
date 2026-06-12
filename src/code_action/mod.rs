@@ -13,6 +13,8 @@
 //! [`data`]: tower_lsp::lsp_types::CodeAction::data
 
 pub mod extract_to_variable;
+pub mod inline_variable;
+mod note_state;
 
 use std::collections::HashMap;
 
@@ -24,6 +26,7 @@ use tower_lsp::lsp_types::{
 
 use crate::document::Document;
 use extract_to_variable::ExtractToVariable;
+use inline_variable::{InlineAll, InlineHere};
 
 /// A code action the server can offer for a selection in a document.
 pub trait CodeAction {
@@ -68,6 +71,8 @@ struct ResolveData {
 pub fn offer_all(document: &Document, uri: &Url, selection: Range) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
     offer::<ExtractToVariable>(document, uri, selection, &mut actions);
+    offer::<InlineAll>(document, uri, selection, &mut actions);
+    offer::<InlineHere>(document, uri, selection, &mut actions);
     actions
 }
 
@@ -116,6 +121,8 @@ pub fn resolve(document: &Document, mut action: LspCodeAction) -> LspCodeAction 
 
     let resolved = match data.id.as_str() {
         ExtractToVariable::ID => ExtractToVariable::resolve(document, data.selection),
+        InlineAll::ID => InlineAll::resolve(document, data.selection),
+        InlineHere::ID => InlineHere::resolve(document, data.selection),
         _ => None,
     };
 
