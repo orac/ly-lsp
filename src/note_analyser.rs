@@ -1,71 +1,29 @@
 //! Lexical note-state analysis.
 //!
-//! LilyPond lets a note omit its duration (inherited from the previous note)
-//! and, in `\relative` mode, write only octave *adjustments* rather than an
-//! absolute octave. Several refactorings we might add later — extracting music
-//! to a variable, adding explicit pitches or durations, converting between
-//! relative and absolute entry — need to know each note's *resolved* pitch and
-//! duration, i.e. what LilyPond itself would compute reading the music left to
-//! right.
+//! LilyPond lets a note omit its duration (inherited from the previous note) and, in `\relative` mode, write only octave *adjustments* rather than an absolute octave. Several refactorings we might add later — extracting music to a variable, adding explicit pitches or durations, converting between relative and absolute entry — need to know each note's *resolved* pitch and duration, i.e. what LilyPond itself would compute reading the music left to right.
 //!
-//! This module reconstructs that state purely lexically. We never follow a
-//! `\foo` reference or an `\include`: the resolved pitch and duration of a note
-//! depend only on the notes that lexically precede it. The result is a flat
-//! list of [`Event`]s in source order, stored on the `Document` alongside the
-//! symbols and includes.
+//! This module reconstructs that state purely lexically. We never follow a `\foo` reference or an `\include`: the resolved pitch and duration of a note depend only on the notes that lexically precede it. The result is a flat list of [`Event`]s in source order, stored on the `Document` alongside the symbols and includes.
 //!
-//! The tree-sitter grammar does not group a note's tokens: `cis'8.` is a
-//! `symbol` (`cis`), two `punctuation` nodes (`'` and the `.`s), and an
-//! `unsigned_integer` (`8`) as flat siblings of the enclosing block. So the
-//! analyser walks the children of each music block, recognises these runs, and
-//! resolves them against the running state.
+//! The tree-sitter grammar does not group a note's tokens: `cis'8.` is a `symbol` (`cis`), two `punctuation` nodes (`'` and the `.`s), and an `unsigned_integer` (`8`) as flat siblings of the enclosing block. So the analyser walks the children of each music block, recognises these runs, and resolves them against the running state.
 //!
 //! # What counts as a note
 //!
-//! At an event position in a music block, any bare `symbol` (not introduced by
-//! `\` and not a quoted string) must be either one of the special tokens
-//! `r`/`R`/`s`/`q` or a pitch in the [active note-name language](crate::note_names).
-//! A `symbol` that is neither is reported as an invalid note (a diagnostic),
-//! which surfaces the places this lexical heuristic breaks down.
+//! At an event position in a music block, any bare `symbol` (not introduced by `\` and not a quoted string) must be either one of the special tokens `r`/`R`/`s`/`q` or a pitch in the [active note-name language](crate::note_names). A `symbol` that is neither is reported as an invalid note (a diagnostic), which surfaces the places this lexical heuristic breaks down.
 //!
-//! The active language follows `\language "…"` and `\include "….ly"` directives
-//! as they appear, starting from LilyPond's default (Dutch). Pitch resolution is
-//! only attempted in note mode (the default, `\notemode`, `\relative`,
-//! `\fixed`); `\chordmode` gives symbols chord meanings rather than pitches, so
-//! its entries are recorded for their extent and duration but not resolved to a
-//! pitch (an [`EventKind::ChordModeEvent`]). `\drummode` and `\figuremode` give
-//! symbols yet other meanings and are left alone for now.
+//! The active language follows `\language "…"` and `\include "….ly"` directives as they appear, starting from LilyPond's default (Dutch). Pitch resolution is only attempted in note mode (the default, `\notemode`, `\relative`, `\fixed`); `\chordmode` gives symbols chord meanings rather than pitches, so its entries are recorded for their extent and duration but not resolved to a pitch (an [`EventKind::ChordModeEvent`]). `\drummode` and `\figuremode` give symbols yet other meanings and are left alone for now.
 //!
 //! # Known limitations
 //!
-//! Resolution is best-effort and lexical, so a few constructs are mis-read or
-//! skipped, by design for now:
+//! Resolution is best-effort and lexical, so a few constructs are mis-read or skipped, by design for now:
 //!
-//! - Commands whose bare-symbol argument we don't yet skip (`\key c \major`,
-//!   `\transpose c d …`) have that pitch read as a spurious note, which also
-//!   perturbs the running `\relative` reference. `\clef`, `\set` and `\unset`
-//!   arguments are skipped; others may need the same treatment.
-//! - Drum mode (`\drummode`, `\new DrumStaff`, …) is skipped wholesale rather
-//!   than resolved, so user-defined drum note names need deeper handling later.
-//! - A parse error can flatten the tree (e.g. an unformed mode block), after
-//!   which loose music is read in the wrong mode. Events there are unreliable,
-//!   but diagnostics falling inside the error region are suppressed so a
-//!   mid-edit file is not buried in spurious squiggles.
-//! - Chord-modifier shorthand in note mode (`c:maj7`, `d:min`) leaves the
-//!   modifier (`maj`, `min`) looking like a bare symbol, so it is flagged as an
-//!   invalid note.
-//! - A bare note as an unbraced assignment value (`foo = c4`) is not read; only
-//!   events inside `{ }` / `<< >>` blocks and chords are.
-//! - `\breve`/`\longa` durations (written as words, not numbers) are not
-//!   recognised, so a following note inherits the previous numeric duration.
-//! - Inside nested `{ }` in `\relative` mode, the reference pitch does not
-//!   propagate back out of the inner block.
-//! - Post-events (articulations, fingerings, dynamics, slurs, ties and text or
-//!   markup scripts) are folded into the event's span but only when attached: a
-//!   neutral dynamic or articulation set off by whitespace, such as `c4 \f`, is
-//!   read as a following command instead. A markup post-event written with a
-//!   chained command (`c-\markup \italic foo`) keeps only the `\markup` in the
-//!   span; the rest is left loose.
+//! - Commands whose bare-symbol argument we don't yet skip (`\key c \major`, `\transpose c d …`) have that pitch read as a spurious note, which also perturbs the running `\relative` reference. `\clef`, `\set` and `\unset` arguments are skipped; others may need the same treatment.
+//! - Drum mode (`\drummode`, `\new DrumStaff`, …) is skipped wholesale rather than resolved, so user-defined drum note names need deeper handling later.
+//! - A parse error can flatten the tree (e.g. an unformed mode block), after which loose music is read in the wrong mode. Events there are unreliable, but diagnostics falling inside the error region are suppressed so a mid-edit file is not buried in spurious squiggles.
+//! - Chord-modifier shorthand in note mode (`c:maj7`, `d:min`) leaves the modifier (`maj`, `min`) looking like a bare symbol, so it is flagged as an invalid note.
+//! - A bare note as an unbraced assignment value (`foo = c4`) is not read; only events inside `{ }` / `<< >>` blocks and chords are.
+//! - `\breve`/`\longa` durations (written as words, not numbers) are not recognised, so a following note inherits the previous numeric duration.
+//! - Inside nested `{ }` in `\relative` mode, the reference pitch does not propagate back out of the inner block.
+//! - Post-events (articulations, fingerings, dynamics, slurs, ties and text or markup scripts) are folded into the event's span but only when attached: a neutral dynamic or articulation set off by whitespace, such as `c4 \f`, is read as a following command instead. A markup post-event written with a chained command (`c-\markup \italic foo`) keeps only the `\markup` in the span; the rest is left loose.
 
 use tree_sitter::{Node, Tree};
 
@@ -76,36 +34,27 @@ use crate::notes::{
     ChordNote, Duration, Event, EventKind, Events, NoteAnalysis, Pitch, Problem, RelativeRef,
 };
 
-/// The octave-entry mode in force for a span of music. The default at the top
-/// level (and inside a plain `{ }`) is [`Mode::Absolute`].
+/// The octave-entry mode in force for a span of music. The default at the top level (and inside a plain `{ }`) is [`Mode::Absolute`].
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     /// Octave marks are absolute: `c` is `octave -1`, each `'`/`,` adjusts it.
     Absolute,
-    /// `\relative`: octave marks adjust from the previous note, whose octave is
-    /// otherwise the nearest to it. Carries the running reference pitch.
+    /// `\relative`: octave marks adjust from the previous note, whose octave is otherwise the nearest to it. Carries the running reference pitch.
     Relative(Pitch),
-    /// `\fixed p`: like absolute, but the bare octave is shifted so an unmarked
-    /// note sits in `p`'s octave. Carries that octave offset.
+    /// `\fixed p`: like absolute, but the bare octave is shifted so an unmarked note sits in `p`'s octave. Carries that octave offset.
     Fixed(i32),
 }
 
-/// Whether the children being walked form a note-music event stream, and what
-/// mode their nested bare blocks inherit.
+/// Whether the children being walked form a note-music event stream, and what mode their nested bare blocks inherit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Region {
-    /// Bare symbols and chords here are read as note events; nested bare blocks
-    /// stay note-music.
+    /// Bare symbols and chords here are read as note events; nested bare blocks stay note-music.
     NoteMusic,
-    /// `\chordmode`: bare symbols here are chord-mode entries (a root with a
-    /// `:quality`/`/bass`), read for their extent and duration but not their
-    /// pitch; nested bare blocks stay chord-music.
+    /// `\chordmode`: bare symbols here are chord-mode entries (a root with a `:quality`/`/bass`), read for their extent and duration but not their pitch; nested bare blocks stay chord-music.
     ChordMusic,
-    /// Not itself an event stream (the top level, a music-function argument),
-    /// but nested bare blocks are note-music.
+    /// Not itself an event stream (the top level, a music-function argument), but nested bare blocks are note-music.
     NoteContext,
-    /// A non-note region (`\header`, `\lyricmode`, …); symbols are not events and
-    /// nested bare blocks stay non-note.
+    /// A non-note region (`\header`, `\lyricmode`, …); symbols are not events and nested bare blocks stay non-note.
     NonNote,
 }
 
@@ -129,9 +78,7 @@ const DEFAULT_RELATIVE_REFERENCE: Pitch = Pitch {
 
 /// Resolves the note state for every music event in `tree`, in source order.
 ///
-/// Walks music blocks left to right, tracking the octave-entry [`Mode`], the
-/// running `\relative` reference pitch, the active note-name language, and the
-/// last duration seen.
+/// Walks music blocks left to right, tracking the octave-entry [`Mode`], the running `\relative` reference pitch, the active note-name language, and the last duration seen.
 pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
     let mut analyser = Analyser {
         src,
@@ -145,11 +92,7 @@ pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
     // The top level is not itself a music stream, but its bare blocks are music.
     analyser.walk(tree.root_node(), Mode::Absolute, Region::NoteContext);
 
-    // A file is usually mid-edit, so parse errors are normal. Where the tree is
-    // broken the structure can't be trusted — a mode block may not have formed,
-    // and its contents then read in the wrong mode — so we drop any diagnostic
-    // falling inside an error region rather than bury the real syntax error
-    // under a flurry of spurious ones.
+    // A file is usually mid-edit, so parse errors are normal. Where the tree is broken the structure can't be trusted — a mode block may not have formed, and its contents then read in the wrong mode — so we drop any diagnostic falling inside an error region rather than bury the real syntax error under a flurry of spurious ones.
     let mut error_spans = Vec::new();
     collect_error_spans(tree.root_node(), &mut error_spans);
     analyser
@@ -168,9 +111,7 @@ struct Analyser<'a> {
     src: &'a str,
     events: Vec<Event>,
     problems: Vec<Problem>,
-    /// Structured command invocations recognised by the shared command parser,
-    /// in source order (preorder, so a `\repeat` precedes the `\volta`s nested in
-    /// its body).
+    /// Structured command invocations recognised by the shared command parser, in source order (preorder, so a `\repeat` precedes the `\volta`s nested in its body).
     commands: Vec<CommandCall>,
     /// Active note-name language; advances on `\language` / language includes.
     language: Language,
@@ -190,9 +131,7 @@ impl<'a> Analyser<'a> {
         node.kind() == "punctuation" && self.text(node) == ch
     }
 
-    /// Walks the children of `parent`. In a [`Region::NoteMusic`] region bare
-    /// symbols and chords are read as music events resolved against `mode`;
-    /// otherwise the children are scanned only for nested music and directives.
+    /// Walks the children of `parent`. In a [`Region::NoteMusic`] region bare symbols and chords are read as music events resolved against `mode`; otherwise the children are scanned only for nested music and directives.
     fn walk(&mut self, parent: Node, mut mode: Mode, region: Region) {
         let mut cursor = parent.walk();
         let children: Vec<Node> = parent.children(&mut cursor).collect();
@@ -203,8 +142,7 @@ impl<'a> Analyser<'a> {
             let child = children[i];
             match child.kind() {
                 "expression_block" | "parallel_music" => {
-                    // A bare block inherits the surrounding mode and region,
-                    // unless a preceding `\new`/`\context` set a region for it.
+                    // A bare block inherits the surrounding mode and region, unless a preceding `\new`/`\context` set a region for it.
                     let block_region = pending.take().unwrap_or_else(|| region.nested_block());
                     self.walk(child, mode, block_region);
                     i += 1;
@@ -219,18 +157,14 @@ impl<'a> Analyser<'a> {
                     i = self.read_chord_mode_event(&children, i);
                 }
                 "escaped_word" => {
-                    // Record the structured call for any command we have a
-                    // signature for; the mode/region logic still flows through
-                    // `handle_command`, which walks the body as music.
+                    // Record the structured call for any command we have a signature for; the mode/region logic still flows through `handle_command`, which walks the body as music.
                     if let Some((call, _)) = command::parse(&children, i, self.src) {
                         self.commands.push(call);
                     }
                     i = self.handle_command(&children, i, mode);
                     pending = None;
                 }
-                // `\new Staff` etc.: the context type decides whether the block
-                // that follows is read as note music. `\new Lyrics`/`ChordNames`
-                // and friends are not.
+                // `\new Staff` etc.: the context type decides whether the block that follows is read as note music. `\new Lyrics`/`ChordNames` and friends are not.
                 "named_context" => {
                     pending = Some(match self.context_type(child) {
                         Some(kind) if is_non_note_context(kind) => Region::NonNote,
@@ -243,8 +177,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// The context type named by a `named_context` node (`Staff` in `\new
-    /// Staff`), if it has one.
+    /// The context type named by a `named_context` node (`Staff` in `\new Staff`), if it has one.
     fn context_type(&self, node: Node) -> Option<&'a str> {
         let mut cursor = node.walk();
         node.children(&mut cursor)
@@ -252,8 +185,7 @@ impl<'a> Analyser<'a> {
             .map(|n| self.text(n))
     }
 
-    /// Handles an `escaped_word` command at `children[start]`, consuming any
-    /// arguments and block it governs, and returns the next index to read.
+    /// Handles an `escaped_word` command at `children[start]`, consuming any arguments and block it governs, and returns the next index to read.
     fn handle_command(&mut self, children: &[Node], start: usize, ambient: Mode) -> usize {
         let word = self.text(children[start]);
         match word {
@@ -291,16 +223,13 @@ impl<'a> Analyser<'a> {
                 self.enter_block(children, &mut i, Mode::Absolute);
                 i
             }
-            // Chord mode: bare symbols are chord-mode entries, read for their
-            // extent and duration (but not pitch). Nested bare blocks stay in
-            // chord mode.
+            // Chord mode: bare symbols are chord-mode entries, read for their extent and duration (but not pitch). Nested bare blocks stay in chord mode.
             "\\chordmode" | "\\chords" => {
                 let mut i = start + 1;
                 self.enter_chord_block(children, &mut i, ambient);
                 i
             }
-            // Modes where a bare symbol is not a note; scan for nested music but
-            // don't read events.
+            // Modes where a bare symbol is not a note; scan for nested music but don't read events.
             "\\drummode" | "\\drums" | "\\figuremode" | "\\figures" | "\\lyricmode"
             | "\\lyrics" | "\\addlyrics" | "\\markup" | "\\markuplist" | "\\header" | "\\paper"
             | "\\layout" | "\\midi" | "\\with" => {
@@ -308,8 +237,7 @@ impl<'a> Analyser<'a> {
                 self.enter_non_event_block(children, &mut i, ambient);
                 i
             }
-            // `\lyricsto voice { … }`: the lyric block follows a voice name,
-            // written as a bare symbol or a quoted string.
+            // `\lyricsto voice { … }`: the lyric block follows a voice name, written as a bare symbol or a quoted string.
             "\\lyricsto" => {
                 let mut i = start + 1;
                 if matches!(children.get(i).map(|n| n.kind()), Some("string" | "symbol")) {
@@ -318,8 +246,7 @@ impl<'a> Analyser<'a> {
                 self.enter_non_event_block(children, &mut i, ambient);
                 i
             }
-            // The repeat type (`volta`, `unfold`, …) is a bare symbol that must
-            // not be read as a note; the count and body follow as normal.
+            // The repeat type (`volta`, `unfold`, …) is a bare symbol that must not be read as a note; the count and body follow as normal.
             "\\repeat" => {
                 let next = start + 1;
                 if children.get(next).map(|n| n.kind()) == Some("symbol") {
@@ -338,22 +265,18 @@ impl<'a> Analyser<'a> {
                 }
                 next
             }
-            // `\set`/`\unset` take a context-property path (`Staff.instrumentName`)
-            // whose names must not be read as notes; any `= value` that follows
-            // is left to the main loop.
+            // `\set`/`\unset` take a context-property path (`Staff.instrumentName`) whose names must not be read as notes; any `= value` that follows is left to the main loop.
             "\\set" | "\\unset" => {
                 let mut i = start + 1;
                 self.skip_property_path(children, &mut i);
                 i
             }
-            // Any other command: dynamics, articulations, `\break`, etc. Its
-            // block argument, if any, is read as music by the main loop.
+            // Any other command: dynamics, articulations, `\break`, etc. Its block argument, if any, is read as music by the main loop.
             _ => start + 1,
         }
     }
 
-    /// Reads an optional reference pitch (a note name with octave marks) used by
-    /// `\relative`/`\fixed`, advancing `i` past it. Interpreted as absolute.
+    /// Reads an optional reference pitch (a note name with octave marks) used by `\relative`/`\fixed`, advancing `i` past it. Interpreted as absolute.
     fn read_reference_pitch(&self, children: &[Node], i: &mut usize) -> Option<Pitch> {
         let node = *children.get(*i)?;
         if node.kind() != "symbol" {
@@ -369,8 +292,7 @@ impl<'a> Analyser<'a> {
         })
     }
 
-    /// If a block follows at `children[*i]`, reads it as note music in `mode`
-    /// and advances past it.
+    /// If a block follows at `children[*i]`, reads it as note music in `mode` and advances past it.
     fn enter_block(&mut self, children: &[Node], i: &mut usize, mode: Mode) {
         if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
             self.walk(*block, mode, Region::NoteMusic);
@@ -378,8 +300,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Like [`enter_block`](Self::enter_block) but for a non-note context: the
-    /// block is scanned for nested music and directives only.
+    /// Like [`enter_block`](Self::enter_block) but for a non-note context: the block is scanned for nested music and directives only.
     fn enter_non_event_block(&mut self, children: &[Node], i: &mut usize, ambient: Mode) {
         if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
             self.walk(*block, ambient, Region::NonNote);
@@ -387,10 +308,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Like [`enter_block`](Self::enter_block) but for a `\chordmode` block: bare
-    /// symbols inside are read as chord-mode entries. The mode is carried only
-    /// for nested `\notemode`/`\relative` blocks, which reset it; chord-mode
-    /// entries themselves resolve no octave.
+    /// Like [`enter_block`](Self::enter_block) but for a `\chordmode` block: bare symbols inside are read as chord-mode entries. The mode is carried only for nested `\notemode`/`\relative` blocks, which reset it; chord-mode entries themselves resolve no octave.
     fn enter_chord_block(&mut self, children: &[Node], i: &mut usize, ambient: Mode) {
         if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
             self.walk(*block, ambient, Region::ChordMusic);
@@ -398,8 +316,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Skips a context-property path such as `Staff.instrumentName` — symbols
-    /// joined by dots — so the property names are not read as notes.
+    /// Skips a context-property path such as `Staff.instrumentName` — symbols joined by dots — so the property names are not read as notes.
     fn skip_property_path(&self, children: &[Node], i: &mut usize) {
         while children.get(*i).map(|n| n.kind()) == Some("symbol") {
             *i += 1;
@@ -411,8 +328,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Switches the active note-name language given a `\language`/include name
-    /// (with or without a `.ly` suffix), if it names a known language.
+    /// Switches the active note-name language given a `\language`/include name (with or without a `.ly` suffix), if it names a known language.
     fn set_language(&mut self, name: Option<&str>) {
         if let Some(name) = name {
             let name = name.strip_suffix(".ly").unwrap_or(name);
@@ -422,8 +338,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Reads a note/rest/skip/multi-measure-rest/`q` event whose first token is
-    /// the symbol at `children[start]`, returning the next index.
+    /// Reads a note/rest/skip/multi-measure-rest/`q` event whose first token is the symbol at `children[start]`, returning the next index.
     fn read_symbol(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
         let symbol = children[start];
         let name = self.text(symbol);
@@ -487,8 +402,7 @@ impl<'a> Analyser<'a> {
         i
     }
 
-    /// Reads a chord whose `<…>` node is at `children[start]`, plus the duration
-    /// that follows it, returning the next index.
+    /// Reads a chord whose `<…>` node is at `children[start]`, plus the duration that follows it, returning the next index.
     fn read_chord(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
         let chord = children[start];
         let relative = self.relative_ref(*mode);
@@ -523,14 +437,7 @@ impl<'a> Analyser<'a> {
         i
     }
 
-    /// Reads a chord-mode entry whose root symbol is at `children[start]`: the
-    /// root with its octave marks and duration, then the chord-quality modifier
-    /// (`:maj7`) and bass/inversion (`/e`) and any post-events, returning the
-    /// next index. Nothing is resolved — chord mode gives symbols chord meanings,
-    /// not pitches — so no note-name lookup is done and no diagnostics are
-    /// raised; the entry is recorded only for its extent and (inherited)
-    /// duration. [`value_end`](Event::value_end) is left before the `:`/`/`, so
-    /// an extracted entry that omits its duration has it written as `c4:m`.
+    /// Reads a chord-mode entry whose root symbol is at `children[start]`: the root with its octave marks and duration, then the chord-quality modifier (`:maj7`) and bass/inversion (`/e`) and any post-events, returning the next index. Nothing is resolved — chord mode gives symbols chord meanings, not pitches — so no note-name lookup is done and no diagnostics are raised; the entry is recorded only for its extent and (inherited) duration. [`value_end`](Event::value_end) is left before the `:`/`/`, so an extracted entry that omits its duration has it written as `c4:m`.
     fn read_chord_mode_event(&mut self, children: &[Node], start: usize) -> usize {
         let root = children[start];
         let begin = root.start_byte();
@@ -554,11 +461,7 @@ impl<'a> Analyser<'a> {
         i
     }
 
-    /// Consumes the chord-quality modifier (`:maj7`) and bass/inversion (`/e`,
-    /// `/+e`) that may follow a chord-mode root, together with the run of tokens
-    /// butting against each `:`/`/`, so they are not mistaken for the entries
-    /// that follow. Their content is not interpreted. Returns the byte at which
-    /// the entry now ends.
+    /// Consumes the chord-quality modifier (`:maj7`) and bass/inversion (`/e`, `/+e`) that may follow a chord-mode root, together with the run of tokens butting against each `:`/`/`, so they are not mistaken for the entries that follow. Their content is not interpreted. Returns the byte at which the entry now ends.
     fn consume_chord_qualifiers(&self, children: &[Node], i: &mut usize, mut end: usize) -> usize {
         while let Some(intro) = children
             .get(*i)
@@ -574,11 +477,7 @@ impl<'a> Analyser<'a> {
         end
     }
 
-    /// Consumes a trailing `:` and its chord-modifier or tremolo specification
-    /// (`c:maj7`, `c8:32`), so the modifier tokens are not mistaken for notes.
-    /// The spec is the run of tokens butting directly against the `:`; a `:`
-    /// with nothing adjacent after it is a dangling colon and is flagged.
-    /// Returns the byte at which the event now ends.
+    /// Consumes a trailing `:` and its chord-modifier or tremolo specification (`c:maj7`, `c8:32`), so the modifier tokens are not mistaken for notes. The spec is the run of tokens butting directly against the `:`; a `:` with nothing adjacent after it is a dangling colon and is flagged. Returns the byte at which the event now ends.
     fn consume_chord_or_tremolo(
         &mut self,
         children: &[Node],
@@ -606,19 +505,12 @@ impl<'a> Analyser<'a> {
         end
     }
 
-    /// Consumes the post-events attached to the event whose value ends at
-    /// `value_end` — articulations, fingerings, dynamics, slurs, ties, beams and
-    /// text or markup scripts — so they count towards the event's span rather
-    /// than being mistaken for the music that follows. Their content is not
-    /// interpreted. Returns the byte at which the event ends once they are
-    /// included.
+    /// Consumes the post-events attached to the event whose value ends at `value_end` — articulations, fingerings, dynamics, slurs, ties, beams and text or markup scripts — so they count towards the event's span rather than being mistaken for the music that follows. Their content is not interpreted. Returns the byte at which the event ends once they are included.
     fn consume_post_events(&self, children: &[Node], i: &mut usize, value_end: usize) -> usize {
         let mut end = value_end;
         while let Some(&node) = children.get(*i) {
             match node.kind() {
-                // A direction indicator (`-`/`^`/`_`) always introduces a script —
-                // an articulation, fingering, text or markup — and is invalid
-                // alone, so its target is consumed with it.
+                // A direction indicator (`-`/`^`/`_`) always introduces a script — an articulation, fingering, text or markup — and is invalid alone, so its target is consumed with it.
                 "punctuation" if self.is_direction(node) => {
                     *i += 1;
                     end = self.consume_script(children, i, node.end_byte());
@@ -633,10 +525,7 @@ impl<'a> Analyser<'a> {
                     end = node.end_byte();
                     *i += 1;
                 }
-                // A neutral named articulation or dynamic (`\staccato`, `\f`)
-                // carries no direction; we recognise it by its butting directly
-                // against the event, so a space-separated command that follows is
-                // left for the main loop.
+                // A neutral named articulation or dynamic (`\staccato`, `\f`) carries no direction; we recognise it by its butting directly against the event, so a space-separated command that follows is left for the main loop.
                 "escaped_word" if node.start_byte() == end => {
                     end = self.consume_command_post_event(children, i);
                 }
@@ -646,10 +535,7 @@ impl<'a> Analyser<'a> {
         end
     }
 
-    /// Consumes the script after a direction indicator (`-`/`^`/`_`): a script
-    /// glyph (`.`, `>`, …), a fingering number, a quoted text string, or a named
-    /// articulation or markup command. Returns where it ends, or `indicator_end`
-    /// unchanged for a dangling indicator with nothing after it.
+    /// Consumes the script after a direction indicator (`-`/`^`/`_`): a script glyph (`.`, `>`, …), a fingering number, a quoted text string, or a named articulation or markup command. Returns where it ends, or `indicator_end` unchanged for a dangling indicator with nothing after it.
     fn consume_script(&self, children: &[Node], i: &mut usize, indicator_end: usize) -> usize {
         let Some(&node) = children.get(*i) else {
             return indicator_end;
@@ -664,11 +550,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Consumes an `escaped_word` acting as a post-event — a named articulation
-    /// or dynamic (`\trill`, `\f`), or a markup script (`\markup { … }`) — at
-    /// `children[*i]`, taking a markup command's block, string or Scheme argument
-    /// with it. Returns its end byte. A markup written with a chained command
-    /// (`\markup \italic …`) keeps only the `\markup` itself.
+    /// Consumes an `escaped_word` acting as a post-event — a named articulation or dynamic (`\trill`, `\f`), or a markup script (`\markup { … }`) — at `children[*i]`, taking a markup command's block, string or Scheme argument with it. Returns its end byte. A markup written with a chained command (`\markup \italic …`) keeps only the `\markup` itself.
     fn consume_command_post_event(&self, children: &[Node], i: &mut usize) -> usize {
         let word = children[*i];
         *i += 1;
@@ -687,9 +569,7 @@ impl<'a> Analyser<'a> {
         node.kind() == "punctuation" && matches!(self.text(node), "-" | "^" | "_")
     }
 
-    /// Resolves the pitches inside a `<…>` chord node. In relative mode the
-    /// first note is relative to `mode`'s reference and each subsequent note to
-    /// the one before it.
+    /// Resolves the pitches inside a `<…>` chord node. In relative mode the first note is relative to `mode`'s reference and each subsequent note to the one before it.
     fn read_chord_notes(&mut self, chord: Node, mode: Mode) -> Vec<ChordNote> {
         let mut cursor = chord.walk();
         let inner: Vec<Node> = chord.children(&mut cursor).collect();
@@ -753,8 +633,7 @@ impl<'a> Analyser<'a> {
             .collect()
     }
 
-    /// The absolute octave for a note given the mode, written marks, and an
-    /// optional octave-check override.
+    /// The absolute octave for a note given the mode, written marks, and an optional octave-check override.
     fn resolve_octave(&self, mode: Mode, note_name: u8, marks: i32, check: Option<i32>) -> i32 {
         if let Some(checked) = check {
             return checked;
@@ -766,10 +645,7 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Consumes octave marks (`'`/`,`), accidental reminders (`!`/`?`) and an
-    /// optional octave check (`='`/`=,`) starting at `children[*i]`. Returns the
-    /// net octave shift, whether any marks were written, and the checked octave
-    /// (LilyPond's internal value, `c` = -1) if a check was present.
+    /// Consumes octave marks (`'`/`,`), accidental reminders (`!`/`?`) and an optional octave check (`='`/`=,`) starting at `children[*i]`. Returns the net octave shift, whether any marks were written, and the checked octave (LilyPond's internal value, `c` = -1) if a check was present.
     fn parse_octave(&self, children: &[Node], i: &mut usize) -> (i32, bool, Option<i32>) {
         let mut marks = 0;
         let mut written = false;
@@ -808,9 +684,7 @@ impl<'a> Analyser<'a> {
         (marks, written, check)
     }
 
-    /// Reads an optional duration (number, dots, `*` multipliers) starting at
-    /// `children[*i]`. Returns the duration in force and whether it was written
-    /// here; updates the inherited duration when it was.
+    /// Reads an optional duration (number, dots, `*` multipliers) starting at `children[*i]`. Returns the duration in force and whether it was written here; updates the inherited duration when it was.
     fn parse_duration(&mut self, children: &[Node], i: &mut usize) -> (Duration, bool) {
         let Some(number) = children.get(*i).filter(|n| n.kind() == "unsigned_integer") else {
             return (self.last_duration, false);
@@ -895,9 +769,7 @@ impl<'a> Analyser<'a> {
     }
 }
 
-/// LilyPond's relative-octave rule (`Pitch::to_relative_octave`): place the new
-/// note name in whichever octave is closest in diatonic steps to `reference`
-/// (ties going down), then apply the net written marks.
+/// LilyPond's relative-octave rule (`Pitch::to_relative_octave`): place the new note name in whichever octave is closest in diatonic steps to `reference` (ties going down), then apply the net written marks.
 pub fn relative_octave(reference: Pitch, note_name: u8, net_marks: i32) -> i32 {
     let here = reference.note_name as i32 + reference.octave * 7;
     let up_octave = reference.octave + i32::from(reference.note_name as i32 > note_name as i32);
@@ -912,8 +784,7 @@ pub fn relative_octave(reference: Pitch, note_name: u8, net_marks: i32) -> i32 {
     chosen + net_marks
 }
 
-/// Spells an absolute octave as LilyPond marks: middle C (`octave 0`) is one
-/// `'`, the bare `c` (`octave -1`) is none, each step adds a `'` or `,`.
+/// Spells an absolute octave as LilyPond marks: middle C (`octave 0`) is one `'`, the bare `c` (`octave -1`) is none, each step adds a `'` or `,`.
 fn absolute_octave_marks(octave: i32) -> String {
     if octave >= 0 {
         "'".repeat((octave + 1) as usize)
@@ -922,20 +793,17 @@ fn absolute_octave_marks(octave: i32) -> String {
     }
 }
 
-/// Punctuation that attaches a slur, tie or beam to a note with no introducing
-/// direction: `(`/`)`, `~`, `[`/`]` and the phrasing slurs `\(`/`\)`.
+/// Punctuation that attaches a slur, tie or beam to a note with no introducing direction: `(`/`)`, `~`, `[`/`]` and the phrasing slurs `\(`/`\)`.
 fn is_spanner_punct(text: &str) -> bool {
     matches!(text, "(" | ")" | "~" | "[" | "]" | "\\(" | "\\)")
 }
 
-/// Node kinds that can stand as the argument of a `\markup` post-event: a `{ }`
-/// block, a quoted string, or embedded Scheme.
+/// Node kinds that can stand as the argument of a `\markup` post-event: a `{ }` block, a quoted string, or embedded Scheme.
 fn is_markup_argument(kind: &str) -> bool {
     matches!(kind, "expression_block" | "string" | "embedded_scheme")
 }
 
-/// Collects the byte spans of the outermost `ERROR` nodes in the tree, pruning
-/// subtrees that contain no error.
+/// Collects the byte spans of the outermost `ERROR` nodes in the tree, pruning subtrees that contain no error.
 fn collect_error_spans(node: Node, out: &mut Vec<Span>) {
     if node.is_error() {
         out.push(Span::new(node.start_byte(), node.end_byte()));
@@ -966,8 +834,7 @@ fn string_fragment<'a>(string_node: Node, src: &'a str) -> Option<&'a str> {
         .map(|n| &src[n.start_byte()..n.end_byte()])
 }
 
-/// Whether a `\new`/`\context` context type holds something other than note
-/// music, so its bare block should not be read as notes.
+/// Whether a `\new`/`\context` context type holds something other than note music, so its bare block should not be read as notes.
 fn is_non_note_context(context: &str) -> bool {
     matches!(
         context,
@@ -1049,16 +916,14 @@ mod tests {
 
     #[test]
     fn relative_nearest_octave() {
-        // The classic: c' then notes chosen as the nearest octave.
-        // c' g (down a 4th) c (up a 4th) -> g is below c', c climbs back.
+        // The classic: c' then notes chosen as the nearest octave. c' g (down a 4th) c (up a 4th) -> g is below c', c climbs back.
         let analysis = run("\\relative c' { c g c }");
         assert_eq!(pitches(&analysis), vec![(0, 0), (4, -1), (0, 0)]);
     }
 
     #[test]
     fn relative_with_marks_shifts_octave() {
-        // In relative mode each `'` adds an octave on top of the nearest one, so
-        // `c''` after c' is two octaves up (octave 2), not absolute c''.
+        // In relative mode each `'` adds an octave on top of the nearest one, so `c''` after c' is two octaves up (octave 2), not absolute c''.
         let analysis = run("\\relative c' { c c'' c }");
         assert_eq!(pitches(&analysis), vec![(0, 0), (0, 2), (0, 2)]);
     }
@@ -1103,8 +968,7 @@ mod tests {
     #[test]
     fn rest_carries_duration_but_not_pitch() {
         let analysis = run("\\relative c' { c8 r d }");
-        // The rest takes 8 and does not advance the relative reference, so d is
-        // still resolved from c.
+        // The rest takes 8 and does not advance the relative reference, so d is still resolved from c.
         assert!(matches!(analysis.events[1].kind, EventKind::Rest));
         assert_eq!(pitches(&analysis), vec![(0, 0), (1, 0)]);
         assert_eq!(durations(&analysis), vec![(3, 0), (3, 0), (3, 0)]);
@@ -1240,9 +1104,7 @@ mod tests {
 
     #[test]
     fn chordmode_entry_is_recorded_without_resolving_pitch() {
-        // A chord-mode entry is one event spanning the whole `c2:maj7`, with the
-        // value ending before the `:maj7` so a duration would read `c4:maj7`.
-        // The chord-quality symbols (`maj`) are not flagged as bad notes.
+        // A chord-mode entry is one event spanning the whole `c2:maj7`, with the value ending before the `:maj7` so a duration would read `c4:maj7`. The chord-quality symbols (`maj`) are not flagged as bad notes.
         let src = "\\chordmode { c2:maj7 }";
         let analysis = run(src);
         assert!(analysis.problems.is_empty());
@@ -1253,8 +1115,7 @@ mod tests {
 
     #[test]
     fn chordmode_inversion_is_part_of_the_entry() {
-        // The `/e` bass keeps the entry whole, so a selection can't cut between
-        // the root and its inversion.
+        // The `/e` bass keeps the entry whole, so a selection can't cut between the root and its inversion.
         let src = "\\chordmode { c:m/e d }";
         let analysis = run(src);
         assert!(analysis.problems.is_empty());
@@ -1264,9 +1125,7 @@ mod tests {
 
     #[test]
     fn chordmode_propagates_into_nested_blocks() {
-        // A bare block nested in chordmode (here a `\repeat` body) stays in
-        // chord mode, so its entries are read as chord-mode entries, not notes,
-        // and the `:min` modifier is not flagged.
+        // A bare block nested in chordmode (here a `\repeat` body) stays in chord mode, so its entries are read as chord-mode entries, not notes, and the `:min` modifier is not flagged.
         let analysis = run("\\chordmode { \\repeat unfold 2 { c2:min d } }");
         assert!(analysis.problems.is_empty());
         assert_eq!(analysis.events.len(), 2);
@@ -1324,8 +1183,7 @@ mod tests {
 
     #[test]
     fn named_articulations_and_dynamics_extend_the_span() {
-        // `\staccato` (with a direction) and the bare dynamics `\f`, `\<`, `\!`
-        // all attach to their note, not to the music after it.
+        // `\staccato` (with a direction) and the bare dynamics `\f`, `\<`, `\!` all attach to their note, not to the music after it.
         let src = "{ c4-\\staccato d4\\f e\\< f\\! }";
         let analysis = run(src);
         assert!(analysis.problems.is_empty());
@@ -1337,8 +1195,7 @@ mod tests {
 
     #[test]
     fn markup_script_block_is_part_of_the_span() {
-        // The markup block must be swallowed whole: its words are not notes, and
-        // the span reaches the closing brace.
+        // The markup block must be swallowed whole: its words are not notes, and the span reaches the closing brace.
         let src = "{ c4^\\markup { italic \"x\" } d }";
         let analysis = run(src);
         assert!(
@@ -1410,8 +1267,7 @@ mod tests {
 
     #[test]
     fn note_mode_tremolo_is_consumed() {
-        // `c8:32` is an eighth note played as a 32nd tremolo; the `:32` must not
-        // become a separate event, and the note keeps its `8`.
+        // `c8:32` is an eighth note played as a 32nd tremolo; the `:32` must not become a separate event, and the note keeps its `8`.
         let analysis = run("{ c8:32 d }");
         assert_eq!(analysis.problems, vec![]);
         assert_eq!(durations(&analysis), vec![(3, 0), (3, 0)]);
@@ -1441,8 +1297,7 @@ mod tests {
 
     #[test]
     fn under_error_detects_containment() {
-        // The pure suppression predicate, exercised with fabricated spans so it
-        // needs no real ERROR node in the tree.
+        // The pure suppression predicate, exercised with fabricated spans so it needs no real ERROR node in the tree.
         let errors = [Span::new(10, 20)];
         assert!(under_error(Span::new(12, 15), &errors)); // strictly inside
         assert!(under_error(Span::new(10, 20), &errors)); // exactly the region
@@ -1453,11 +1308,7 @@ mod tests {
 
     #[test]
     fn diagnostics_in_a_broken_region_are_suppressed() {
-        // This real drum part trips tree-sitter into wrapping the whole input in
-        // an ERROR node, so the `\drummode` block never forms and its `sn`/`bd`
-        // would otherwise be read as (invalid) notes. Because they fall inside
-        // the error region, every such diagnostic is dropped — leaving only the
-        // syntax error the parser already reports.
+        // This real drum part trips tree-sitter into wrapping the whole input in an ERROR node, so the `\drummode` block never forms and its `sn`/`bd` would otherwise be read as (invalid) notes. Because they fall inside the error region, every such diagnostic is dropped — leaving only the syntax error the parser already reports.
         let src = "part = \\drummode {\n\
             \x20 << {\n\
             \x20   \\drag sn8-.\\ff sn-. sn-. r \\drag sn8-. sn-. sn-. |\n\
