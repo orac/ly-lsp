@@ -1,0 +1,19 @@
+\repeat volta 2 { c1 \alternative { { d1 } { e1 } } }
+  ^
+---
+{ c1 d1 c1 e1 }
+===
+\repeat volta 2 { c4 } \alternative { \volta 1 { d } \volta 2 { e } }
+  ^
+---
+{ c4 d c4 e }
+===
+\fixed c'' { \repeat volta 6 { c4 d e f \alternative { { c2 e } { f2 d } { e2 f } } } c1 }
+             ^
+---
+\fixed c'' { c4 d e f c2 e c4 d e f c2 e c4 d e f c2 e c4 d e f c2 e c4 d e f f2 d c4 d e f e2 f c1 }
+===
+\fixed c'' { \repeat volta 6 { c4 d e f \alternative { \volta 1,2,3 { c2 e } \volta 4,5 { f2 d } \volta 6 { e2 f } } } c1 }
+             ^
+---
+\fixed c'' { c4 d e f c2 e c4 d e f c2 e c4 d e f c2 e c4 d e f f2 d c4 d e f f2 d c4 d e f e2 f c1 }

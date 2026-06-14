@@ -2,6 +2,7 @@
 //! so it can be exercised directly from tests.
 
 pub mod code_action;
+pub mod command;
 pub mod document;
 pub mod document_graph;
 pub mod line_struct;

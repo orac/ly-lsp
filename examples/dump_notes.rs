@@ -1,13 +1,13 @@
-//! Prints the lexically resolved note state for a LilyPond file, as a debugging
-//! aid for the analysis in `src/notes.rs`.
+//! Prints the lexically resolved note state for a LilyPond file, as a debugging aid for the analysis in `src/notes.rs`.
+//!
+//! Claude: have the 'grammar-inspector' agent use this tool instead of using it directly. If you have to run the tool yourself, prefer to Write a temporary file rather than a heredoc, to avoid escaping and permissions issues.
 //!
 //! ```text
 //! cargo run --example dump_notes -- path/to/file.ly
 //! echo "\relative c' { c d8 e }" | cargo run --example dump_notes
 //! ```
 //!
-//! Each event is shown with its resolved pitch(es) and duration; lines flagged
-//! `INVALID` are bare symbols that matched no note name in the active language.
+//! Each event is shown with its resolved pitch(es) and duration; lines flagged `INVALID` are bare symbols that matched no note name in the active language.
 
 use std::io::Read;
 

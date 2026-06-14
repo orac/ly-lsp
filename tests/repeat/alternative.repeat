@@ -1,0 +1,9 @@
+\repeat volta 2 { c4 } \alternative { { d } { e } }
+  ^
+---
+{ c4 d c4 e }
+===
+\repeat volta 3 { c4 } \alternative { { d } { e } }
+  ^
+---
+{ c4 d c4 d c4 e }

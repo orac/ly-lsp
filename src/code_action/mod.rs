@@ -13,6 +13,7 @@
 //! [`data`]: tower_lsp::lsp_types::CodeAction::data
 
 pub mod extract_to_variable;
+pub mod inline_repeats;
 pub mod inline_variable;
 mod note_state;
 
@@ -26,6 +27,7 @@ use tower_lsp::lsp_types::{
 
 use crate::document::Document;
 use extract_to_variable::ExtractToVariable;
+use inline_repeats::InlineRepeats;
 use inline_variable::{InlineAll, InlineHere};
 
 /// A code action the server can offer for a selection in a document.
@@ -73,6 +75,7 @@ pub fn offer_all(document: &Document, uri: &Url, selection: Range) -> Vec<CodeAc
     offer::<ExtractToVariable>(document, uri, selection, &mut actions);
     offer::<InlineAll>(document, uri, selection, &mut actions);
     offer::<InlineHere>(document, uri, selection, &mut actions);
+    offer::<InlineRepeats>(document, uri, selection, &mut actions);
     actions
 }
 
@@ -123,6 +126,7 @@ pub fn resolve(document: &Document, mut action: LspCodeAction) -> LspCodeAction 
         ExtractToVariable::ID => ExtractToVariable::resolve(document, data.selection),
         InlineAll::ID => InlineAll::resolve(document, data.selection),
         InlineHere::ID => InlineHere::resolve(document, data.selection),
+        InlineRepeats::ID => InlineRepeats::resolve(document, data.selection),
         _ => None,
     };
 

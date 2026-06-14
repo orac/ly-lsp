@@ -1,0 +1,19 @@
+{ \repeat percent 4 c2 }
+  ^
+---
+{ c2 c2 c2 c2 }
+===
+{ \repeat percent 4 <c e>2 }
+  ^
+---
+{ <c e>2 <c e>2 <c e>2 <c e>2 }
+===
+\repeat unfold 2 c4
+^
+---
+{ c4 c4 }
+===
+{ \repeat unfold 2 c4 d8 }
+  ^
+---
+{ c4 c4 d8 }

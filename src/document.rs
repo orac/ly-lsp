@@ -11,6 +11,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
+use crate::command::Commands;
 use crate::line_struct::{LineIndex, Span};
 use crate::note_analyser;
 use crate::notes::{Events, NoteAnalysis, Problem};
@@ -139,6 +140,12 @@ impl Document {
     /// The lexically resolved music events, queryable by position or span.
     pub fn notes(&self) -> &Events {
         &self.notes.events
+    }
+
+    /// The structured command invocations (`\repeat`, `\volta`, …) found in the
+    /// same pass, in source order.
+    pub fn commands(&self) -> &Commands {
+        &self.notes.commands
     }
 
     /// Syntax diagnostics from the parse tree. Tree-sitter's error recovery

@@ -1,0 +1,29 @@
+{ \repeat unfold 2 { c4 d } }
+  ^
+---
+{ c4 d c4 d }
+===
+{ c4 \repeat unfold 2 { d e8 } }
+       ^
+---
+{ c4 d e8 d4 e8 }
+===
+foo = \repeat unfold 2 { c4 d }
+      ^
+---
+foo = { c4 d c4 d }
+===
+{ \repeat volta 1 { c4 d } }
+  ^
+---
+{ c4 d }
+===
+{ \repeat tremolo 8 { c32 d } }
+  ^
+---
+NONE
+===
+{ c4 \repeat unfold 2 { d } }
+  ^
+---
+NONE

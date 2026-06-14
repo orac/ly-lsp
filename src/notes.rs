@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use crate::command::Commands;
 use crate::line_struct::Span;
 
 /// A pitch resolved to its absolute value, mirroring LilyPond's internal model
@@ -217,6 +218,9 @@ pub struct NoteAnalysis {
     pub events: Events,
     /// Lexical problems found while reading the music, surfaced as diagnostics.
     pub problems: Vec<Problem>,
+    /// The structured command invocations (`\repeat`, `\volta`, …) recognised in
+    /// the same pass, for the refactorings and completion to share.
+    pub commands: Commands,
 }
 
 /// A diagnosable problem found by the lexical note pass.

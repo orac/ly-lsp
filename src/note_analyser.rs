@@ -69,6 +69,7 @@
 
 use tree_sitter::{Node, Tree};
 
+use crate::command::{self, CommandCall, Commands, is_block};
 use crate::line_struct::Span;
 use crate::note_names::Language;
 use crate::notes::{
@@ -136,6 +137,7 @@ pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
         src,
         events: Vec::new(),
         problems: Vec::new(),
+        commands: Vec::new(),
         language: Language::DEFAULT,
         last_duration: Duration::DEFAULT,
         last_chord: Vec::new(),
@@ -157,6 +159,7 @@ pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
     NoteAnalysis {
         events: Events::new(analyser.events),
         problems: analyser.problems,
+        commands: Commands::new(analyser.commands),
     }
 }
 
@@ -165,6 +168,10 @@ struct Analyser<'a> {
     src: &'a str,
     events: Vec<Event>,
     problems: Vec<Problem>,
+    /// Structured command invocations recognised by the shared command parser,
+    /// in source order (preorder, so a `\repeat` precedes the `\volta`s nested in
+    /// its body).
+    commands: Vec<CommandCall>,
     /// Active note-name language; advances on `\language` / language includes.
     language: Language,
     /// Last duration seen anywhere; inherited by an event that omits its own.
@@ -212,6 +219,12 @@ impl<'a> Analyser<'a> {
                     i = self.read_chord_mode_event(&children, i);
                 }
                 "escaped_word" => {
+                    // Record the structured call for any command we have a
+                    // signature for; the mode/region logic still flows through
+                    // `handle_command`, which walks the body as music.
+                    if let Some((call, _)) = command::parse(&children, i, self.src) {
+                        self.commands.push(call);
+                    }
                     i = self.handle_command(&children, i, mode);
                     pending = None;
                 }
@@ -909,10 +922,6 @@ fn absolute_octave_marks(octave: i32) -> String {
     }
 }
 
-fn is_block(kind: &str) -> bool {
-    kind == "expression_block" || kind == "parallel_music"
-}
-
 /// Punctuation that attaches a slur, tie or beam to a note with no introducing
 /// direction: `(`/`)`, `~`, `[`/`]` and the phrasing slurs `\(`/`\)`.
 fn is_spanner_punct(text: &str) -> bool {
@@ -1205,6 +1214,28 @@ mod tests {
         let analysis = run("{ \\repeat volta 2 { c d } }");
         assert!(analysis.problems.is_empty());
         assert_eq!(pitches(&analysis), vec![(0, -1), (1, -1)]);
+    }
+
+    #[test]
+    fn commands_are_recorded_in_source_order_including_nested() {
+        // The shared command parser runs in the same pass, so a `\repeat` and the
+        // `\volta` nested in its body are both recorded, the outer one first.
+        let src = "{ \\repeat volta 2 { c \\volta 1 { d } e } }";
+        let analysis = run(src);
+        let names: Vec<&str> = analysis.commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["repeat", "volta"]);
+
+        // The body of the repeat contains exactly the nested volta call.
+        let repeat = &analysis.commands[0];
+        let body = repeat.body().expect("repeat has a body");
+        let inside: Vec<&str> = analysis
+            .commands
+            .within(body.start, body.end)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(inside, vec!["volta"]);
+        // The notes still resolve normally alongside the recorded commands.
+        assert_eq!(pitches(&analysis), vec![(0, -1), (1, -1), (2, -1)]);
     }
 
     #[test]
