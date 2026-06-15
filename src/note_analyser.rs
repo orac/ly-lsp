@@ -21,6 +21,7 @@
 //! - A parse error can flatten the tree (e.g. an unformed mode block), after which loose music is read in the wrong mode. Events there are unreliable, but diagnostics falling inside the error region are suppressed so a mid-edit file is not buried in spurious squiggles.
 //! - Chord-modifier shorthand in note mode (`c:maj7`, `d:min`) leaves the modifier (`maj`, `min`) looking like a bare symbol, so it is flagged as an invalid note.
 //! - A bare note as an unbraced assignment value (`foo = c4`) is not read; only events inside `{ }` / `<< >>` blocks and chords are.
+//! - A bare duration (`c4 4`) is read as a note repeating the previous pitch only directly after a single-note event (possibly across a bar check); after a chord or `q`, whose several pitches a single note can't repeat, or as the first token of a block, it is skipped. To tell a real bare duration from a command's integer argument (the `2` of `\repeat … 2`), only an integer following a music event is taken — so a bare duration after a command is missed too.
 //! - `\breve`/`\longa` durations (written as words, not numbers) are not recognised, so a following note inherits the previous numeric duration.
 //! - Inside nested `{ }` in `\relative` mode, the reference pitch does not propagate back out of the inner block.
 //! - Post-events (articulations, fingerings, dynamics, slurs, ties and text or markup scripts) are folded into the event's span but only when attached: a neutral dynamic or articulation set off by whitespace, such as `c4 \f`, is read as a following command instead. A markup post-event written with a chained command (`c-\markup \italic foo`) keeps only the `\markup` in the span; the rest is left loose.
@@ -87,6 +88,7 @@ pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
         commands: Vec::new(),
         language: Language::DEFAULT,
         last_duration: Duration::DEFAULT,
+        last_pitch: None,
         last_chord: Vec::new(),
     };
     // The top level is not itself a music stream, but its bare blocks are music.
@@ -117,6 +119,10 @@ struct Analyser<'a> {
     language: Language,
     /// Last duration seen anywhere; inherited by an event that omits its own.
     last_duration: Duration,
+    /// Pitch of the most recent single note, repeated by a bare duration (the
+    /// `4` in `c4 4`). Cleared by a chord or `q`, whose repetition a single
+    /// pitch can't represent, and untouched by rests, which carry no pitch.
+    last_pitch: Option<Pitch>,
     /// Pitches of the most recent chord, repeated by `q`.
     last_chord: Vec<ChordNote>,
 }
@@ -137,6 +143,10 @@ impl<'a> Analyser<'a> {
         let children: Vec<Node> = parent.children(&mut cursor).collect();
         // The region a `\new`/`\context` set for the bare block that follows it.
         let mut pending: Option<Region> = None;
+        // Whether the last child read was a music event, so a following bare
+        // integer is a bare duration repeating its pitch rather than a command's
+        // numeric argument (the `1` of `\volta 1`, the `2` of `\repeat … 2`).
+        let mut after_event = false;
         let mut i = 0;
         while i < children.len() {
             let child = children[i];
@@ -145,16 +155,28 @@ impl<'a> Analyser<'a> {
                     // A bare block inherits the surrounding mode and region, unless a preceding `\new`/`\context` set a region for it.
                     let block_region = pending.take().unwrap_or_else(|| region.nested_block());
                     self.walk(child, mode, block_region);
+                    after_event = false;
                     i += 1;
                 }
                 "chord" if region == Region::NoteMusic => {
                     i = self.read_chord(&children, i, &mut mode);
+                    after_event = true;
                 }
                 "symbol" if region == Region::NoteMusic => {
                     i = self.read_symbol(&children, i, &mut mode);
+                    after_event = true;
+                }
+                // A bare duration with no note name (`c4 4`) repeats the previous
+                // note's pitch; read it as a note whose pitch was inherited. Only
+                // directly after a music event, so a command's integer argument
+                // isn't mistaken for one.
+                "unsigned_integer" if region == Region::NoteMusic && after_event => {
+                    i = self.read_bare_duration(&children, i, &mut mode);
+                    after_event = true;
                 }
                 "symbol" if region == Region::ChordMusic => {
                     i = self.read_chord_mode_event(&children, i);
+                    after_event = false;
                 }
                 "escaped_word" => {
                     // Record the structured call for any command we have a signature for; the mode/region logic still flows through `handle_command`, which walks the body as music.
@@ -163,6 +185,7 @@ impl<'a> Analyser<'a> {
                     }
                     i = self.handle_command(&children, i, mode);
                     pending = None;
+                    after_event = false;
                 }
                 // `\new Staff` etc.: the context type decides whether the block that follows is read as note music. `\new Lyrics`/`ChordNames` and friends are not.
                 "named_context" => {
@@ -170,9 +193,16 @@ impl<'a> Analyser<'a> {
                         Some(kind) if is_non_note_context(kind) => Region::NonNote,
                         _ => region.nested_block(),
                     });
+                    after_event = false;
                     i += 1;
                 }
-                _ => i += 1,
+                // A bar check between events doesn't break the run, so a bare
+                // duration may still follow it (`c4 | 4`).
+                "punctuation" if self.is_punct(child, "|") => i += 1,
+                _ => {
+                    after_event = false;
+                    i += 1;
+                }
             }
         }
     }
@@ -355,6 +385,12 @@ impl<'a> Analyser<'a> {
             _ => None,
         };
         if let Some(kind) = special {
+            // A chord repetition (`q`) repeats a chord, which a single inherited
+            // pitch can't stand in for; a rest or skip carries no pitch. Either
+            // way no single pitch is available for a following bare duration.
+            if matches!(kind, EventKind::ChordRepetition(_)) {
+                self.last_pitch = None;
+            }
             let (duration, written) = self.parse_duration(children, &mut i);
             let after_duration = children[i - 1].end_byte();
             let value_end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
@@ -387,6 +423,7 @@ impl<'a> Analyser<'a> {
         if let Mode::Relative(_) = mode {
             *mode = Mode::Relative(pitch);
         }
+        self.last_pitch = Some(pitch);
         self.push_event(
             begin,
             end,
@@ -394,6 +431,48 @@ impl<'a> Analyser<'a> {
             EventKind::Note {
                 pitch,
                 octave_written: octave_written || check.is_some(),
+                pitch_written: true,
+            },
+            duration,
+            written,
+            relative,
+        );
+        i
+    }
+
+    /// Reads a bare duration — a duration with no note name, like the `4` in
+    /// `c4 4` — which repeats the previous note's pitch. Emits a [`Note`] event
+    /// carrying that inherited pitch with `pitch_written` false, or, when no
+    /// single pitch is available to inherit (the music opened with this duration,
+    /// or the last note was a chord or `q`), consumes the duration without
+    /// emitting an event. The first token at `children[start]` is the integer.
+    ///
+    /// [`Note`]: EventKind::Note
+    fn read_bare_duration(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
+        let begin = children[start].start_byte();
+        let relative = self.relative_ref(*mode);
+        let mut i = start;
+        let (duration, written) = self.parse_duration(children, &mut i);
+        let after_duration = children[i - 1].end_byte();
+        let value_end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
+        let end = self.consume_post_events(children, &mut i, value_end);
+
+        let Some(pitch) = self.last_pitch else {
+            return i;
+        };
+        // The bare duration is a full note at the inherited pitch, so it advances
+        // the `\relative` reference — to the same pitch, leaving it unchanged.
+        if let Mode::Relative(_) = mode {
+            *mode = Mode::Relative(pitch);
+        }
+        self.push_event(
+            begin,
+            end,
+            value_end,
+            EventKind::Note {
+                pitch,
+                octave_written: false,
+                pitch_written: false,
             },
             duration,
             written,
@@ -415,6 +494,10 @@ impl<'a> Analyser<'a> {
         if !notes.is_empty() {
             self.last_chord = notes.clone();
         }
+        // A following bare duration repeats this whole chord, not a single pitch,
+        // so clear the single-note inheritance rather than leave an older note in
+        // place for it to wrongly pick up.
+        self.last_pitch = None;
 
         let mut i = start + 1;
         let (duration, written) = self.parse_duration(children, &mut i);
@@ -1284,6 +1367,70 @@ mod tests {
         let analysis = run("{ <c e>4:maj7 }");
         assert!(analysis.problems.is_empty());
         assert_eq!(analysis.events.len(), 1);
+    }
+
+    /// Whether each event wrote its own pitch, or inherited it (a bare duration).
+    fn pitch_written(analysis: &NoteAnalysis) -> Vec<bool> {
+        analysis
+            .events
+            .iter()
+            .map(|e| {
+                !matches!(
+                    e.kind,
+                    EventKind::Note {
+                        pitch_written: false,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bare_duration_repeats_the_previous_pitch() {
+        // The `4` and `8` carry no note name, so each repeats the pitch before it.
+        let analysis = run("{ c4 4 d8 8 }");
+        assert!(analysis.problems.is_empty());
+        assert_eq!(pitches(&analysis), vec![(0, -1), (0, -1), (1, -1), (1, -1)]);
+        assert_eq!(pitch_written(&analysis), vec![true, false, true, false]);
+        // Every bare duration writes its own duration, inheriting nothing.
+        assert!(analysis.events.iter().all(|e| e.duration_written));
+    }
+
+    #[test]
+    fn bare_duration_in_relative_advances_the_reference() {
+        // The bare `4` is a c' that advances the reference like any note, so the
+        // following `g` is still the nearest g below c' (octave -1), unchanged.
+        let analysis = run("\\relative c' { c4 4 g }");
+        assert_eq!(pitches(&analysis), vec![(0, 0), (0, 0), (4, -1)]);
+    }
+
+    #[test]
+    fn bare_duration_needs_a_single_pitch_to_inherit() {
+        // A chord or `q` repeats more than one pitch, which a single inherited
+        // note can't stand in for, so a bare duration after one is not read.
+        for src in ["{ <c e>4 4 }", "{ <c e>4 q4 4 }"] {
+            let analysis = run(src);
+            assert!(
+                analysis.events.iter().all(|e| !matches!(
+                    e.kind,
+                    EventKind::Note {
+                        pitch_written: false,
+                        ..
+                    }
+                )),
+                "a bare duration was read in {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_integer_arguments_are_not_bare_durations() {
+        // The number arguments of `\repeat`/`\volta` follow a command word, not a
+        // music event, so they must not be read as pitch-repeating bare durations.
+        let analysis = run("{ c \\repeat volta 2 { d \\volta 1 { e } } }");
+        assert!(analysis.problems.is_empty());
+        assert_eq!(pitches(&analysis), vec![(0, -1), (1, -1), (2, -1)]);
     }
 
     #[test]

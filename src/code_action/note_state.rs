@@ -1,12 +1,14 @@
-//! Shared note-state helpers for the refactorings that move music between
-//! contexts (extract-to-variable and inline-variable).
+//! Shared note-state helpers for the refactorings that make a note's inherited
+//! state explicit: those that move music between contexts (extract-to-variable
+//! and inline-variable), where a note that omitted its duration or (in
+//! `\relative` mode) its octave would resolve differently once moved, and
+//! make-pitches/durations-explicit, which spell out that inherited state in
+//! place.
 //!
-//! When a run of music is detached from or spliced into its surroundings, a
-//! note that omitted its duration or (in `\relative` mode) its octave would
-//! resolve differently in the new context. These helpers locate the note that
-//! carries an event's octave and re-spell its marks, and spell the octave
-//! adjustment for a relative note — the common arithmetic both refactorings use
-//! to keep the music sounding the same after it moves.
+//! These helpers locate the note that carries an event's octave and re-spell its
+//! marks, spell the octave adjustment for a relative note, and spell the
+//! inherited pitch of a bare duration — the common arithmetic the refactorings
+//! use to keep the music sounding the same.
 
 use tower_lsp::lsp_types::{Range, TextEdit};
 
@@ -14,6 +16,64 @@ use crate::document::Document;
 use crate::line_struct::Span;
 use crate::note_analyser::relative_octave;
 use crate::notes::{Event, EventKind, Pitch};
+
+/// The text spelling the inherited pitch of the bare-duration note `events[index]`
+/// — what "make pitches explicit" inserts before its duration — or `None` if the
+/// note's pitch is already written or no source pitch can be found to copy.
+///
+/// In `\relative` mode the inherited pitch is the reference in force, so the note
+/// name alone (no octave marks) resolves to it. Otherwise — absolute or `\fixed`
+/// mode — the previous *written* note's pitch text is copied verbatim: it spells
+/// the very same pitch, and being written in the same mode it resolves there to
+/// the same pitch again, sidestepping any mode-specific octave arithmetic.
+pub(super) fn explicit_pitch(events: &[Event], index: usize, src: &str) -> Option<String> {
+    if !matches!(
+        events[index].kind,
+        EventKind::Note {
+            pitch_written: false,
+            ..
+        }
+    ) {
+        return None;
+    }
+
+    // The nearest earlier note whose pitch the source actually wrote; the bare
+    // duration exists only because such a note set the inherited pitch, and in
+    // `\relative` mode that note is also the reference now in force.
+    let previous = events[..index].iter().rev().find(|event| {
+        matches!(
+            event.kind,
+            EventKind::Note {
+                pitch_written: true,
+                ..
+            }
+        )
+    })?;
+    let value = &src[previous.span.start..previous.value_end];
+
+    // In `\relative` mode the bare note inherits the reference, so its name and
+    // accidental alone — no octave marks — resolve back to it. Copying them from
+    // the source keeps the writer's own spelling (`ef`, not the language's
+    // canonical `e-flat`). Otherwise — absolute or `\fixed` mode — the full pitch
+    // text, octave marks included, spells the very same pitch again.
+    Some(if events[index].relative.is_some() {
+        value[..leading_letters(value)].to_string()
+    } else {
+        pitch_text(value).to_string()
+    })
+}
+
+/// The pitch portion at the start of a note's value text: its name and
+/// accidental followed by any octave marks (`cis,` of `cis,8`), dropping the
+/// duration and the accidental reminders (`!`/`?`) that follow.
+fn pitch_text(value: &str) -> &str {
+    let head = leading_letters(value);
+    let marks = value[head..]
+        .bytes()
+        .take_while(|b| matches!(b, b'\'' | b','))
+        .count();
+    &value[..head + marks]
+}
 
 /// The resolved pitch carried by an event for relative-octave purposes: a note's
 /// pitch, or a chord's first note. `None` for rests, skips and the like.
@@ -34,9 +94,13 @@ pub(super) fn pitch_of(event: &Event) -> Option<Pitch> {
 /// marks never strays into an attached articulation or markup.
 pub(super) fn leading_note(event: &Event) -> Option<(Span, Pitch)> {
     match &event.kind {
-        EventKind::Note { pitch, .. } => {
-            Some((Span::new(event.span.start, event.value_end), *pitch))
-        }
+        // A bare duration carries no note name or octave marks to re-spell, so it
+        // is not a leading note even though it resolves to a pitch.
+        EventKind::Note {
+            pitch,
+            pitch_written: true,
+            ..
+        } => Some((Span::new(event.span.start, event.value_end), *pitch)),
         EventKind::Chord(notes) => notes.first().map(|n| (n.span, n.pitch)),
         _ => None,
     }

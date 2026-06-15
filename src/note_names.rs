@@ -86,13 +86,15 @@ impl Language {
     }
 
     /// A spelling for the pitch `(note name, alteration)` in this language, or
-    /// `None` if it has no name for it. The table lists the canonical spelling
-    /// before any alternatives, so the first match is the canonical one.
+    /// `None` if it has no name for it. Where a language gives several spellings
+    /// (English `ef` and `e-flat`), the shortest is chosen, so callers get the
+    /// terse form a writer would use rather than the spelled-out alias.
     pub fn spell(self, note_name: u8, alteration: i8) -> Option<&'static str> {
         self.table()
             .iter()
-            .find(|&&(_, note, alt)| note == note_name && alt == alteration)
+            .filter(|&&(_, note, alt)| note == note_name && alt == alteration)
             .map(|&(name, _, _)| name)
+            .min_by_key(|name| name.len())
     }
 }
 
@@ -1124,3 +1126,24 @@ static VLAAMS_NAMES: &[(&str, u8, i8)] = &[
     ("solkhk", 4, 3),
     ("solkk", 4, 4),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+
+    #[test]
+    fn spell_prefers_the_short_form_over_a_spelled_out_alias() {
+        // English lists both `ef` and `e-flat` for e-flat; the terse one wins.
+        assert_eq!(Language::English.spell(2, -2), Some("ef"));
+        assert_eq!(Language::English.spell(0, 2), Some("cs"));
+        // A natural keeps its bare letter, not `e-natural`.
+        assert_eq!(Language::English.spell(2, 0), Some("e"));
+    }
+
+    #[test]
+    fn spell_returns_none_for_a_pitch_no_spelling_covers() {
+        // No language names a pitch this sharp (alteration 6); the tables stop at
+        // the double sharp, +4.
+        assert_eq!(Language::English.spell(0, 6), None);
+    }
+}

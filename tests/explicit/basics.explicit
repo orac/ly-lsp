@@ -1,0 +1,35 @@
+{ c4 d e8 f }
+  ^^^^^^^^^
+--- dur
+{ c4 d4 e8 f8 }
+--- pitch
+NONE
+--- both
+{ c4 d4 e8 f8 }
+===
+{ c4 d e f }
+     ^^^
+--- dur
+{ c4 d4 e4 f }
+--- pitch
+NONE
+--- both
+{ c4 d4 e4 f }
+===
+{ c4 d4 }
+  ^^^^^
+--- dur
+NONE
+--- pitch
+NONE
+--- both
+NONE
+===
+{ c4 r <e g> }
+  ^^^^^^^^^^
+--- dur
+{ c4 r4 <e g>4 }
+--- pitch
+NONE
+--- both
+{ c4 r4 <e g>4 }

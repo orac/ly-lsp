@@ -1,6 +1,6 @@
 //! Prints the lexically resolved note state for a LilyPond file, as a debugging aid for the analysis in `src/notes.rs`.
 //!
-//! Claude: have the 'grammar-inspector' agent use this tool instead of using it directly. If you have to run the tool yourself, prefer to Write a temporary file rather than a heredoc, to avoid escaping and permissions issues.
+//! Claude: always Write a temporary file rather than using `printf` in bash or a heredoc, both of which will ask for permission.
 //!
 //! ```text
 //! cargo run --example dump_notes -- path/to/file.ly
@@ -45,7 +45,14 @@ fn main() {
             " (inherited)"
         };
         let kind = match &event.kind {
-            EventKind::Note { pitch, .. } => format!("note {pitch:?}"),
+            EventKind::Note {
+                pitch,
+                pitch_written,
+                ..
+            } => {
+                let repeated = if *pitch_written { "" } else { " (repeated)" };
+                format!("note {pitch:?}{repeated}")
+            }
             EventKind::Chord(notes) => format!("chord {:?}", pitch_list(notes)),
             EventKind::ChordRepetition(notes) => format!("q {:?}", pitch_list(notes)),
             EventKind::Rest => "rest".to_string(),

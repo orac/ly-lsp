@@ -1,0 +1,35 @@
+\language "english"
+{ ef4 4 fs8 8 }
+  ^^^^^^^^^^^
+--- dur
+NONE
+--- pitch
+\language "english"
+{ ef4 ef4 fs8 fs8 }
+--- both
+\language "english"
+{ ef4 ef4 fs8 fs8 }
+===
+\language english
+{ ef4 4 fs8 8 }
+  ^^^^^^^^^^^
+--- dur
+NONE
+--- pitch
+\language english
+{ ef4 ef4 fs8 fs8 }
+--- both
+\language english
+{ ef4 ef4 fs8 fs8 }
+===
+\language english
+\relative c' { ef8 8 8~8 }
+               ^^^^^^^^^
+--- dur
+NONE
+--- pitch
+\language english
+\relative c' { ef8 ef8 ef8~ef8 }
+--- both
+\language english
+\relative c' { ef8 ef8 ef8~ef8 }

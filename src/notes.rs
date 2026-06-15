@@ -97,8 +97,17 @@ pub struct ChordNote {
 /// `\relative` reference pitch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
-    /// A single pitched note, e.g. `cis'` (`NoteEvent`).
-    Note { pitch: Pitch, octave_written: bool },
+    /// A single pitched note, e.g. `cis'` (`NoteEvent`). A bare duration that
+    /// repeats the previous note's pitch — the `4` in `c4 4` — is also a `Note`,
+    /// carrying that inherited pitch with `pitch_written` false.
+    Note {
+        pitch: Pitch,
+        octave_written: bool,
+        /// Whether the source wrote a note name here, or the pitch was inherited
+        /// from the previous note (a bare duration). When inherited, the octave
+        /// marks are necessarily absent too, so `octave_written` is false.
+        pitch_written: bool,
+    },
     /// A chord, e.g. `<c e g>` (`EventChord`). The duration lives on the
     /// enclosing [`Event`].
     Chord(Vec<ChordNote>),

@@ -15,6 +15,7 @@
 pub mod extract_to_variable;
 pub mod inline_repeats;
 pub mod inline_variable;
+pub mod make_explicit;
 mod note_state;
 
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use crate::document::Document;
 use extract_to_variable::ExtractToVariable;
 use inline_repeats::InlineRepeats;
 use inline_variable::{InlineAll, InlineHere};
+use make_explicit::{MakeBothExplicit, MakeDurationsExplicit, MakePitchesExplicit};
 
 /// A code action the server can offer for a selection in a document.
 pub trait CodeAction {
@@ -76,6 +78,9 @@ pub fn offer_all(document: &Document, uri: &Url, selection: Range) -> Vec<CodeAc
     offer::<InlineAll>(document, uri, selection, &mut actions);
     offer::<InlineHere>(document, uri, selection, &mut actions);
     offer::<InlineRepeats>(document, uri, selection, &mut actions);
+    offer::<MakeDurationsExplicit>(document, uri, selection, &mut actions);
+    offer::<MakePitchesExplicit>(document, uri, selection, &mut actions);
+    offer::<MakeBothExplicit>(document, uri, selection, &mut actions);
     actions
 }
 
@@ -127,6 +132,9 @@ pub fn resolve(document: &Document, mut action: LspCodeAction) -> LspCodeAction 
         InlineAll::ID => InlineAll::resolve(document, data.selection),
         InlineHere::ID => InlineHere::resolve(document, data.selection),
         InlineRepeats::ID => InlineRepeats::resolve(document, data.selection),
+        MakeDurationsExplicit::ID => MakeDurationsExplicit::resolve(document, data.selection),
+        MakePitchesExplicit::ID => MakePitchesExplicit::resolve(document, data.selection),
+        MakeBothExplicit::ID => MakeBothExplicit::resolve(document, data.selection),
         _ => None,
     };
 

@@ -1,0 +1,17 @@
+\relative c' { c4 4 }
+               ^^^^
+--- dur
+NONE
+--- pitch
+\relative c' { c4 c4 }
+--- both
+\relative c' { c4 c4 }
+===
+\relative c' { c4 4 g4 4 }
+               ^^^^^^^^^^
+--- dur
+NONE
+--- pitch
+\relative c' { c4 c4 g4 g4 }
+--- both
+\relative c' { c4 c4 g4 g4 }
