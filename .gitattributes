@@ -1,0 +1,2 @@
+# LF in the repository and in the working tree on every platform. The fixture harnesses in tests/ split on literal "\n===\n" and feed the fixture text straight to the parser, so a CRLF checkout silently mis-parses them.
+* text=auto eol=lf
