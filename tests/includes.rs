@@ -337,6 +337,46 @@ fn include_cache_serves_until_mtime_changes() {
 }
 
 #[test]
+fn music_function_defined_in_an_included_file_resolves_across_the_include_graph() {
+    // `myFunc = #(define-music-function …)` is an ordinary assignment to the
+    // symbol query, so it resolves through `\include` exactly like any other
+    // variable — go-to-definition finds it, and no undefined-reference
+    // diagnostic is raised for `\myFunc`. See `doc/command-parsing.md`'s
+    // "Go-to-definition for user-defined music functions" table.
+    let dir = tempfile::tempdir().unwrap();
+    let words = dir.path().join("lilypond-words");
+    let functions = dir.path().join("functions.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(&words, "\\\\relative\n").unwrap();
+    fs::write(
+        &functions,
+        "myFunc = #(define-music-function (m) (ly:music?) m)\n",
+    )
+    .unwrap();
+    fs::write(&score, "\\include \"functions.ily\"\n\\myFunc { c4 }\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    assert!(ws.load_vocabulary(&words));
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    // Cursor on `\myFunc` (line 1).
+    let locations = ws.goto_definition(&url(&score), Position::new(1, 2));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, url(&functions));
+    assert_eq!(
+        locations[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 6))
+    );
+
+    // And it must not be flagged as an undefined reference.
+    let diagnostics = ws.diagnostics(&url(&score));
+    assert!(
+        diagnostics.is_empty(),
+        "expected no diagnostics, got {diagnostics:?}"
+    );
+}
+
+#[test]
 fn undefined_reference_diagnostics_are_off_without_vocabulary() {
     let dir = tempfile::tempdir().unwrap();
     let score = dir.path().join("score.ly");

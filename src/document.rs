@@ -2,6 +2,20 @@
 //! extracts the symbols (definitions and references) we answer
 //! go-to-definition and find-references with, and converts between byte offsets
 //! and LSP positions.
+//!
+//! # Known limitations
+//!
+//! - A music function defined purely inside a Scheme block —
+//!   `#(define-public myFunc (define-music-function …))` — produces no
+//!   `assignment_lhs` node, so [`SYMBOL_QUERY`] never sees it as a definition. A
+//!   later `\myFunc` is then flagged as an *undefined* reference: a false
+//!   positive, worse than the missing feature. The ordinary form,
+//!   `myFunc = #(define-music-function …)`, works today because the query only
+//!   looks at the assignment's left-hand side, which is unaffected by what the
+//!   right-hand side contains. See [`doc/command-parsing.md`](../doc/command-parsing.md)'s
+//!   "Go-to-definition for user-defined music functions" section — step 3's
+//!   `tree-sitter-scheme` reader is what teaches the vocabulary to look inside
+//!   `#( … )` too, removing this false positive.
 
 use std::sync::OnceLock;
 
@@ -11,7 +25,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
-use crate::command::Commands;
+use crate::command::{self, Commands};
 use crate::line_struct::{LineIndex, Span};
 use crate::note_analyser;
 use crate::notes::{Events, NoteAnalysis, Problem};
@@ -177,7 +191,24 @@ impl Document {
                 ..Diagnostic::default()
             });
         }
+        diagnostics.extend(self.command_diagnostics());
         diagnostics
+    }
+
+    /// Runs [`Command::check`](command::Command::check) over every command
+    /// call in the document. This is the whole-document pass
+    /// [`CheckContext`](command::CheckContext)'s doc comment describes: a
+    /// call's complaint can depend on other calls (`\volta` is only wrong
+    /// because no `\repeat volta` encloses it), which aren't all collected
+    /// until parsing of the whole document is done, so this runs here rather
+    /// than inside the note analyser's walk.
+    fn command_diagnostics(&self) -> Vec<Diagnostic> {
+        let commands = self.commands();
+        let ctx = command::CheckContext::new(&self.line_index, commands);
+        commands
+            .iter()
+            .flat_map(|call| call.cmd.check(call, &ctx))
+            .collect()
     }
 
     /// A diagnostic for every `\foo` reference whose name `is_known` rejects.
@@ -650,6 +681,59 @@ mod tests {
     }
 
     #[test]
+    fn repeat_with_a_valid_kind_is_not_flagged() {
+        let doc = Document::new("\\repeat volta 2 { c }".to_string());
+        assert!(doc.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn repeat_with_an_unrecognised_kind_is_flagged() {
+        let doc = Document::new("\\repeat bogus 2 { c }".to_string());
+        let diagnostics = doc.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diagnostics[0].message.contains("bogus"));
+        // Localised to the offending word itself, not the whole call.
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 8), Position::new(0, 13))
+        );
+    }
+
+    #[test]
+    fn repeat_with_a_count_of_one_is_not_flagged() {
+        let doc = Document::new("\\repeat unfold 1 { c }".to_string());
+        assert!(doc.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn repeat_with_a_count_of_zero_is_flagged() {
+        let doc = Document::new("\\repeat unfold 0 { c }".to_string());
+        let diagnostics = doc.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diagnostics[0].message.contains('0'));
+    }
+
+    #[test]
+    fn volta_is_never_flagged_regardless_of_enclosing_context() {
+        // `\volta` is valid inside any `\repeat` kind, in an `\alternative`
+        // that follows (rather than sits inside) the repeat, and even in a
+        // variable substituted into a `\repeat` body from elsewhere in the
+        // file — none of which lexical enclosure can see, so `\volta` gets no
+        // enclosing-repeat check at all.
+        for src in [
+            "\\repeat volta 2 { \\volta 1 { c } }",
+            "\\repeat segno 2 { \\volta 1 { c } }",
+            "\\repeat unfold 2 { \\volta 1 { c } }",
+            "{ \\volta 1 { c } }",
+        ] {
+            let doc = Document::new(src.to_string());
+            assert!(doc.diagnostics().is_empty(), "flagged: {src}");
+        }
+    }
+
+    #[test]
     fn unclosed_brace_is_reported_at_the_brace() {
         let doc = Document::new("foo = { c d e\n".to_string());
         let diagnostics = doc.diagnostics();
@@ -751,6 +835,65 @@ mod tests {
         let doc = Document::new("{ c d e }\n".to_string());
         // Cursor on `c` (a note, char 2) — not a bracket.
         assert!(doc.bracket_at(Position::new(0, 2)).is_none());
+    }
+
+    /// Diagnostics for references that resolve to none of `doc`'s own
+    /// definitions — a single-document stand-in for [`DocumentGraph`]'s
+    /// include-aware `is_known`, good enough for these tests since they don't
+    /// span files.
+    ///
+    /// [`DocumentGraph`]: crate::document_graph::DocumentGraph
+    fn undefined_references(doc: &Document) -> Vec<Diagnostic> {
+        doc.undefined_reference_diagnostics(|name| doc.definitions().iter().any(|d| d.name == name))
+    }
+
+    #[test]
+    fn music_function_definition_resolves_its_reference() {
+        // `myFunc = #(define-music-function …)` is an ordinary assignment as far
+        // as the symbol query is concerned — go-to-definition, find-references
+        // and the undefined-reference diagnostic all see it exactly like
+        // `myFunc = { c d e }`. Pinned here so step 3 (which starts reading
+        // *inside* the `#( … )`) can't quietly regress this simpler path.
+        let doc = Document::new(
+            "myFunc = #(define-music-function (m) (ly:music?) m)\n\\myFunc { c4 }\n".to_string(),
+        );
+        assert_eq!(names(doc.definitions()), vec!["myFunc"]);
+        assert_eq!(names(doc.references()), vec!["myFunc"]);
+        assert!(undefined_references(&doc).is_empty());
+    }
+
+    #[test]
+    fn reference_with_no_definition_anywhere_is_undefined() {
+        let doc = Document::new("\\myFunc { c4 }\n".to_string());
+        assert!(doc.definitions().is_empty());
+        let diagnostics = undefined_references(&doc);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("myFunc"));
+    }
+
+    #[test]
+    fn scheme_only_definition_is_a_false_positive_today() {
+        // A function defined purely inside a Scheme block — no `foo = …` on the
+        // left — produces no `assignment_lhs`, so [`SYMBOL_QUERY`] never captures
+        // it as a definition, and the reference below is (wrongly) flagged as
+        // undefined. This is today's pinned behaviour, not the desired one: see
+        // the "Known limitations" note in this module's docs and
+        // `doc/command-parsing.md`'s step 3, which is what removes it.
+        let doc = Document::new(
+            "#(define-public myFunc (define-music-function (m) (ly:music?) m))\n\\myFunc { c4 }\n"
+                .to_string(),
+        );
+        assert!(
+            doc.definitions().is_empty(),
+            "the Scheme-only definition is invisible to the symbol query today"
+        );
+        let diagnostics = undefined_references(&doc);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "today \\myFunc is wrongly flagged as undefined"
+        );
+        assert!(diagnostics[0].message.contains("myFunc"));
     }
 
     #[test]

@@ -13,8 +13,9 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{
-    CodeAction, CodeActionOrCommand, Diagnostic, DocumentHighlight, DocumentHighlightKind,
-    Location, Position, Range, TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
+    CodeAction, CodeActionOrCommand, CompletionItem, Diagnostic, DocumentHighlight,
+    DocumentHighlightKind, Hover, Location, Position, Range, SemanticToken, SignatureHelp,
+    TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::document::Document;
@@ -294,6 +295,36 @@ impl DocumentGraph {
         };
         self.with_document(&uri, |doc| crate::code_action::resolve(doc, action.clone()))
             .unwrap_or(action)
+    }
+
+    /// Signature help for the command call at `position` in `uri`. See
+    /// [`command_assist::signature_help`](crate::command_assist::signature_help).
+    pub fn signature_help(&self, uri: &Url, position: Position) -> Option<SignatureHelp> {
+        self.with_document(uri, |doc| {
+            crate::command_assist::signature_help(doc, position)
+        })
+        .flatten()
+    }
+
+    /// Argument completions at `position` in `uri`. See
+    /// [`command_assist::completions`](crate::command_assist::completions).
+    pub fn completions(&self, uri: &Url, position: Position) -> Vec<CompletionItem> {
+        self.with_document(uri, |doc| crate::command_assist::completions(doc, position))
+            .unwrap_or_default()
+    }
+
+    /// Hover documentation for the command word at `position` in `uri`. See
+    /// [`command_assist::hover`](crate::command_assist::hover).
+    pub fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
+        self.with_document(uri, |doc| crate::command_assist::hover(doc, position))
+            .flatten()
+    }
+
+    /// Semantic tokens for the whole of the document at `uri`. See
+    /// [`semantic_tokens::semantic_tokens_full`](crate::semantic_tokens::semantic_tokens_full).
+    pub fn semantic_tokens_full(&self, uri: &Url) -> Vec<SemanticToken> {
+        self.with_document(uri, crate::semantic_tokens::semantic_tokens_full)
+            .unwrap_or_default()
     }
 
     /// Renames all definitions and references of the symbol at `position` in

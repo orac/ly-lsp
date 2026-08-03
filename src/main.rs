@@ -5,6 +5,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use ly_lsp::document_graph::DocumentGraph;
+use ly_lsp::semantic_tokens;
 
 #[derive(Debug)]
 struct Backend {
@@ -81,6 +82,29 @@ impl LanguageServer for Backend {
                     },
                 )),
                 rename_provider: Some(OneOf::Left(true)),
+                // Signature help retriggers on the space after a command word
+                // (as each further argument is typed) and on a fresh `\`
+                // (typing the start of a nested command inside a body); `(`
+                // means nothing in LilyPond's own syntax, so it's not listed.
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec![" ".to_string(), "\\".to_string()]),
+                    retrigger_characters: Some(vec![" ".to_string()]),
+                    ..SignatureHelpOptions::default()
+                }),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![" ".to_string(), "\\".to_string()]),
+                    ..CompletionOptions::default()
+                }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: semantic_tokens::legend(),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            ..SemanticTokensOptions::default()
+                        },
+                    ),
+                ),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -170,6 +194,39 @@ impl LanguageServer for Backend {
         Ok(self
             .documents
             .rename(&pos.text_document.uri, pos.position, &params.new_name))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let pos = params.text_document_position_params;
+        Ok(self
+            .documents
+            .signature_help(&pos.text_document.uri, pos.position))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let pos = params.text_document_position;
+        let items = self
+            .documents
+            .completions(&pos.text_document.uri, pos.position);
+        Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let pos = params.text_document_position_params;
+        Ok(self.documents.hover(&pos.text_document.uri, pos.position))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let data = self
+            .documents
+            .semantic_tokens_full(&params.text_document.uri);
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 }
 

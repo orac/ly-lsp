@@ -1,0 +1,9 @@
+\repeat segno 2 { c4 \volta 1 { d8 } e }
+  ^
+---
+{ c4 d8 e c4 e8 }
+===
+\repeat segno 2 { c4 \volta 1 { d } \volta 2 { e } f }
+  ^
+---
+{ c4 d f c4 e f }

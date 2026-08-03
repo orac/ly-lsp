@@ -3,10 +3,12 @@
 
 pub mod code_action;
 pub mod command;
+pub mod command_assist;
 pub mod document;
 pub mod document_graph;
 pub mod line_struct;
 pub mod note_analyser;
 pub mod note_names;
 pub mod notes;
+pub mod semantic_tokens;
 pub mod vocabulary;

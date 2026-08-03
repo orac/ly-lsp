@@ -16,7 +16,6 @@
 //!
 //! Resolution is best-effort and lexical, so a few constructs are mis-read or skipped, by design for now:
 //!
-//! - Commands whose bare-symbol argument we don't yet skip (`\key c \major`, `\transpose c d …`) have that pitch read as a spurious note, which also perturbs the running `\relative` reference. `\clef`, `\set` and `\unset` arguments are skipped; others may need the same treatment.
 //! - Drum mode (`\drummode`, `\new DrumStaff`, …) is skipped wholesale rather than resolved, so user-defined drum note names need deeper handling later.
 //! - A parse error can flatten the tree (e.g. an unformed mode block), after which loose music is read in the wrong mode. Events there are unreliable, but diagnostics falling inside the error region are suppressed so a mid-edit file is not buried in spurious squiggles.
 //! - Chord-modifier shorthand in note mode (`c:maj7`, `d:min`) leaves the modifier (`maj`, `min`) looking like a bare symbol, so it is flagged as an invalid note.
@@ -28,7 +27,7 @@
 
 use tree_sitter::{Node, Tree};
 
-use crate::command::{self, CommandCall, Commands, is_block};
+use crate::command::{self, Arg, CommandCall, Commands, MusicContext, clamp_octave, is_block};
 use crate::line_struct::Span;
 use crate::note_names::Language;
 use crate::notes::{
@@ -70,12 +69,44 @@ impl Region {
     }
 }
 
-/// LilyPond's default `\relative` reference when none is written: middle C.
-const DEFAULT_RELATIVE_REFERENCE: Pitch = Pitch {
-    note_name: 0,
-    octave: 0,
-    alteration: 0,
-};
+/// The [`MusicContext`] equivalent of the analyser's own (`mode`, `region`)
+/// pair at the point a command is encountered — what a [`Command`](command::Command)
+/// impl's `music_context` calls `ambient`.
+///
+/// `Region::NoteContext` (the top level, and any bare block not itself an
+/// event stream) collapses into the same case as `NoteMusic`: a command's own
+/// body is always a concrete music region once entered, so the distinction
+/// only matters for the *bare* blocks [`Region::nested_block`] already
+/// handles, never for a command's `ambient`.
+fn ambient_context(mode: Mode, region: Region) -> MusicContext {
+    match region {
+        Region::NonNote => MusicContext::NonNote,
+        Region::ChordMusic => MusicContext::Chord,
+        Region::NoteMusic | Region::NoteContext => match mode {
+            Mode::Absolute => MusicContext::Absolute,
+            Mode::Relative(pitch) => MusicContext::Relative(pitch),
+            Mode::Fixed(offset) => MusicContext::Fixed(clamp_octave(offset)),
+        },
+    }
+}
+
+/// The inverse of [`ambient_context`]: the (`mode`, `region`) pair to walk a
+/// command's `Arg::Music` body in, given the [`MusicContext`] its
+/// `music_context` resolved to. `ambient_mode` supplies the mode for
+/// [`MusicContext::Chord`] and [`MusicContext::NonNote`], neither of which
+/// carries one of its own — chord mode and non-note regions change what a
+/// bare symbol means, not the octave-entry mode nested `\relative`/`\fixed`
+/// blocks would still reset.
+fn mode_and_region(context: MusicContext, ambient_mode: Mode) -> (Mode, Region) {
+    match context {
+        MusicContext::Inherit => (ambient_mode, Region::NoteMusic),
+        MusicContext::Absolute => (Mode::Absolute, Region::NoteMusic),
+        MusicContext::Relative(pitch) => (Mode::Relative(pitch), Region::NoteMusic),
+        MusicContext::Fixed(offset) => (Mode::Fixed(offset.into()), Region::NoteMusic),
+        MusicContext::Chord => (ambient_mode, Region::ChordMusic),
+        MusicContext::NonNote => (ambient_mode, Region::NonNote),
+    }
+}
 
 /// Resolves the note state for every music event in `tree`, in source order.
 ///
@@ -179,11 +210,7 @@ impl<'a> Analyser<'a> {
                     after_event = false;
                 }
                 "escaped_word" => {
-                    // Record the structured call for any command we have a signature for; the mode/region logic still flows through `handle_command`, which walks the body as music.
-                    if let Some((call, _)) = command::parse(&children, i, self.src) {
-                        self.commands.push(call);
-                    }
-                    i = self.handle_command(&children, i, mode);
+                    i = self.handle_command(&children, i, mode, region);
                     pending = None;
                     after_event = false;
                 }
@@ -215,146 +242,94 @@ impl<'a> Analyser<'a> {
             .map(|n| self.text(n))
     }
 
-    /// Handles an `escaped_word` command at `children[start]`, consuming any arguments and block it governs, and returns the next index to read.
-    fn handle_command(&mut self, children: &[Node], start: usize, ambient: Mode) -> usize {
-        let word = self.text(children[start]);
-        match word {
-            "\\language" | "\\include" => {
-                match children.get(start + 1) {
-                    Some(node) if node.kind() == "string" => {
-                        self.set_language(string_fragment(*node, self.src));
-                        start + 2
-                    }
-                    // `\language english` without quotes: a bare symbol.
-                    Some(node) if word == "\\language" && node.kind() == "symbol" => {
-                        self.set_language(Some(self.text(*node)));
-                        start + 2
-                    }
-                    _ => start + 1,
-                }
-            }
-            "\\relative" => {
-                let mut i = start + 1;
-                let reference = self
-                    .read_reference_pitch(children, &mut i)
-                    .unwrap_or(DEFAULT_RELATIVE_REFERENCE);
-                self.enter_block(children, &mut i, Mode::Relative(reference));
-                i
-            }
-            "\\fixed" => {
-                let mut i = start + 1;
-                let reference = self.read_reference_pitch(children, &mut i);
-                let offset = reference.map_or(-1, |p| p.octave);
-                self.enter_block(children, &mut i, Mode::Fixed(offset));
-                i
-            }
-            "\\notemode" | "\\notes" => {
-                let mut i = start + 1;
-                self.enter_block(children, &mut i, Mode::Absolute);
-                i
-            }
-            // Chord mode: bare symbols are chord-mode entries, read for their extent and duration (but not pitch). Nested bare blocks stay in chord mode.
-            "\\chordmode" | "\\chords" => {
-                let mut i = start + 1;
-                self.enter_chord_block(children, &mut i, ambient);
-                i
-            }
-            // Modes where a bare symbol is not a note; scan for nested music but don't read events.
-            "\\drummode" | "\\drums" | "\\figuremode" | "\\figures" | "\\lyricmode"
-            | "\\lyrics" | "\\addlyrics" | "\\markup" | "\\markuplist" | "\\header" | "\\paper"
-            | "\\layout" | "\\midi" | "\\with" => {
-                let mut i = start + 1;
-                self.enter_non_event_block(children, &mut i, ambient);
-                i
-            }
-            // `\lyricsto voice { … }`: the lyric block follows a voice name, written as a bare symbol or a quoted string.
-            "\\lyricsto" => {
-                let mut i = start + 1;
-                if matches!(children.get(i).map(|n| n.kind()), Some("string" | "symbol")) {
-                    i += 1;
-                }
-                self.enter_non_event_block(children, &mut i, ambient);
-                i
-            }
-            // The repeat type (`volta`, `unfold`, …) is a bare symbol that must not be read as a note; the count and body follow as normal.
-            "\\repeat" => {
-                let next = start + 1;
-                if children.get(next).map(|n| n.kind()) == Some("symbol") {
-                    return next + 1;
-                }
-                next
-            }
-            // `\clef bass` takes a single clef name (symbol or string).
-            "\\clef" => {
-                let next = start + 1;
-                if matches!(
-                    children.get(next).map(|n| n.kind()),
-                    Some("symbol" | "string")
-                ) {
-                    return next + 1;
-                }
-                next
-            }
-            // `\set`/`\unset` take a context-property path (`Staff.instrumentName`) whose names must not be read as notes; any `= value` that follows is left to the main loop.
-            "\\set" | "\\unset" => {
-                let mut i = start + 1;
-                self.skip_property_path(children, &mut i);
-                i
-            }
-            // Any other command: dynamics, articulations, `\break`, etc. Its block argument, if any, is read as music by the main loop.
-            _ => start + 1,
+    /// Handles an `escaped_word` command at `children[start]`, and returns the
+    /// next index to read.
+    ///
+    /// This is the five steps `doc/command-parsing.md`'s "How the note
+    /// analyser uses it" section describes, replacing what used to be a
+    /// per-command `match`: look the word up in the shared [`command`] table,
+    /// parse its arguments, ask what [`MusicContext`](command::MusicContext)
+    /// its body reads in, walk that body's `Music` arguments in it, and
+    /// return where to resume. A command with no [`Command`](command::Command)
+    /// impl — known, if at all, only by a bare `lilypond-words` entry — is
+    /// left entirely to the fallback: this returns `start + 1`, and the loop
+    /// in [`walk`](Self::walk) that called us then reaches the following
+    /// block itself, through its own `expression_block` arm, exactly as it
+    /// does today for `\break`, `\bar`, and everything else with no signature.
+    fn handle_command(
+        &mut self,
+        children: &[Node],
+        start: usize,
+        mode: Mode,
+        region: Region,
+    ) -> usize {
+        let Some((call, next)) = command::parse(children, start, self.src, self.language) else {
+            return start + 1;
+        };
+
+        // `\language`/`\include` have a side effect no `Command` method
+        // expresses: switching the active note-name language. Rather than add
+        // a side-effect method solely for these two, we inspect the parsed
+        // call by name here, after the fact — the same string argument the
+        // `Command` impl already consumed as an ordinary `Arg::String`.
+        if matches!(call.name.as_str(), "language" | "include")
+            && let Some(Arg::String { text, .. }) = call.args.first()
+        {
+            self.set_language(Some(text));
         }
+
+        let ambient = ambient_context(mode, region);
+        let context = call.cmd.music_context(&call, ambient);
+        let (body_mode, body_region) = mode_and_region(context, mode);
+        let music_spans: Vec<Span> = call
+            .args
+            .iter()
+            .filter_map(|arg| match arg {
+                Arg::Music { span } => Some(*span),
+                _ => None,
+            })
+            .collect();
+
+        // Recorded before its body is walked, so a call nested in that body
+        // (a `\volta` inside a `\repeat`) is pushed after it — `self.commands`
+        // is a preorder walk, and `Commands::new` asserts source order by
+        // keyword start.
+        self.commands.push(call);
+        for span in music_spans {
+            self.walk_music_arg(children, span, body_mode, body_region);
+        }
+        next
     }
 
-    /// Reads an optional reference pitch (a note name with octave marks) used by `\relative`/`\fixed`, advancing `i` past it. Interpreted as absolute.
-    fn read_reference_pitch(&self, children: &[Node], i: &mut usize) -> Option<Pitch> {
-        let node = *children.get(*i)?;
-        if node.kind() != "symbol" {
-            return None;
+    /// Walks a command's already-parsed `Arg::Music { span }` in `mode`/`region`.
+    /// `span` covers either a `{ … }`/`<< … >>` block — walked like any other
+    /// nested block — or a single braceless note or chord (`\repeat percent 4
+    /// c2`), which has no container node to hand to [`walk`](Self::walk) and
+    /// is instead read directly, the same way the main loop reads one. Locates
+    /// the node by its start byte, which `span.start` always matches: the
+    /// command parser only ever produces a `Music` argument starting exactly
+    /// on the node it consumed.
+    fn walk_music_arg(&mut self, children: &[Node], span: Span, mode: Mode, region: Region) {
+        let Some(idx) = children.iter().position(|n| n.start_byte() == span.start) else {
+            return;
+        };
+        let node = children[idx];
+        if is_block(node.kind()) {
+            self.walk(node, mode, region);
+            return;
         }
-        let (note_name, alteration) = self.language.note(self.text(node))?;
-        *i += 1;
-        let (marks, _written, _check) = self.parse_octave(children, i);
-        Some(Pitch {
-            note_name,
-            octave: marks - 1,
-            alteration,
-        })
-    }
-
-    /// If a block follows at `children[*i]`, reads it as note music in `mode` and advances past it.
-    fn enter_block(&mut self, children: &[Node], i: &mut usize, mode: Mode) {
-        if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
-            self.walk(*block, mode, Region::NoteMusic);
-            *i += 1;
-        }
-    }
-
-    /// Like [`enter_block`](Self::enter_block) but for a non-note context: the block is scanned for nested music and directives only.
-    fn enter_non_event_block(&mut self, children: &[Node], i: &mut usize, ambient: Mode) {
-        if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
-            self.walk(*block, ambient, Region::NonNote);
-            *i += 1;
-        }
-    }
-
-    /// Like [`enter_block`](Self::enter_block) but for a `\chordmode` block: bare symbols inside are read as chord-mode entries. The mode is carried only for nested `\notemode`/`\relative` blocks, which reset it; chord-mode entries themselves resolve no octave.
-    fn enter_chord_block(&mut self, children: &[Node], i: &mut usize, ambient: Mode) {
-        if let Some(block) = children.get(*i).filter(|n| is_block(n.kind())) {
-            self.walk(*block, ambient, Region::ChordMusic);
-            *i += 1;
-        }
-    }
-
-    /// Skips a context-property path such as `Staff.instrumentName` — symbols joined by dots — so the property names are not read as notes.
-    fn skip_property_path(&self, children: &[Node], i: &mut usize) {
-        while children.get(*i).map(|n| n.kind()) == Some("symbol") {
-            *i += 1;
-            if children.get(*i).is_some_and(|n| self.is_punct(*n, ".")) {
-                *i += 1;
-            } else {
-                break;
+        let mut m = mode;
+        match (region, node.kind()) {
+            (Region::NoteMusic, "chord") => {
+                self.read_chord(children, idx, &mut m);
             }
+            (Region::NoteMusic, "symbol") => {
+                self.read_symbol(children, idx, &mut m);
+            }
+            (Region::ChordMusic, "symbol") => {
+                self.read_chord_mode_event(children, idx);
+            }
+            _ => {}
         }
     }
 
@@ -908,15 +883,6 @@ fn under_error(span: Span, errors: &[Span]) -> bool {
         .any(|error| error.start <= span.start && span.end <= error.end)
 }
 
-/// The text inside a `string` node's quotes, if it has a `string_fragment`.
-fn string_fragment<'a>(string_node: Node, src: &'a str) -> Option<&'a str> {
-    let mut cursor = string_node.walk();
-    string_node
-        .named_children(&mut cursor)
-        .find(|n| n.kind() == "string_fragment")
-        .map(|n| &src[n.start_byte()..n.end_byte()])
-}
-
 /// Whether a `\new`/`\context` context type holds something other than note music, so its bare block should not be read as notes.
 fn is_non_note_context(context: &str) -> bool {
     matches!(
@@ -1161,6 +1127,142 @@ mod tests {
         let analysis = run("{ \\repeat volta 2 { c d } }");
         assert!(analysis.problems.is_empty());
         assert_eq!(pitches(&analysis), vec![(0, -1), (1, -1)]);
+    }
+
+    /// The following tests check that commands with pitch/duration args do not affect how subsequent notes are read.
+    fn assert_same_events(with: &str, without: &str) {
+        let with_analysis = run(with);
+        let without_analysis = run(without);
+        assert_eq!(
+            pitches(&with_analysis),
+            pitches(&without_analysis),
+            "pitches differ between {with:?} and {without:?}"
+        );
+        assert_eq!(
+            durations(&with_analysis),
+            durations(&without_analysis),
+            "durations differ between {with:?} and {without:?}"
+        );
+    }
+
+    #[test]
+    fn key_argument_is_not_read_as_a_note() {
+        assert_same_events("{ \\key g \\major a4 b }", "{ a4 b }");
+    }
+
+    #[test]
+    fn key_argument_does_not_perturb_the_relative_reference() {
+        assert_same_events(
+            "\\relative c' { \\key g \\major a4 }",
+            "\\relative c' { a4 }",
+        );
+    }
+
+    #[test]
+    fn transpose_arguments_are_not_read_as_notes() {
+        assert_same_events("{ \\transpose c d { e4 } }", "{ { e4 } }");
+    }
+
+    #[test]
+    fn transpose_arguments_do_not_perturb_the_relative_reference() {
+        assert_same_events(
+            "\\relative c' { \\transpose g d { g4 } }",
+            "\\relative c' { { g4 } }",
+        );
+    }
+
+    #[test]
+    fn tempo_duration_argument_is_not_the_following_notes_inherited_duration() {
+        // `\tempo`'s own `4 = 120` must not become the duration a following bare
+        // note inherits; that duration should still come from the last real
+        // note.
+        assert_same_events("{ c8 \\tempo 4 = 120 d }", "{ c8 d }");
+    }
+
+    #[test]
+    fn tempo_text_and_duration_argument_does_not_affect_notes() {
+        // `\tempo "Allegro" 4 = 120` (both forms combined) — confirmed passing today.
+        assert_same_events("{ c8 \\tempo \"Allegro\" 4 = 120 d }", "{ c8 d }");
+    }
+
+    #[test]
+    fn volta_number_list_argument_is_not_a_duration() {
+        let analysis = run("{ \\repeat volta 4 { c8 \\volta 4 { d } } }");
+        assert!(analysis.problems.is_empty());
+        assert_eq!(durations(&analysis), vec![(3, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn lyricsto_voice_name_argument_is_not_a_note() {
+        // The voice name after \lyricsto (bare symbol form, as opposed to a
+        // quoted string) must not be read as a note.
+        let analysis = run("\\new Lyrics \\lyricsto v { la la }");
+        assert!(analysis.problems.is_empty());
+        assert!(analysis.events.is_empty());
+    }
+
+    #[test]
+    fn notemode_body_matches_the_equivalent_bare_block() {
+        // \notemode establishes absolute mode explicitly; at the top level, where
+        // a bare block is already absolute, that has no observable effect.
+        assert_same_events("{ \\notemode { c d } }", "{ { c d } }");
+    }
+
+    #[test]
+    fn notes_alias_behaves_like_notemode() {
+        assert_same_events("{ \\notes { c d } }", "{ { c d } }");
+    }
+
+    #[test]
+    fn figuremode_contents_are_not_read_as_notes() {
+        let analysis = run("\\figuremode { wobble blah }");
+        assert!(analysis.problems.is_empty());
+        assert!(analysis.events.is_empty());
+    }
+
+    #[test]
+    fn figures_alias_behaves_like_figuremode() {
+        let analysis = run("\\figures { wobble blah }");
+        assert!(analysis.problems.is_empty());
+        assert!(analysis.events.is_empty());
+    }
+
+    #[test]
+    fn lyricmode_contents_are_not_read_as_notes() {
+        // The bare `\lyricmode` keyword itself, as opposed to `\new Lyrics { … }`
+        // or `\lyricsto`/`\addlyrics`, which the existing `lyrics_are_not_read_as_notes` covers.
+        let analysis = run("\\lyricmode { wobble blah }");
+        assert!(analysis.problems.is_empty());
+        assert!(analysis.events.is_empty());
+    }
+
+    #[test]
+    fn lyrics_alias_behaves_like_lyricmode() {
+        let analysis = run("\\lyrics { wobble blah }");
+        assert!(analysis.problems.is_empty());
+        assert!(analysis.events.is_empty());
+    }
+
+    #[test]
+    fn drums_alias_behaves_like_drummode() {
+        let analysis = run("\\drums { sn8 bd }");
+        assert!(analysis.problems.is_empty());
+        assert!(analysis.events.is_empty());
+    }
+
+    #[test]
+    fn chords_alias_behaves_like_chordmode() {
+        let analysis = run("\\chords { c2:maj7 }");
+        assert!(analysis.problems.is_empty());
+        assert_eq!(analysis.events.len(), 1);
+        assert!(matches!(analysis.events[0].kind, EventKind::ChordModeEvent));
+    }
+
+    #[test]
+    fn with_contents_are_not_read_as_notes() {
+        let analysis = run("\\score { { c } \\with { wobble } }");
+        assert!(analysis.problems.is_empty());
+        assert_eq!(pitches(&analysis), vec![(0, -1)]);
     }
 
     #[test]

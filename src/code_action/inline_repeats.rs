@@ -40,8 +40,11 @@ use super::note_state::{leading_note, octave_fix, octave_respelling};
 use super::{CodeAction, Offer, Resolved};
 
 /// The repeat kinds we offer to unfold: every kind but `tremolo`, which is a
-/// notational shorthand with no literal expansion. `percent` and `segno` unfold
-/// to plain repetition (their special notation is understood to be lost).
+/// notational shorthand with no literal expansion. `segno` shares `volta`'s
+/// `\volta`-tagged `\alternative` structure — the same filtering applies to
+/// both — so it needs no special casing here; only their engraved output
+/// differs, and that's lost either way once unfolded. `percent` doesn't take
+/// alternate endings, so it always unfolds to plain repetition.
 const UNFOLDABLE_KINDS: [&str; 4] = ["volta", "unfold", "percent", "segno"];
 
 pub struct InlineRepeats;

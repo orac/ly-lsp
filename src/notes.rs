@@ -221,7 +221,7 @@ impl std::ops::Deref for Events {
 }
 
 /// The outcome of the lexical note-state pass over a document.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct NoteAnalysis {
     /// Every resolved music event, in source order.
     pub events: Events,
