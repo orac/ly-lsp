@@ -33,6 +33,7 @@ use crate::note_names::Language;
 use crate::notes::{
     ChordNote, Duration, Event, EventKind, Events, NoteAnalysis, Pitch, Problem, RelativeRef,
 };
+use crate::vocabulary::Scope;
 
 /// The octave-entry mode in force for a span of music. The default at the top level (and inside a plain `{ }`) is [`Mode::Absolute`].
 #[derive(Debug, Clone, Copy)]
@@ -111,9 +112,12 @@ fn mode_and_region(context: MusicContext, ambient_mode: Mode) -> (Mode, Region) 
 /// Resolves the note state for every music event in `tree`, in source order.
 ///
 /// Walks music blocks left to right, tracking the octave-entry [`Mode`], the running `\relative` reference pitch, the active note-name language, and the last duration seen.
-pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
+///
+/// `scope` is the set of commands visible from this document — the builtins, plus whatever it and its includes define. It decides which `\foo`s are parsed as calls with arguments, and hence which following blocks are a command's body rather than loose music, so the same source analysed in two different scopes can legitimately give different events: see [`Document::refresh`](crate::document::Document::refresh) for how a document is re-analysed when its scope changes.
+pub fn analyse(tree: &Tree, src: &str, scope: &Scope) -> NoteAnalysis {
     let mut analyser = Analyser {
         src,
+        scope,
         events: Vec::new(),
         problems: Vec::new(),
         commands: Vec::new(),
@@ -142,6 +146,10 @@ pub fn analyse(tree: &Tree, src: &str) -> NoteAnalysis {
 /// The running state of the left-to-right pass.
 struct Analyser<'a> {
     src: &'a str,
+    /// The commands visible from this document, consulted for every `\word`
+    /// the walk meets. Borrowed for the walk rather than owned: a scope stacks
+    /// layers shared with every other document that can see the same files.
+    scope: &'a Scope<'a>,
     events: Vec<Event>,
     problems: Vec<Problem>,
     /// Structured command invocations recognised by the shared command parser, in source order (preorder, so a `\repeat` precedes the `\volta`s nested in its body).
@@ -263,7 +271,9 @@ impl<'a> Analyser<'a> {
         mode: Mode,
         region: Region,
     ) -> usize {
-        let Some((call, next)) = command::parse(children, start, self.src, self.language) else {
+        let Some((call, next)) =
+            command::parse(children, start, self.src, self.language, self.scope)
+        else {
             return start + 1;
         };
 
@@ -908,7 +918,11 @@ mod tests {
             .set_language(&tree_sitter_lilypond::LANGUAGE_LILYPOND.into())
             .expect("load grammar");
         let tree = parser.parse(src, None).expect("parse");
-        analyse(&tree, src)
+        // The file's own music functions are in scope, as they are for a real
+        // document; what it *includes* is the document graph's business, not
+        // the analyser's.
+        let defined = std::sync::Arc::new(crate::command::scheme::read(&tree, src).layer);
+        analyse(&tree, src, &Scope::new(None, vec![defined]))
     }
 
     /// The resolved pitches of every `Note` event, as `(note_name, octave)`.
@@ -1168,6 +1182,32 @@ mod tests {
         assert_same_events(
             "\\relative c' { \\transpose g d { g4 } }",
             "\\relative c' { { g4 } }",
+        );
+    }
+
+    /// A definition of `\myFunc` taking a reference pitch and a music block,
+    /// prefixed to a snippet so the analyser reads the call against a real
+    /// signature. Its own line carries no events, so a differential assertion
+    /// against two snippets that both start with it stays honest.
+    fn with_my_func(src: &str) -> String {
+        format!("myFunc = #(define-music-function (from music) (ly:pitch? ly:music?) music)\n{src}")
+    }
+
+    #[test]
+    fn a_user_functions_pitch_argument_is_not_read_as_a_note() {
+        assert_same_events(
+            &with_my_func("{ \\myFunc d' { g4 } }"),
+            &with_my_func("{ { g4 } }"),
+        );
+    }
+
+    #[test]
+    fn a_user_functions_arguments_do_not_perturb_the_relative_reference() {
+        // Without the signature, `d'` would be read as a note and would move
+        // the running reference before `g4` resolved against it.
+        assert_same_events(
+            &with_my_func("\\relative c' { \\myFunc d' { g4 } }"),
+            &with_my_func("\\relative c' { { g4 } }"),
         );
     }
 

@@ -10,9 +10,12 @@
 //! Each event is shown with its resolved pitch(es) and duration; lines flagged `INVALID` are bare symbols that matched no note name in the active language.
 
 use std::io::Read;
+use std::sync::Arc;
 
+use ly_lsp::command::scheme;
 use ly_lsp::note_analyser::analyse;
 use ly_lsp::notes::{ChordNote, EventKind};
+use ly_lsp::vocabulary::Scope;
 
 use tree_sitter::Parser;
 
@@ -35,7 +38,11 @@ fn main() {
         .set_language(&tree_sitter_lilypond::LANGUAGE_LILYPOND.into())
         .expect("load LilyPond grammar");
     let tree = parser.parse(&src, None).expect("parser produces a tree");
-    let analysis = analyse(&tree, &src);
+    // The file's own music functions count, so a `\myFunc { … }` in it is read
+    // as a call with a music argument rather than a bare word and a block.
+    // What it *includes* doesn't: this tool reads one file, with no graph.
+    let scope = Scope::new(None, vec![Arc::new(scheme::read(&tree, &src).layer)]);
+    let analysis = analyse(&tree, &src, &scope);
 
     for event in analysis.events.iter() {
         let text = &src[event.span.start..event.span.end];

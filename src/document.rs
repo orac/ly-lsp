@@ -3,21 +3,26 @@
 //! go-to-definition and find-references with, and converts between byte offsets
 //! and LSP positions.
 //!
+//! Definitions come from two readers, because LilyPond has two ways of binding
+//! a name that `\foo` can reach. [`SYMBOL_QUERY`] captures the ordinary
+//! assignment, `foo = …`, from its left-hand side. [`command::scheme`] captures
+//! the Scheme binding forms, `#(define-public foo …)`, which produce no
+//! `assignment_lhs` for a query to match on. The two are disjoint by
+//! construction and merged in source order by [`Document::from_parts`], so
+//! go-to-definition, find-references, rename and the undefined-reference
+//! diagnostic treat both shapes alike.
+//!
 //! # Known limitations
 //!
-//! - A music function defined purely inside a Scheme block —
-//!   `#(define-public myFunc (define-music-function …))` — produces no
-//!   `assignment_lhs` node, so [`SYMBOL_QUERY`] never sees it as a definition. A
-//!   later `\myFunc` is then flagged as an *undefined* reference: a false
-//!   positive, worse than the missing feature. The ordinary form,
-//!   `myFunc = #(define-music-function …)`, works today because the query only
-//!   looks at the assignment's left-hand side, which is unaffected by what the
-//!   right-hand side contains. See [`doc/command-parsing.md`](../doc/command-parsing.md)'s
-//!   "Go-to-definition for user-defined music functions" section — step 3's
-//!   `tree-sitter-scheme` reader is what teaches the vocabulary to look inside
-//!   `#( … )` too, removing this false positive.
+//! - Only *top-level* assignments are definitions: the query is anchored on
+//!   `lilypond_program`, so a `foo = …` nested inside a `\layout` or `\with`
+//!   block is invisible. Scheme bindings are found at any depth, since they
+//!   carry no such anchor.
+//! - Nothing inside a music function's `#{ … #}` body is read, definitions
+//!   included. That is what keeps the LilyPond and Scheme readers from becoming
+//!   mutually recursive; see [`command::scheme`]'s module docs.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use streaming_iterator::StreamingIterator;
 use tower_lsp::lsp_types::{
@@ -29,6 +34,7 @@ use crate::command::{self, Commands};
 use crate::line_struct::{LineIndex, Span};
 use crate::note_analyser;
 use crate::notes::{Events, NoteAnalysis, Problem};
+use crate::vocabulary::{Layer, Scope};
 
 /// A named occurrence in the source: either a definition (`foo = ...`) or a
 /// reference (`\foo`). `span` covers the clickable extent of the occurrence.
@@ -64,7 +70,16 @@ pub struct Document {
     definitions: Vec<Symbol>,
     references: Vec<Symbol>,
     includes: Vec<Include>,
+    /// The commands *this file* defines, ready to be stacked into the
+    /// [`Scope`] of every document that can see it. Read once here, when the
+    /// document is built, which is what stops an include shared by a dozen
+    /// scores being read a dozen times.
+    commands_defined: Arc<Layer>,
     notes: NoteAnalysis,
+    /// The [`Scope::fingerprint`] `notes` was analysed in. Compared against
+    /// the current scope by [`refresh`](Self::refresh), which is what makes an
+    /// edit to an included file re-analyse the files that include it.
+    analysed_in: u64,
 }
 
 impl Document {
@@ -73,11 +88,29 @@ impl Document {
         Self::from_parts(text, tree)
     }
 
-    /// Builds the derived state (line index and symbols) for `text` and `tree`.
+    /// Builds the derived state (line index, symbols, definitions and note
+    /// analysis) for `text` and `tree`.
+    ///
+    /// The note analysis is done in the scope the file makes on its own — the
+    /// builtins and its own definitions — since a document knows nothing of
+    /// the graph it sits in; [`refresh`](Self::refresh) redoes it once the
+    /// graph can say what else this document can see. A file that includes
+    /// nothing (or nothing that defines a command) is therefore analysed here
+    /// and never again.
     fn from_parts(text: String, tree: Tree) -> Self {
         let line_index = LineIndex::new(&text);
-        let analysis = extract(&tree, &text);
-        let notes = note_analyser::analyse(&tree, &text);
+        let mut analysis = extract(&tree, &text);
+        let scheme = command::scheme::read(&tree, &text);
+        // The query sees LilyPond assignments; the Scheme reader sees the
+        // bindings inside `#( … )`. Neither sees the other's, so the two sets
+        // are disjoint and simply concatenate — sorted back into source order,
+        // which is the order every consumer of `definitions` expects.
+        analysis.definitions.extend(scheme.symbols);
+        analysis.definitions.sort_by_key(|symbol| symbol.span.start);
+
+        let commands_defined = Arc::new(scheme.layer);
+        let scope = own_scope(&commands_defined);
+        let notes = note_analyser::analyse(&tree, &text, &scope);
         Self {
             text,
             tree,
@@ -85,8 +118,36 @@ impl Document {
             definitions: analysis.definitions,
             references: analysis.references,
             includes: analysis.includes,
+            commands_defined,
             notes,
+            analysed_in: scope.fingerprint(),
         }
+    }
+
+    /// The layer of commands this file defines, for stacking into a [`Scope`].
+    pub(crate) fn commands_defined(&self) -> &Arc<Layer> {
+        &self.commands_defined
+    }
+
+    /// Re-runs the note and command analysis if `scope` differs from the one
+    /// it was last done in.
+    ///
+    /// Command parsing is a cross-file analysis: whether `\myFunc { c4 }` is a
+    /// call with a music argument or a bare `\myFunc` followed by a block
+    /// depends on a `define-music-function` that may live in an included file.
+    /// So the analysis is keyed on the scope that produced it, and redone when
+    /// a file in the include closure changes — which mints a new
+    /// [`Layer`](crate::vocabulary::Layer) id, and so a new fingerprint. Doing
+    /// it here, lazily, rather than eagerly invalidating dependants at the
+    /// moment of an edit, means the cost falls only on documents actually
+    /// queried, and needs no reverse include index to find them.
+    pub(crate) fn refresh(&mut self, scope: &Scope) {
+        let fingerprint = scope.fingerprint();
+        if fingerprint == self.analysed_in {
+            return;
+        }
+        self.notes = note_analyser::analyse(&self.tree, &self.text, scope);
+        self.analysed_in = fingerprint;
     }
 
     /// Applies a single LSP content change. A change with a `range` is spliced
@@ -417,8 +478,22 @@ fn symbol_query() -> &'static Query {
     QUERY.get_or_init(|| Query::new(&language(), SYMBOL_QUERY).expect("valid query"))
 }
 
+/// The scope a file makes on its own: the builtins, plus whatever it defines
+/// itself. Stacked the same way [`DocumentGraph::scope_for`](crate::document_graph::DocumentGraph)
+/// stacks it — the document's own layer first, empty layers left out — so a
+/// document with no includes fingerprints identically either way and is never
+/// re-analysed for the sake of it.
+fn own_scope(defined: &Arc<Layer>) -> Scope<'static> {
+    let layers = if defined.is_empty() {
+        Vec::new()
+    } else {
+        vec![Arc::clone(defined)]
+    };
+    Scope::new(None, layers)
+}
+
 /// Parses `src`, reusing `old_tree` for incremental reparsing when supplied.
-fn parse(src: &str, old_tree: Option<&Tree>) -> Tree {
+pub(crate) fn parse(src: &str, old_tree: Option<&Tree>) -> Tree {
     let mut parser = Parser::new();
     parser
         .set_language(&language())
@@ -852,8 +927,9 @@ mod tests {
         // `myFunc = #(define-music-function …)` is an ordinary assignment as far
         // as the symbol query is concerned — go-to-definition, find-references
         // and the undefined-reference diagnostic all see it exactly like
-        // `myFunc = { c d e }`. Pinned here so step 3 (which starts reading
-        // *inside* the `#( … )`) can't quietly regress this simpler path.
+        // `myFunc = { c d e }`. Pinned here so that [`command::scheme`], which
+        // reads *inside* the `#( … )` for the same definition, can't quietly
+        // regress this simpler view of it.
         let doc = Document::new(
             "myFunc = #(define-music-function (m) (ly:music?) m)\n\\myFunc { c4 }\n".to_string(),
         );
@@ -872,28 +948,65 @@ mod tests {
     }
 
     #[test]
-    fn scheme_only_definition_is_a_false_positive_today() {
+    fn a_scheme_only_definition_is_both_a_symbol_and_a_command() {
         // A function defined purely inside a Scheme block — no `foo = …` on the
-        // left — produces no `assignment_lhs`, so [`SYMBOL_QUERY`] never captures
-        // it as a definition, and the reference below is (wrongly) flagged as
-        // undefined. This is today's pinned behaviour, not the desired one: see
-        // the "Known limitations" note in this module's docs and
-        // `doc/command-parsing.md`'s step 3, which is what removes it.
+        // left — produces no `assignment_lhs`, so [`SYMBOL_QUERY`] can't see it.
+        // [`command::scheme`] reads the binding instead and reports the name it
+        // binds, with the span of the name as written, so go-to-definition,
+        // find-references, rename and the undefined-reference diagnostic all
+        // treat it exactly like `myFunc = …`.
+        let src =
+            "#(define-public myFunc (define-music-function (m) (ly:music?) m))\n\\myFunc { c4 }\n";
+        let doc = Document::new(src.to_string());
+
+        assert_eq!(names(doc.definitions()), vec!["myFunc"]);
+        let span = doc.definitions()[0].span;
+        assert_eq!(&src[span.start..span.end], "myFunc");
+        assert_eq!(names(doc.references()), vec!["myFunc"]);
+        assert!(undefined_references(&doc).is_empty());
+        assert!(
+            doc.commands_defined().get("myFunc").is_some(),
+            "and it carries a signature, being a definition form"
+        );
+    }
+
+    #[test]
+    fn a_scheme_binding_of_a_plain_value_is_a_definition_with_no_signature() {
+        // `\foo` reaches anything bound in the module, so the binding is a
+        // definition whatever its value — but only the `define-…-function`
+        // forms say what arguments `\foo` takes, so this one gets no signature.
+        let doc = Document::new("#(define-public myColour \"red\")\n\\myColour\n".to_string());
+        assert_eq!(names(doc.definitions()), vec!["myColour"]);
+        assert!(undefined_references(&doc).is_empty());
+        assert!(doc.commands_defined().get("myColour").is_none());
+    }
+
+    #[test]
+    fn a_scheme_procedure_is_not_a_definition() {
+        // `(define (helper x) …)` names a procedure, not an identifier `\helper`
+        // could reach: its name is a list rather than a symbol, which is how
+        // the two are told apart.
+        let doc = Document::new("#(define (helper x) (* x 2))\n".to_string());
+        assert!(doc.definitions().is_empty());
+    }
+
+    #[test]
+    fn a_documents_own_music_function_is_in_scope_for_its_own_calls() {
+        // No graph, no includes: a file's own definitions are readable from the
+        // file alone, so its calls are parsed against them from the moment it
+        // is parsed.
         let doc = Document::new(
-            "#(define-public myFunc (define-music-function (m) (ly:music?) m))\n\\myFunc { c4 }\n"
+            "myFunc = #(define-music-function (from music) (ly:pitch? ly:music?) music)\n\
+             \\myFunc c' { c4 }\n"
                 .to_string(),
         );
-        assert!(
-            doc.definitions().is_empty(),
-            "the Scheme-only definition is invisible to the symbol query today"
-        );
-        let diagnostics = undefined_references(&doc);
-        assert_eq!(
-            diagnostics.len(),
-            1,
-            "today \\myFunc is wrongly flagged as undefined"
-        );
-        assert!(diagnostics[0].message.contains("myFunc"));
+        let call = doc
+            .commands()
+            .iter()
+            .find(|call| call.name == "myFunc")
+            .expect("the call is parsed against its own definition");
+        assert!(matches!(call.args[0], crate::command::Arg::Pitch { .. }));
+        assert!(matches!(call.args[1], crate::command::Arg::Music { .. }));
     }
 
     #[test]

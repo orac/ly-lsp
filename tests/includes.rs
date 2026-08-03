@@ -377,6 +377,110 @@ fn music_function_defined_in_an_included_file_resolves_across_the_include_graph(
 }
 
 #[test]
+fn a_music_function_from_an_include_gives_its_calls_a_signature() {
+    // The signature of `\myFunc` lives in another file entirely, so this tests finding symbols and applying their signatures across the whole Scope.
+    let dir = tempfile::tempdir().unwrap();
+    let functions = dir.path().join("functions.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(
+        &functions,
+        "myFunc = #(define-music-function (from music) (ly:pitch? ly:music?)\n  \"Do a @var{thing}.\"\n  music)\n",
+    )
+    .unwrap();
+    fs::write(&score, "\\include \"functions.ily\"\n\\myFunc c' { c4 }\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    // Cursor just after `\myFunc `, where the first argument goes.
+    let help = ws
+        .signature_help(&url(&score), Position::new(1, 8))
+        .expect("signature help for a user-defined function");
+    assert_eq!(help.signatures[0].label, "\\myFunc from music");
+    assert_eq!(help.active_parameter, Some(0));
+
+    // And hovering the keyword shows the docstring, converted from Texinfo.
+    let hover = ws
+        .hover(&url(&score), Position::new(1, 3))
+        .expect("hover on the function name");
+    let rendered = format!("{:?}", hover.contents);
+    assert!(rendered.contains("Do a *thing*."), "got {rendered}");
+}
+
+#[test]
+fn editing_an_include_re_analyses_the_calls_in_the_files_that_include_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let functions = dir.path().join("functions.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(
+        &functions,
+        "myFunc = #(define-music-function (music) (ly:music?) music)\n",
+    )
+    .unwrap();
+    fs::write(&score, "\\include \"functions.ily\"\n\\myFunc { c4 }\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+    assert_eq!(
+        ws.signature_help(&url(&score), Position::new(1, 8))
+            .expect("signature help")
+            .signatures[0]
+            .label,
+        "\\myFunc music"
+    );
+
+    // The user opens the include and gives the function a leading pitch. The
+    // score is untouched, but its calls must be read against the new signature.
+    ws.open(
+        url(&functions),
+        "myFunc = #(define-music-function (from music) (ly:pitch? ly:music?) music)\n".to_string(),
+    );
+    assert_eq!(
+        ws.signature_help(&url(&score), Position::new(1, 8))
+            .expect("signature help")
+            .signatures[0]
+            .label,
+        "\\myFunc from music"
+    );
+}
+
+#[test]
+fn a_function_defined_only_inside_scheme_resolves_like_any_other() {
+    // `#(define-public myFunc (define-music-function …))` has no
+    // `assignment_lhs`, so the document's symbol query never sees it; the
+    // Scheme reader reports the binding instead, name and span alike. Across
+    // the include graph that has to behave exactly like `myFunc = …`: no
+    // undefined-reference diagnostic, and go-to-definition landing on the name
+    // inside the `#( … )`.
+    let dir = tempfile::tempdir().unwrap();
+    let words = dir.path().join("lilypond-words");
+    let functions = dir.path().join("functions.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(&words, "\\\\relative\n").unwrap();
+    fs::write(
+        &functions,
+        "#(define-public myFunc (define-music-function (m) (ly:music?) m))\n",
+    )
+    .unwrap();
+    fs::write(&score, "\\include \"functions.ily\"\n\\myFunc { c4 }\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    assert!(ws.load_vocabulary(&words));
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    let diagnostics = ws.diagnostics(&url(&score));
+    assert!(
+        diagnostics.is_empty(),
+        "expected no diagnostics, got {diagnostics:?}"
+    );
+    // `#(define-public myFunc …)`: the name starts at column 16 of line 0.
+    let locations = ws.goto_definition(&url(&score), Position::new(1, 2));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, url(&functions));
+    assert_eq!(locations[0].range, line_range(0, 16, 22));
+}
+
+#[test]
 fn undefined_reference_diagnostics_are_off_without_vocabulary() {
     let dir = tempfile::tempdir().unwrap();
     let score = dir.path().join("score.ly");

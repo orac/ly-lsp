@@ -20,8 +20,8 @@ Three layers, resolved in priority order. This split is not a hedge — it follo
 
 | Layer | Source | Status |
 |---|---|---|
-| `builtin` | Hand-written impls in this repo | **Build now** |
-| `workspace` | Definitions parsed from the user's open and `\include`d files | Later |
+| `builtin` | Hand-written impls in this repo | Built (step 1) |
+| `workspace` | Definitions parsed from the user's open and `\include`d files | Built (step 3) |
 | `install` | `define-music-function` and friends read out of the active LilyPond install | Later |
 
 `workspace` outranks `install` because a user redefining `\foo` means theirs. `builtin` outranks both, because it exists precisely where the other two are absent or unhelpful.
@@ -32,181 +32,34 @@ Conversely the ~400 music functions are not worth hand-writing, and hand-written
 
 ### Decisions already taken for the later layers
 
-Recorded here because they shape the trait, not because they're being built yet.
+Recorded before those layers were built, because they shaped the trait.
 
 - **Read, don't evaluate.** Recognising `(define-music-function (a b) (pred? pred?) "doc" …)` is a datum-shape match, not a computation. Reading avoids embedding a Scheme interpreter, and avoids executing workspace-authored code in the server process.
-- **Use `tree-sitter-scheme` for the reading.** We already depend on `tree-sitter`, and it gives error recovery and incremental reparse — essential for workspace definitions being edited mid-keystroke, where a strict S-expression reader simply fails.
 - **If evaluation ever becomes unavoidable, shell out to the user's own `lilypond`** rather than embedding an interpreter: run it once over a generated `.ly` that dumps every function's name, `ly:music-function-signature` and docstring, and cache the result keyed on the binary's path and mtime. This is the same data the manuals are generated from. It requires respecting VS Code's workspace trust, since it executes workspace-reachable code.
 - **Match on the definition form, not on `define-public`.** Harvesting `define-public` fabricates commands that aren't callable as `\foo`. The reliable markers are `define-music-function` / `define-event-function` / `define-scheme-function` / `define-void-function` in value position, plus `foo = #(define-… )` in `ly/*.ly`.
 - **Docstrings arrive as Texinfo** (`@var{}`, `@code{}`, wrapped in `_i` for gettext). Convert to Markdown once on the way in, not per hover.
 
 ## The design
 
-### The trait
-
-```rust
-/// A `\word` the server understands: the arguments it takes, what to say about it on hover, and what to offer inside its arguments.
-///
-/// There is one impl per *source of knowledge*, not one per command: hand-written unit structs for the keyword layer, and later a single `SchemeCommand` struct instantiated once per definition read from the install or the workspace.
-///
-/// Deliberately object-safe: [`Vocabulary`] stores `Arc<dyn Command>` and hands them out by name, so no method may be generic or return `Self`. In particular `check` returns a `Vec` rather than `impl Iterator`, because an RPITIT would make the trait dyn-incompatible.
-pub trait Command: Send + Sync {
-    /// The name as written, without its leading backslash (`repeat`).
-    fn name(&self) -> &str;
-
-    /// The parameters this command expects, in source order.
-    ///
-    /// Impls that override [`parse_args`](Command::parse_args) still return their parameters here, because signature help and arity diagnostics read them even when the parsing is irregular. A command we know only by name — a `lilypond-words` entry with no definition behind it — returns an empty slice, and its following block is then read as music by the analyser's main loop, which is what happens today.
-    fn signature(&self) -> &[Param];
-
-    /// Consumes this command's arguments from the siblings following its keyword.
-    ///
-    /// The default walks [`signature`](Command::signature): a required parameter that fails to match stops consumption, so a half-typed `\repeat volta` yields the arguments seen so far rather than nothing; an optional parameter that fails is skipped and the next parameter tried against the same node.
-    ///
-    /// Override only when the shape can't be expressed as a parameter list at all — `\override`'s property path, `\tweak`'s backtracking. Do not override merely to reject a bad argument; that belongs in [`check`](Command::check), so that a wrong-but-parseable call still produces a structured [`CommandCall`] for the refactorings to work with.
-    fn parse_args(&self, args: &mut ArgReader) -> Vec<Arg> {
-        default_parse(self.signature(), args)
-    }
-
-    /// How the note analyser should read this call's music arguments — the mode `\relative` establishes, the chord region `\chordmode` establishes, the non-note region `\lyricmode` establishes.
-    ///
-    /// Takes the parsed call because the answer often depends on an argument: `\relative c'` reads its own reference pitch out of `call` and returns `MusicContext::Relative(pitch)`. Takes `ambient` because some contexts inherit rather than replace it. The default, [`MusicContext::Inherit`], is right for the overwhelming majority of commands.
-    fn music_context(&self, _call: &CommandCall, ambient: MusicContext) -> MusicContext {
-        ambient
-    }
-
-    /// Hover documentation, already rendered to Markdown. `None` for a command we recognise but can say nothing about.
-    fn documentation(&self) -> Option<&Documentation> {
-        None
-    }
-
-    /// The values worth completing at parameter `index`. Empty when the parameter is open-ended.
-    fn completions(&self, _index: usize) -> &[Candidate] {
-        &[]
-    }
-
-    /// Problems with a parsed call beyond "an argument didn't match" — `\repeat volta 0`, a repeat kind that isn't one of the four, a `\volta` outside any `\repeat`.
-    ///
-    /// Produces LSP [`Diagnostic`]s directly rather than going through the note pass's [`Problem`] enum. `Problem` is a closed, `Copy` enum of fixed variants, which suits the note reader's small fixed set of complaints but not this: command diagnostics are open-ended and command-specific, and a `SchemeCommand` built at runtime in steps 3–4 could not add variants to it at all. `ctx` supplies the span-to-range conversion that keeps this method from needing a `LineIndex` of its own.
-    fn check(&self, _call: &CommandCall, _ctx: &CheckContext) -> Vec<Diagnostic> {
-        Vec::new()
-    }
-}
-```
+The `Command` trait and supporting types can be found in src/command/mod.rs.
 
 Code actions are deliberately not a method here. `code_action` already owns an offer/resolve lifecycle (see [`src/code_action/README.md`](../src/code_action/README.md)); an action that wants command knowledge asks the table for it, keeping the dependency one-way.
 
 ### Supporting types
 
-```rust
-/// One parameter of a command's signature.
-pub struct Param {
-    /// The name from the definition (`weightList`), shown in signature help. `Cow` so hand-written impls can use literals while parsed ones own their strings.
-    pub name: Cow<'static, str>,
-    /// What this parameter looks like in source, and hence how to consume it.
-    pub kind: ArgKind,
-    /// Whether the parameter may be absent. LilyPond writes these as `(name default)` pairs and matches them by trying the predicate and backtracking; we approximate that by trying the shape.
-    pub optional: bool,
-}
-
-/// The existing enum, extended with the argument forms the hand-written commands need and with the escape hatch that makes parsed signatures usable.
-pub enum ArgKind {
-    BareWord,       // \repeat volta
-    Count,          // \repeat unfold 4
-    NumberList,     // \volta 2,3
-    Music,          // a block, or a single braceless note or chord
-    Pitch,          // \relative c', \fixed c, \key c \major
-    Word,           // the \major of \key c \major — an escaped_word argument
-    String,         // \clef "bass", \language "english" — quoted or bare symbol
-    PropertyPath,   // \set Staff.instrumentName
-    /// A predicate we have no source-shape rule for, named so hover and signature help can still show it. Consumes exactly one node, which is right often enough to beat refusing the whole signature.
-    Unknown(Cow<'static, str>),
-}
-
-/// How music inside a command's body is to be read. Mirrors the analyser's existing `Mode` and `Region` pair, which collapse into this once commands stop steering them by hand.
-pub enum MusicContext {
-    Inherit,
-    Absolute,
-    Relative(Pitch),
-    Fixed(i8),
-    Chord,
-    /// Lyrics, drums, figures, markup, headers — scanned for nested music and directives, but bare symbols are not events.
-    NonNote,
-}
-
-/// A cursor over the sibling nodes following a command keyword, shared by the default parser and by hand-written overrides so both consume arguments the same way.
-pub struct ArgReader<'a> { /* children, src, next index */ }
-
-impl ArgReader<'_> {
-    /// Consumes one argument of `kind`, or returns `None` **without advancing**. The non-consuming failure is what lets an optional parameter be retried against the next parameter; overrides must preserve it.
-    pub fn take(&mut self, kind: &ArgKind) -> Option<Arg>;
-
-    /// The next node without consuming it, for overrides that need to look before they leap.
-    pub fn peek(&self) -> Option<Node>;
-
-    /// The index of the first unconsumed sibling — what `command::parse` returns to its caller.
-    pub fn position(&self) -> usize;
-}
-
-/// What a command may consult while checking a call, and the means to report what it finds.
-///
-/// Checking is a whole-document pass, not part of the note analyser's walk: a command's complaint often depends on calls *other* than its own — `\volta` is only wrong because no `\repeat volta` encloses it — and those aren't all collected until the walk finishes. So `check` runs afterwards, over the completed [`Commands`], driven from [`Document::diagnostics`].
-pub struct CheckContext<'a> {
-    src: &'a str,
-    lines: &'a LineIndex,
-    /// Every call in the document, in source order, so a command can inspect the calls enclosing or nested within its own.
-    calls: &'a Commands,
-}
-
-impl CheckContext<'_> {
-    /// The source text a span covers.
-    pub fn text(&self, span: Span) -> &str;
-
-    /// The innermost call whose body contains `span` — what `\volta` asks to discover it has no `\repeat`.
-    pub fn enclosing(&self, span: Span) -> Option<&CommandCall>;
-
-    /// The calls nested directly inside `call`'s body — what `\repeat volta` asks to check its alternatives.
-    pub fn nested(&self, call: &CommandCall) -> impl Iterator<Item = &CommandCall>;
-
-    /// Builds a diagnostic at `span`, converting it to a range and filling in `source: "ly-lsp"` so every impl reports consistently. Prefer these over constructing `Diagnostic` literals.
-    pub fn error(&self, span: Span, message: impl Into<String>) -> Diagnostic;
-    pub fn warning(&self, span: Span, message: impl Into<String>) -> Diagnostic;
-}
-
-/// Hover text plus where it came from, so the table can prefer our curated wording over LilyPond's when both exist.
-pub struct Documentation {
-    /// Markdown, ready for an LSP `MarkupContent`.
-    pub markdown: String,
-    pub source: DocSource,
-}
-
-pub enum DocSource { Curated, Workspace, Install }
-```
-
 ### The table
 
-The symbol table is [`Vocabulary`](../src/vocabulary.rs), which already answers "is `\foo` a command?" and now answers "…and what does it do?". Reusing it avoids a second registry and a second name; `is_known` becomes a thin wrapper over lookup plus the existing CamelCase context-reference rule.
+The symbol table is [`vocabulary.rs`](../src/vocabulary.rs), which already answered "is `\foo` a command?" and now answers "…and what does it do?". Reusing it avoids a second registry and a second name; `is_known` becomes a thin wrapper over lookup plus the existing CamelCase context-reference rule.
 
-```rust
-pub struct Vocabulary {
-    /// Hand-written impls, always present.
-    builtin: HashMap<&'static str, Arc<dyn Command>>,
-    /// Definitions from the user's files. Rebuilt when a defining document changes.
-    workspace: HashMap<String, Arc<dyn Command>>,
-    /// Read from the active LilyPond install.
-    install: HashMap<String, Arc<dyn Command>>,
-    /// Names from `lilypond-words` with nothing behind them. Known, but with an empty signature.
-    known_names: HashSet<String>,
-}
+Step 1 wrote this as one flat struct with a field per source. Step 3 made the middle field *per file* rather than per workspace, which turns the whole thing into a scoped symbol table: each source of knowledge is a `Layer`, and what a document sees is a stack of them.
 
-impl Vocabulary {
-    /// The command `\name` refers to, resolved `builtin` → `workspace` → `install`, or a nameless placeholder for a `known_names` entry.
-    pub fn get(&self, name: &str) -> Option<&Arc<dyn Command>>;
+A bare `known_names` entry resolves to no `Command` at all, rather than to a placeholder with an empty signature. Knowing that a name exists says nothing about its arguments, and `command::parse` declining the call is exactly what leaves the block after `\break` to be read as ordinary music.
 
-    /// Unchanged in meaning: whether `\name` is a command we recognise at all.
-    pub fn is_known(&self, name: &str) -> bool;
-}
-```
+Three consequences of the layering, because they are what make the cross-file part work:
+
+- **A file's definitions are read once, when its `Document` is parsed.** The layer lives on the `Document`; every scope that reaches the file shares the same `Arc<Layer>`. A header included by twenty scores is read once, not twenty times.
+- **A scope is compared by its layers' identities, not their contents.** Editing a file mints a new layer id, so every scope containing it fingerprints differently and `Document::refresh` re-analyses it on the next query. That needs no reverse include index and no eager invalidation walk at the moment of the edit; the cost falls only on the documents actually asked about.
+- **Empty layers are skipped.** A file that defines no commands, and includes none that do, fingerprints the same as the bare builtin scope — so the overwhelming majority of documents are analysed once, when parsed, and never again.
 
 Note that `command::Commands` is a different thing with a confusingly close name: it is the list of `CommandCall`s *found in one document*, not the table of commands that exist. Leave it be for now; renaming it to `CommandCalls` is a tidy-up worth doing separately.
 
@@ -216,7 +69,7 @@ This is the part that makes step 1 worth doing on its own, and the part most lik
 
 `Analyser::handle_command` currently does two jobs at once: skipping over a command's arguments so they aren't misread as notes, and deciding what mode and region the command's body is read in. The first job is exactly `parse_args`. The second is exactly `music_context`. So `handle_command` collapses to:
 
-1. Look the `escaped_word` up in the `Vocabulary`.
+1. Look the `escaped_word` up in the document's `Scope`.
 2. `parse_args` to build the `CommandCall` — this consumes the reference pitch, the clef name, the property path, the repeat kind, replacing every hand-written `children.get(i).kind() == "symbol"` check in that function.
 3. Ask `music_context` what the body is read in.
 4. Walk each `Arg::Music` in that context.
@@ -263,10 +116,6 @@ Nothing there looks at the right-hand side, so this is expected to work already,
 | The same definition in an `\include`d file | Resolves across the include graph, like any other variable |
 | `\myFunc` with no definition anywhere | Still diagnosed as undefined |
 
-There is one shape that will *not* work, and it's worth pinning as a known limitation rather than discovering later: a function defined purely inside a Scheme block, `#(define-public myFunc (define-music-function …))`, produces no `assignment_lhs`, so it is invisible to the query. `\myFunc` then gets an **undefined-reference error** — a false positive, which is worse than a missing feature. Add a test recording today's behaviour and note it in `note_analyser.rs`'s limitations list; step 3's Scheme reader is what fixes it.
-
-I haven't confirmed the grammar really produces `assignment_lhs` for an assignment whose value is a `#( … )` block — `examples/dump_tree.rs`, the tool for checking that, is currently missing from the crate (see below). Confirm it while writing these tests.
-
 **Step 1 — the trait, hand-written commands, and every call site.** No Scheme, no new layers, no new LSP features.
 
 1. Add the trait and supporting types to `src/command.rs`, with `default_parse` driving off `signature()`. Implement the new `ArgKind` variants in `ArgReader::take`.
@@ -280,9 +129,17 @@ Apart from item 6 this step is behaviour-preserving: the existing suites must pa
 
 **Step 2 — new LSP features off the table.** Signature help, argument completion, hover, semantic tokens for bare-word arguments, and `check`-based diagnostics. Each is independent; none needs the later layers.
 
-**Step 3 — the workspace layer.** Parse `define-music-function` out of the user's own files with `tree-sitter-scheme`. This is where cross-file invalidation lands: a signature edit has to invalidate call sites through [`document_graph.rs`](../src/document_graph.rs), which makes command parsing a derived cross-file analysis rather than a per-document one. Expect this to be the largest architectural cost in the whole feature.
+**Step 3 — the workspace layer. Done.** `define-music-function` and friends are read out of the user's own files by [`src/command/scheme.rs`](../src/command/scheme.rs), into one `Layer` per file, stacked into a `Scope` by [`document_graph.rs`](../src/document_graph.rs) along the include closure. Cross-file invalidation landed as described in "The table" above: the analysis records the scope's fingerprint, and `Document::refresh` redoes it when that changes. The architectural cost was real but smaller than feared, for two reasons — the LilyPond grammar already parses embedded Scheme (no second grammar), and keying the analysis on the scope removed the need to invalidate dependants eagerly.
 
-Two things fall out of this step. Signatures start coming from the right-hand side of an assignment the symbol query already sees, so the step 0 go-to-definition tests are the guard that the two views of the same definition stay consistent. And a function defined only inside `#( … )` becomes visible, which removes the false-positive undefined-reference diagnostic noted above.
+What it reads, and what it deliberately doesn't:
+
+- Both naming shapes: `myFunc = #(define-…-function …)` and `#(define-public myFunc (define-…-function …))`. All four `define-…-function` forms count, since all four are called the same way.
+- Signatures are aligned with the predicate list **from the right**, so the pre-2.15 `(parser location note)` argument lists still in use across real libraries read as one argument, not three.
+- A predicate becomes an `ArgKind` only where its source *shape* is known (`ly:music?`, `ly:pitch?`, `string?`, the integer ones); everything else is `ArgKind::Unknown(predicate)`, consuming one node. So an unfamiliar predicate costs the extent of one argument, not the whole signature.
+- Docstrings are converted from Texinfo to Markdown once, on the way in, `(_i "…")` wrappers included.
+- Function *bodies* are not read at all, `#{ … #}` least of all: that is what keeps the two readers from becoming mutually recursive.
+
+Two things fell out, as expected. Signatures come from the right-hand side of an assignment the symbol query already sees, so the step 0 go-to-definition tests are the guard that the two views of the same definition stay consistent. And a function defined only inside `#( … )` stopped being a false-positive undefined reference — and then, since the reader knows *where* each name was written and not merely that it exists, stopped being a second-class definition altogether: go-to-definition, find-references and rename all reach it. See "Go-to-definition for user-defined music functions" above.
 
 **Step 4 — the install layer.** The same reader pointed at the active install's `.scm` and `ly/*.ly`, indexed asynchronously on startup and cached on disk keyed on an install fingerprint, so first diagnostics aren't blocked.
 
@@ -295,6 +152,4 @@ Two things fall out of this step. Signatures start coming from the right-hand si
 ## Testing
 
 - Every hand-written command gets unit tests in `src/command.rs` in the style of the existing ones, including a half-typed case that exercises stopping at a missing required argument.
-- The existing `tests/extract/`, `tests/inline/` and `tests/explicit/` suites are the regression net for step 1, and must pass unchanged.
-- The step 0 tests come off `#[ignore]` in step 1 and stay as the regression net for the two fixed mis-readings.
-- Steps 3 and 4 must not make tests depend on an installed LilyPond. Check in fixture `.scm` and dump files from the start.
+- Step 4 must not make tests depend on an installed LilyPond. It should check in fixture `.scm` and dump files from the start.

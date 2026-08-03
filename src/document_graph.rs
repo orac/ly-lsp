@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
@@ -19,7 +19,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::Document;
-use crate::vocabulary::Vocabulary;
+use crate::vocabulary::{Scope, Vocabulary};
 
 #[derive(Debug, Default)]
 pub struct DocumentGraph {
@@ -98,18 +98,21 @@ impl DocumentGraph {
             return Vec::new();
         }
 
-        // Compute the reachable definition names *before* borrowing the open
-        // document below, so we never re-enter the document map while holding a
-        // reference into it.
-        let vocabulary = self.vocabulary.get();
-        let reachable = vocabulary.map(|_| self.reachable_definition_names(uri));
+        // Computed *before* borrowing the open document below, so we never
+        // re-enter the document map while holding a reference into it. The
+        // scope answers for commands — builtins, and the functions this file
+        // and its includes define — and `reachable` for every other kind of
+        // definition an `\include` brings into view.
+        let known = self.vocabulary.get().map(|_| {
+            let scope = self.scope_for(uri);
+            let reachable = self.reachable_definition_names(uri);
+            move |name: &str| scope.is_known(name) || reachable.contains(name)
+        });
 
         self.with_document(uri, |doc| {
             let mut diagnostics = doc.diagnostics();
-            if let (Some(vocabulary), Some(reachable)) = (vocabulary, &reachable) {
-                diagnostics.extend(doc.undefined_reference_diagnostics(|name| {
-                    vocabulary.is_known(name) || reachable.contains(name)
-                }));
+            if let Some(known) = &known {
+                diagnostics.extend(doc.undefined_reference_diagnostics(known));
             }
             diagnostics
         })
@@ -120,7 +123,7 @@ impl DocumentGraph {
     fn reachable_definition_names(&self, uri: &Url) -> HashSet<String> {
         let mut names = HashSet::new();
         for file in self.include_closure(uri) {
-            self.with_document(&file, |doc| {
+            self.with_document_raw(&file, |doc| {
                 names.extend(doc.definitions().iter().map(|d| d.name.clone()));
             });
         }
@@ -242,7 +245,7 @@ impl DocumentGraph {
         let mut found = Vec::new();
         for file in self.include_closure(uri) {
             let ranges = self
-                .with_document(&file, |doc| doc.definition_ranges(name))
+                .with_document_raw(&file, |doc| doc.definition_ranges(name))
                 .unwrap_or_default();
             found.extend(ranges.into_iter().map(|r| Location::new(file.clone(), r)));
         }
@@ -261,7 +264,7 @@ impl DocumentGraph {
                 continue;
             }
             order.push(current.clone());
-            self.with_document(&current, |doc| {
+            self.with_document_raw(&current, |doc| {
                 for include in doc.includes() {
                     if let Some(target) =
                         resolve_include(&current, &include.path, self.search_paths())
@@ -373,27 +376,69 @@ impl DocumentGraph {
         })
     }
 
-    /// Runs `f` against the document at `uri`. Open documents are used directly;
-    /// others are read from disk and cached, the cache being reused while the
-    /// file's modification time is unchanged. Returns `None` if the document is
-    /// neither open nor a readable file.
+    /// Runs `f` against the document at `uri`, with its command analysis
+    /// brought up to date for the [`Scope`] it can currently see.
+    ///
+    /// Everything a document derives from its own text alone is ready the
+    /// moment it is parsed; only the command analysis depends on other files,
+    /// so only that is refreshed here. See [`Document::refresh`].
     fn with_document<R>(&self, uri: &Url, f: impl FnOnce(&Document) -> R) -> Option<R> {
-        if let Some(doc) = self.open.get(uri) {
-            return Some(f(&doc));
+        // Built before any entry is borrowed: `scope_for` walks the include
+        // graph, so computing it while holding a reference into the document
+        // map would re-enter that map.
+        let scope = self.scope_for(uri);
+        self.with_document_raw(uri, |doc| {
+            doc.refresh(&scope);
+            f(doc)
+        })
+    }
+
+    /// The commands visible from `uri`: the definitions of every file in its
+    /// include closure, nearest first, over the global vocabulary.
+    ///
+    /// Each file contributes the layer its [`Document`] built when it was
+    /// parsed, so a header included by twenty scores is read once and its
+    /// layer shared twenty times over rather than re-read per score.
+    fn scope_for(&self, uri: &Url) -> Scope<'_> {
+        let mut layers = Vec::new();
+        for file in self.include_closure(uri) {
+            self.with_document_raw(&file, |doc| {
+                let layer = doc.commands_defined();
+                if !layer.is_empty() {
+                    layers.push(Arc::clone(layer));
+                }
+            });
+        }
+        Scope::new(self.vocabulary.get(), layers)
+    }
+
+    /// Runs `f` against the document at `uri` without refreshing its
+    /// cross-file analysis. Open documents are used directly; others are read
+    /// from disk and cached, the cache being reused while the file's
+    /// modification time is unchanged. Returns `None` if the document is
+    /// neither open nor a readable file.
+    ///
+    /// This is what the include-graph walk itself uses — includes, symbols and
+    /// a file's own definitions are all derived from the file alone, so asking
+    /// for them can't need a scope, and mustn't, on pain of unbounded
+    /// recursion through [`scope_for`](Self::scope_for).
+    fn with_document_raw<R>(&self, uri: &Url, f: impl FnOnce(&mut Document) -> R) -> Option<R> {
+        if let Some(mut doc) = self.open.get_mut(uri) {
+            return Some(f(&mut doc));
         }
 
         let path = uri.to_file_path().ok()?;
         let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
 
-        if let Some(cached) = self.cache.get(uri)
+        if let Some(mut cached) = self.cache.get_mut(uri)
             && cached.modified == modified
         {
-            return Some(f(&cached.document));
+            return Some(f(&mut cached.document));
         }
 
         // Absent or stale: (re)read and parse, then cache.
-        let document = Document::new(std::fs::read_to_string(&path).ok()?);
-        let result = f(&document);
+        let mut document = Document::new(std::fs::read_to_string(&path).ok()?);
+        let result = f(&mut document);
         self.cache
             .insert(uri.clone(), CachedDocument { modified, document });
         Some(result)
@@ -423,4 +468,125 @@ fn resolve_include(base: &Url, path: &str, search_paths: &[PathBuf]) -> Option<U
 /// The zero-width range at the start of a file.
 fn start_of_file() -> Range {
     Range::new(Position::new(0, 0), Position::new(0, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn url(path: &Path) -> Url {
+        Url::from_file_path(path).expect("absolute path")
+    }
+
+    /// Two scores including one shared file of music functions. The scope each
+    /// sees stacks the *same* layer instance, so their fingerprints match —
+    /// the observable consequence of the shared file being read once rather
+    /// than once per score that includes it.
+    #[test]
+    fn a_shared_include_is_read_once_for_every_file_that_includes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared.ily");
+        let one = dir.path().join("one.ly");
+        let two = dir.path().join("two.ly");
+        fs::write(
+            &shared,
+            "myFunc = #(define-music-function (m) (ly:music?) m)\n",
+        )
+        .unwrap();
+        fs::write(&one, "\\include \"shared.ily\"\n\\myFunc { c4 }\n").unwrap();
+        fs::write(&two, "\\include \"shared.ily\"\n\\myFunc { d4 }\n").unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&one), fs::read_to_string(&one).unwrap());
+        ws.open(url(&two), fs::read_to_string(&two).unwrap());
+
+        assert_eq!(
+            ws.scope_for(&url(&one)).fingerprint(),
+            ws.scope_for(&url(&two)).fingerprint(),
+            "both scores should stack the same layer from the shared include"
+        );
+    }
+
+    /// The other half of the same claim: a scope's fingerprint follows the
+    /// content of the files in its closure, so an analysis made before an
+    /// include was edited is not silently served afterwards.
+    #[test]
+    fn editing_an_include_changes_the_scope_of_the_files_that_include_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared.ily");
+        let score = dir.path().join("score.ly");
+        fs::write(
+            &shared,
+            "myFunc = #(define-music-function (m) (ly:music?) m)\n",
+        )
+        .unwrap();
+        fs::write(&score, "\\include \"shared.ily\"\n\\myFunc { c4 }\n").unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), fs::read_to_string(&score).unwrap());
+        let before = ws.scope_for(&url(&score)).fingerprint();
+
+        // The editor opens the include and gives the function a second argument.
+        ws.open(
+            url(&shared),
+            "myFunc = #(define-music-function (a m) (ly:pitch? ly:music?) m)\n".to_string(),
+        );
+        assert_ne!(before, ws.scope_for(&url(&score)).fingerprint());
+    }
+
+    /// Renaming reaches a definition bound inside `#( … )`, where the name is a
+    /// bare `scheme_symbol` rather than an `assignment_lhs`. Worth checking on
+    /// the resulting text rather than on the edits: a span off by the `#(` or
+    /// by the leading backslash would corrupt the file.
+    #[test]
+    fn rename_rewrites_a_definition_bound_inside_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let source =
+            "#(define-public myFunc (define-music-function (m) (ly:music?) m))\n\\myFunc { c4 }\n";
+        fs::write(&score, source).unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), source.to_string());
+
+        // Cursor on the `\myFunc` call.
+        let edit = ws
+            .rename(&url(&score), Position::new(1, 2), "newFunc")
+            .expect("a rename of a user-defined function");
+        let mut edits = edit.changes.expect("changes")[&url(&score)].clone();
+        // Apply back to front, so earlier offsets stay valid.
+        edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+
+        let index = crate::line_struct::LineIndex::new(source);
+        let mut renamed = source.to_string();
+        for TextEdit { range, new_text } in edits {
+            let start = index.offset_at(range.start).expect("a start offset");
+            let end = index.offset_at(range.end).expect("an end offset");
+            renamed.replace_range(start..end, &new_text);
+        }
+
+        assert_eq!(
+            renamed,
+            "#(define-public newFunc (define-music-function (m) (ly:music?) m))\n\\newFunc { c4 }\n"
+        );
+    }
+
+    /// A file that defines nothing and includes nothing sees the plain builtin
+    /// scope — so the overwhelming majority of documents are analysed once,
+    /// when they are parsed, and never re-analysed.
+    #[test]
+    fn a_file_with_no_definitions_stacks_no_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.ly");
+        fs::write(&plain, "{ c d e }\n").unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&plain), fs::read_to_string(&plain).unwrap());
+
+        assert_eq!(
+            ws.scope_for(&url(&plain)).fingerprint(),
+            Scope::builtins_only().fingerprint()
+        );
+    }
 }

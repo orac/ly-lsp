@@ -17,14 +17,17 @@
 //! of them are plain rows of [`STATIC_ROWS`], built as a [`StaticCommand`]; the
 //! handful with genuinely irregular behaviour — [`relative`], [`fixed`],
 //! [`tempo`] and [`repeat`] — each get their own file here, wrapping
-//! a `StaticCommand` and overriding the one method that makes them bespoke. See
-//! [`doc/command-parsing.md`](../../doc/command-parsing.md) for the fuller design,
-//! including the `workspace`/`install` layers [`Vocabulary`](crate::vocabulary::Vocabulary)
-//! grows later.
+//! a `StaticCommand` and overriding the one method that makes them bespoke.
+//! [`scheme`] is the other layer built so far: the `define-music-function`s of
+//! the user's own files, read into a [`Layer`] per file and stacked into a
+//! [`Scope`] by the document graph. See
+//! [`doc/command-parsing.md`](../../doc/command-parsing.md) for the fuller
+//! design, including the `install` layer still to come.
 
 mod fixed;
 mod relative;
 mod repeat;
+pub mod scheme;
 mod static_command;
 mod tempo;
 
@@ -38,6 +41,7 @@ use tree_sitter::Node;
 use crate::line_struct::{LineIndex, Span};
 use crate::note_names::Language;
 use crate::notes::Pitch;
+use crate::vocabulary::{Layer, Scope};
 use static_command::{curated, static_command};
 
 /// A `\word` the server understands: the arguments it takes, what to say about
@@ -524,28 +528,31 @@ impl Arg {
     }
 }
 
-/// Parses the command at `children[start]` (an `escaped_word`) against its
-/// [`Command`] impl in [`BUILTIN`], if it names one there, consuming as many of
-/// its arguments as are present. `language` is the note-name language active at
-/// this point in the source, needed to resolve a [`Pitch`](ArgKind::Pitch)
-/// argument the same way an ordinary note is resolved.
+/// Parses the command at `children[start]` (an `escaped_word`) against the
+/// [`Command`] impl `scope` resolves it to, if it resolves to one, consuming
+/// as many of its arguments as are present. `language` is the note-name
+/// language active at this point in the source, needed to resolve a
+/// [`Pitch`](ArgKind::Pitch) argument the same way an ordinary note is
+/// resolved.
 ///
 /// Returns the structured call and the index of the first node after the
-/// arguments consumed. `None` when the word names no known command, leaving
-/// the caller to handle it as it did before (in `note_analyser`, that means
-/// the following block is read as an ordinary bare block).
+/// arguments consumed. `None` when the word names no command `scope` has a
+/// signature for, leaving the caller to handle it as it did before (in
+/// `note_analyser`, that means the following block is read as an ordinary bare
+/// block).
 pub fn parse(
     children: &[Node],
     start: usize,
     src: &str,
     language: Language,
+    scope: &Scope,
 ) -> Option<(CommandCall, usize)> {
     let keyword_node = *children.get(start)?;
     if keyword_node.kind() != "escaped_word" {
         return None;
     }
     let name = src[keyword_node.start_byte()..keyword_node.end_byte()].strip_prefix('\\')?;
-    let cmd = BUILTIN.get(name)?.clone();
+    let cmd = scope.get(name)?.clone();
 
     let keyword = node_span(keyword_node);
     let mut reader = ArgReader::new(children, start + 1, src, language);
@@ -1027,13 +1034,13 @@ static STATIC_ROWS: &[Row] = {
 /// [`StaticCommand`](static_command::StaticCommand) and overrides the one
 /// method that makes it bespoke. Keyed by name without the leading backslash.
 /// Read once into [`BUILTIN`].
-fn builtin_table() -> HashMap<&'static str, Arc<dyn Command>> {
-    let mut table: HashMap<&'static str, Arc<dyn Command>> = HashMap::new();
+fn builtin_table() -> Layer {
+    let mut table: HashMap<String, Arc<dyn Command>> = HashMap::new();
 
     for Row(names, params, context, doc, completions) in STATIC_ROWS {
         for &name in *names {
             table.insert(
-                name,
+                name.to_string(),
                 Arc::new(static_command(
                     name,
                     params,
@@ -1045,22 +1052,20 @@ fn builtin_table() -> HashMap<&'static str, Arc<dyn Command>> {
         }
     }
 
-    table.insert("repeat", Arc::new(repeat::command()));
-    table.insert("relative", Arc::new(relative::command()));
-    table.insert("fixed", Arc::new(fixed::command()));
-    table.insert("tempo", Arc::new(tempo::command()));
+    table.insert("repeat".to_string(), Arc::new(repeat::command()));
+    table.insert("relative".to_string(), Arc::new(relative::command()));
+    table.insert("fixed".to_string(), Arc::new(fixed::command()));
+    table.insert("tempo".to_string(), Arc::new(tempo::command()));
 
-    table
+    Layer::new(table)
 }
 
-/// The hand-written command table, built once. [`parse`] looks commands up
-/// here directly; [`Vocabulary::get`](crate::vocabulary::Vocabulary::get)
-/// consults it too rather than holding a layer of its own, so the two ways of
-/// asking "does ly-lsp know `\foo`?" — parsing a call, and checking
-/// `is_known` — stay in lock-step by construction rather than by two
-/// hand-maintained lists agreeing.
-pub(crate) static BUILTIN: LazyLock<HashMap<&'static str, Arc<dyn Command>>> =
-    LazyLock::new(builtin_table);
+/// The hand-written command layer, built once and stacked first by every
+/// [`Scope`](crate::vocabulary::Scope). It is a [`Layer`] like any other, so
+/// the one way of asking "does ly-lsp know `\foo`?" serves both parsing a call
+/// and checking `is_known`, rather than two hand-maintained lists having to
+/// agree.
+pub(crate) static BUILTIN: LazyLock<Layer> = LazyLock::new(builtin_table);
 
 /// The source-ordered command calls found in a document, queryable by the
 /// position or span a refactoring is working at. Mirrors [`Events`] so a call
@@ -1209,7 +1214,14 @@ mod tests {
         let mut cursor = root.walk();
         let children: Vec<Node> = root.children(&mut cursor).collect();
         let start = children.iter().position(|n| n.kind() == "escaped_word")?;
-        parse(&children, start, src, Language::DEFAULT).map(|(call, _)| call)
+        parse(
+            &children,
+            start,
+            src,
+            Language::DEFAULT,
+            &Scope::builtins_only(),
+        )
+        .map(|(call, _)| call)
     }
 
     #[test]
@@ -1313,7 +1325,14 @@ mod tests {
             .iter()
             .position(|n| n.kind() == "escaped_word")
             .unwrap();
-        let (call, _) = parse(&children, start, src, Language::DEFAULT).expect("a repeat call");
+        let (call, _) = parse(
+            &children,
+            start,
+            src,
+            Language::DEFAULT,
+            &Scope::builtins_only(),
+        )
+        .expect("a repeat call");
         let body = call.body().expect("a body");
         assert_eq!(&src[body.start..body.end], "c4");
     }
@@ -1342,7 +1361,8 @@ mod tests {
                 &children,
                 0,
                 "\\override NoteHead.color = #red",
-                Language::DEFAULT
+                Language::DEFAULT,
+                &Scope::builtins_only(),
             )
             .is_none()
         );
@@ -1631,7 +1651,7 @@ mod tests {
     /// helper above) to exercise [`Commands::call_site_at`] against nesting.
     fn commands(src: &str) -> Commands {
         let tree = tree(src);
-        crate::note_analyser::analyse(&tree, src).commands
+        crate::note_analyser::analyse(&tree, src, &Scope::builtins_only()).commands
     }
 
     #[test]
