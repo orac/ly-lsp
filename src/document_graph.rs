@@ -99,14 +99,13 @@ impl DocumentGraph {
         }
 
         // Computed *before* borrowing the open document below, so we never
-        // re-enter the document map while holding a reference into it. The
-        // scope answers for commands — builtins, and the functions this file
-        // and its includes define — and `reachable` for every other kind of
-        // definition an `\include` brings into view.
+        // re-enter the document map while holding a reference into it. One
+        // walk of the include graph answers for every kind of name: a
+        // definition is a command in its file's layer, whether or not anything
+        // says what arguments it takes.
         let known = self.vocabulary.get().map(|_| {
             let scope = self.scope_for(uri);
-            let reachable = self.reachable_definition_names(uri);
-            move |name: &str| scope.is_known(name) || reachable.contains(name)
+            move |name: &str| scope.is_known(name)
         });
 
         self.with_document(uri, |doc| {
@@ -117,17 +116,6 @@ impl DocumentGraph {
             diagnostics
         })
         .unwrap_or_default()
-    }
-
-    /// The names of every definition reachable from `uri` through includes.
-    fn reachable_definition_names(&self, uri: &Url) -> HashSet<String> {
-        let mut names = HashSet::new();
-        for file in self.include_closure(uri) {
-            self.with_document_raw(&file, |doc| {
-                names.extend(doc.definitions().iter().map(|d| d.name.clone()));
-            });
-        }
-        names
     }
 
     /// Document highlights for `position` in `uri`: matched bracket ranges, or
@@ -181,13 +169,38 @@ impl DocumentGraph {
                 .unwrap_or_default();
         }
 
-        let Some(Some(name)) =
-            self.with_document(uri, |doc| doc.symbol_at(position).map(str::to_string))
-        else {
+        let Some((Some(name), at)) = self.with_document(uri, |doc| {
+            (
+                doc.symbol_at(position).map(str::to_string),
+                doc.line_index().offset_at(position),
+            )
+        }) else {
             return Vec::new();
         };
 
-        self.definitions_of(&name, uri)
+        self.definitions_in_effect(&name, uri, at)
+    }
+
+    /// The definition of `name` a reference at byte offset `at` in `uri`
+    /// actually means — one per file in the include closure that defines it,
+    /// rather than every place each of them binds the name.
+    ///
+    /// See [`Document::definition_in_effect`] for what "in effect" means within
+    /// a file. Across files it stays unresolved: two files in one closure both
+    /// defining `foo` is a genuine ambiguity we don't have the information to
+    /// settle here, since the closure walk doesn't record where each `\include`
+    /// sits relative to the reference. Both are offered, as before.
+    fn definitions_in_effect(&self, name: &str, uri: &Url, at: Option<usize>) -> Vec<Location> {
+        let mut found = Vec::new();
+        for file in self.include_closure(uri) {
+            // Only the cursor's own file has a position to resolve against.
+            let at = if file == *uri { at } else { None };
+            let range = self
+                .with_document_raw(&file, |doc| doc.definition_in_effect(name, at))
+                .flatten();
+            found.extend(range.map(|range| Location::new(file.clone(), range)));
+        }
+        found
     }
 
     /// Resolves find-references at `position` in document `uri`.
@@ -240,7 +253,16 @@ impl DocumentGraph {
         locations
     }
 
-    /// All definitions of `name` reachable from `uri` through includes.
+    /// *Every* place `name` is bound in the files reachable from `uri` — not
+    /// only the definition in effect at any particular point.
+    ///
+    /// Deliberately different from [`definitions_in_effect`](Self::definitions_in_effect),
+    /// which go-to-definition uses. Rename and find-references treat a name as
+    /// one thing across a file: renaming `\foo` where a second definition is in
+    /// effect but leaving the first alone would rewrite the references that
+    /// meant the first one too, and break them. Renaming the name entire is
+    /// self-consistent; resolving each reference to its own binding first is a
+    /// scoped rename, and a bigger job than this.
     fn definitions_of(&self, name: &str, uri: &Url) -> Vec<Location> {
         let mut found = Vec::new();
         for file in self.include_closure(uri) {

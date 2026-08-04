@@ -11,6 +11,8 @@
 //! concerns, and a fair amount of formatting logic of its own.
 //!
 //! [`document`]: crate::document
+//! [`Commands::call_site_at`]: crate::command::Commands::call_site_at
+//! [`CommandCall`]: crate::command::CommandCall
 
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Hover, HoverContents, MarkupContent, MarkupKind,
@@ -28,8 +30,8 @@ use crate::document::Document;
 ///
 /// Returns the byte offset alongside the [`CallSite`] because [`hover`] needs
 /// it for one more check — whether the cursor sits on the keyword itself —
-/// that [`Commands::call_site_at`](command::Commands::call_site_at) doesn't
-/// answer on its own.
+/// that [`Commands::call_site_at`](crate::command::Commands::call_site_at)
+/// doesn't answer on its own.
 fn call_at(doc: &Document, position: Position) -> Option<(usize, CallSite<'_>)> {
     let offset = doc.line_index().offset_at(position)?;
     let site = doc.commands().call_site_at(offset, doc.text())?;
@@ -65,7 +67,7 @@ pub fn signature_help(doc: &Document, position: Position) -> Option<SignatureHel
 
 /// The completion candidates for the argument position at `position`, if the
 /// cursor is in one and that parameter has a closed set of accepted values
-/// (see [`Command::completions`](command::Command::completions)). Empty
+/// (see [`Command::completions`](crate::command::Command::completions)). Empty
 /// otherwise — an open-ended parameter (a pitch, a music block, most strings)
 /// offers nothing here rather than guessing.
 pub fn completions(doc: &Document, position: Position) -> Vec<CompletionItem> {
@@ -86,13 +88,20 @@ pub fn completions(doc: &Document, position: Position) -> Vec<CompletionItem> {
 /// Hover documentation for the command word at `position`, if the cursor sits
 /// on one: its signature, plus its curated prose where there is any. `None`
 /// when the cursor is elsewhere in a call's header or body — hovering an
-/// argument value isn't wired up here, only the command word itself.
+/// argument value isn't wired up here, only the command word itself — and
+/// `None` for a command with neither parameters nor prose, which is every
+/// reference to a plain variable: a popup reading just `\foo` over the `\foo`
+/// you are already looking at is worse than nothing. Rendering a variable's
+/// *value* would earn one, and is the obvious next thing here.
 pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
     let (offset, site) = call_at(doc, position)?;
     if !site.call.keyword.contains(offset) {
         return None;
     }
     let cmd = &site.call.cmd;
+    if cmd.signature().is_empty() && cmd.documentation().is_none() {
+        return None;
+    }
 
     let mut markdown = format!(
         "```\n{}\n```",
@@ -233,6 +242,15 @@ mod tests {
         };
         assert!(markup.value.contains("\\relative [reference] music"));
         assert!(markup.value.contains("relative to the previous note"));
+    }
+
+    #[test]
+    fn hover_stays_quiet_over_a_plain_variable() {
+        // `\foo` resolves to a zero-argument command with nothing to say about
+        // itself. A popup rendering just `\foo` over the `\foo` under the
+        // cursor is worse than no popup at all.
+        let (doc, pos) = doc_at("foo = { c }\n\\f|oo\n");
+        assert!(hover(&doc, pos).is_none());
     }
 
     #[test]

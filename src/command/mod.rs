@@ -12,18 +12,21 @@
 //! The knowledge of *which* commands exist and what their arguments look like
 //! lives behind the [`Command`] trait. [`BUILTIN`] is the hand-written layer —
 //! the keyword commands (`\repeat`, `\relative`, `\set`, the mode switches, …)
-//! that can only ever be hand-written because they are reserved words in
-//! LilyPond's own grammar, not functions a Scheme reader could discover. Most
-//! of them are plain rows of [`STATIC_ROWS`], built as a [`StaticCommand`]; the
+//! which are reserved words in LilyPond's grammar. Most of them are plain rows
+//! of the [`STATIC_ROWS`] table, built as a [`StaticCommand`](static_command::StaticCommand); the
 //! handful with genuinely irregular behaviour — [`relative`], [`fixed`],
 //! [`tempo`] and [`repeat`] — each get their own file here, wrapping
 //! a `StaticCommand` and overriding the one method that makes them bespoke.
-//! [`scheme`] is the other layer built so far: the `define-music-function`s of
-//! the user's own files, read into a [`Layer`] per file and stacked into a
-//! [`Scope`] by the document graph. See
+//! The other layer built so far is the user's own files. [`definition`] builds
+//! one [`Layer`] per file out of everything it binds — a definition being a
+//! command that takes no arguments unless something says otherwise — and the
+//! document graph stacks those into a [`Scope`]. [`scheme`] is what supplies
+//! the "unless": it reads the `define-music-function`s inside `#( … )` for the
+//! arguments they declare. See
 //! [`doc/command-parsing.md`](../../doc/command-parsing.md) for the fuller
 //! design, including the `install` layer still to come.
 
+pub mod definition;
 mod fixed;
 mod relative;
 mod repeat;
@@ -53,8 +56,15 @@ use static_command::{curated, static_command};
 /// command whose only job is to consume a fixed signature and (maybe) set a
 /// fixed [`MusicContext`] for its body; [`relative::RelativeCommand`],
 /// [`fixed::FixedCommand`] and [`tempo::TempoCommand`] are the three whose
-/// behaviour genuinely differs. Later a `SchemeCommand` will be instantiated
-/// once per `define-music-function` read from the workspace or the install.
+/// behaviour genuinely differs. From the user's own files,
+/// [`SchemeCommand`](scheme::SchemeCommand) is instantiated once per
+/// `define-…-function` and [`Variable`](definition::Variable) once per
+/// everything else bound.
+///
+/// One impl decorates rather than answers: `definition::Definition` wraps any
+/// of the above with where its file wrote the name, so
+/// [`definition`](Self::definition) and [`redefines`](Self::redefines) are
+/// implemented once for every source of knowledge rather than once each.
 ///
 /// Deliberately object-safe: [`Vocabulary`](crate::vocabulary::Vocabulary)
 /// stores `Arc<dyn Command>` and hands them out by name, so no method may be
@@ -111,6 +121,31 @@ pub trait Command: Send + Sync {
     /// we recognise but can say nothing about — most of [`STATIC_ROWS`]'s
     /// rows, which say nothing beyond their signature.
     fn documentation(&self) -> Option<&Documentation> {
+        None
+    }
+
+    /// Where this command's name is written, within the file whose [`Layer`]
+    /// it came from.
+    ///
+    /// `None` for the hand-written commands, which are defined in this repo
+    /// rather than in anyone's score, and so have nothing to navigate to.
+    ///
+    /// A span, not a range or a URL: a [`Layer`] belongs to one file, and the
+    /// caller that asked it for a command already knows which.
+    fn definition(&self) -> Option<Span> {
+        None
+    }
+
+    /// The definition this one replaced, where its file binds the same name
+    /// more than once.
+    ///
+    /// LilyPond takes the last binding of a name, so that is the one the layer
+    /// hands out — but the earlier ones are still *written*, and are still
+    /// what go-to-definition and document highlights should point at. Keeping
+    /// them on a chain rather than as a flat list of spans also leaves the
+    /// replaced command itself reachable, which a warning or code lens about a
+    /// redefinition would want. See [`definition_spans`].
+    fn redefines(&self) -> Option<&Arc<dyn Command>> {
         None
     }
 
@@ -318,6 +353,24 @@ pub fn default_parse(signature: &[Param], args: &mut ArgReader) -> Vec<Arg> {
         }
     }
     out
+}
+
+/// Every place `command`'s file binds its name, in source order.
+///
+/// Walks the [`redefines`](Command::redefines) chain, so a file that assigns
+/// `foo` twice yields both spans from the single layer entry `\foo` resolves
+/// to. Empty for a command with no definition to point at — every builtin, and
+/// (later) whatever the install layer can't locate.
+pub fn definition_spans(command: &dyn Command) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut current = Some(command);
+    while let Some(command) = current {
+        spans.extend(command.definition());
+        current = command.redefines().map(Arc::as_ref);
+    }
+    // The chain runs latest-first; every caller wants source order.
+    spans.reverse();
+    spans
 }
 
 /// Hover text plus where it came from, so the table can prefer our curated

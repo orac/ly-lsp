@@ -4,16 +4,15 @@
 //! adds a command of their own, and the only way the server can learn about
 //! one. This module recognises the definition *forms* — `define-music-function`
 //! and its `event`/`scheme`/`void` siblings — and turns each into a
-//! [`SchemeCommand`], a [`Command`] like any other, collected into the file's
-//! [`Layer`].
+//! [`SchemeCommand`], a [`Command`] like any other.
 //!
-//! It also reports the names bound by `#(define-public foo …)` and friends as
-//! [`Symbol`]s, whatever their value. Those are what
-//! [`Document`](crate::document::Document) merges into its own definitions:
-//! such a binding has no `assignment_lhs` for the symbol query to match on, so
-//! without this the name would have no definition to navigate to and every
-//! `\foo` using it would be flagged as undefined. See [`Definitions`] for why
-//! the set of names is wider than the set of commands.
+//! It reports every name a file's Scheme binds, as a
+//! [`Binding`], whether or not the value says what
+//! arguments it takes: `#(define-public foo 42)` has no signature to read, but
+//! LilyPond will still substitute `\foo` for it, so the name is defined and
+//! must not be flagged as an undefined reference. Those bindings have no
+//! `assignment_lhs` for the symbol query to match on, so this is the only
+//! reader that sees them at all.
 //!
 //! # Read, don't evaluate
 //!
@@ -41,15 +40,13 @@
 //! predicate can't void the rest of a function's arguments.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tree_sitter::{Node, Tree};
 
+use super::definition::Binding;
 use super::{ArgKind, Command, DocSource, Documentation, Param};
-use crate::document::Symbol;
 use crate::line_struct::Span;
-use crate::vocabulary::Layer;
 
 /// The definition forms that produce a `\command`. `define-void-function` and
 /// `define-scheme-function` are here alongside the two music ones because all
@@ -100,54 +97,29 @@ impl Command for SchemeCommand {
     // this way.
 }
 
-/// What a file's embedded Scheme defines: the commands, and the names it binds.
+/// Reads every name `tree`'s embedded Scheme binds, in source order.
 ///
-/// The two are not the same set, and deliberately so. A [`Layer`] entry is a
-/// thing callable as `\foo` *with a known signature*, which only the
-/// `define-…-function` forms produce. A [`Symbol`] is a place a name was
-/// written, which is what go-to-definition needs and what stops a reference
-/// being flagged as undefined — and LilyPond will substitute `\foo` for
-/// anything bound in the module, whatever its value, so the binding forms
-/// count there even when their value is a plain number.
-pub struct Definitions {
-    pub layer: Layer,
-    /// Names bound by a Scheme *binding* form (`#(define-public foo …)`), with
-    /// the span of the name as written.
-    ///
-    /// A definition assigned the LilyPond way (`foo = #( … )`) is absent here:
-    /// [`SYMBOL_QUERY`](crate::document::SYMBOL_QUERY) already captures it from
-    /// the assignment's left-hand side, and reporting it twice would double
-    /// every go-to-definition result and every rename edit.
-    pub symbols: Vec<Symbol>,
-}
-
-/// Reads every definition in `tree`'s embedded Scheme.
+/// A binding whose value is one of the [`FUNCTION_FORMS`] carries a
+/// [`SchemeCommand`] saying what arguments `\name` takes; every other binding
+/// carries none, and becomes a plain
+/// [`Variable`](super::definition::Variable) — a signature would be an
+/// invention, but the name is defined either way, since LilyPond substitutes
+/// `\foo` for anything bound in the module.
 ///
 /// Called once per [`Document`](crate::document::Document), so a file included
 /// from a dozen scores is read once rather than a dozen times: the resulting
 /// layer is shared by every [`Scope`](crate::vocabulary::Scope) that reaches
 /// the file.
-pub fn read(tree: &Tree, src: &str) -> Definitions {
-    let mut out = Collector::default();
+pub fn read(tree: &Tree, src: &str) -> Vec<Binding> {
+    let mut out = Vec::new();
     collect(tree.root_node(), src, &mut out);
-    Definitions {
-        layer: Layer::new(out.commands),
-        symbols: out.symbols,
-    }
-}
-
-/// The two halves of [`Definitions`] under construction, threaded through the
-/// walk together because one pass over the tree finds both.
-#[derive(Default)]
-struct Collector {
-    commands: HashMap<String, Arc<dyn Command>>,
-    symbols: Vec<Symbol>,
+    out
 }
 
 /// Walks `node` for `embedded_scheme` blocks, reading each for a definition.
 /// Doesn't descend into a block once found: a definition nested in a function's
 /// *body* is out of scope by design (see the module docs).
-fn collect(node: Node, src: &str, out: &mut Collector) {
+fn collect(node: Node, src: &str, out: &mut Vec<Binding>) {
     if node.kind() == "embedded_scheme" {
         read_embedded(node, src, out);
         return;
@@ -160,7 +132,7 @@ fn collect(node: Node, src: &str, out: &mut Collector) {
 
 /// Reads one `#( … )` block for a definition, naming it from the assignment it
 /// is the value of (`myFunc = #( … )`) where there is one.
-fn read_embedded(node: Node, src: &str, out: &mut Collector) {
+fn read_embedded(node: Node, src: &str, out: &mut Vec<Binding>) {
     let Some(list) = child_of_kind(node, "embedded_scheme_text")
         .and_then(|text| child_of_kind(text, "scheme_list"))
     else {
@@ -188,7 +160,7 @@ fn assigned_name<'a>(node: Node<'a>, src: &str) -> Option<Node<'a>> {
 
 /// Reads a Scheme list that may be a definition, named either by the LilyPond
 /// assignment it is the value of or by the binding form it sits in.
-fn read_definition(list: Node, assigned: Option<Node>, src: &str, out: &mut Collector) {
+fn read_definition(list: Node, assigned: Option<Node>, src: &str, out: &mut Vec<Binding>) {
     let elements = items(list);
     let Some(head) = elements.first().filter(|n| n.kind() == "scheme_symbol") else {
         return;
@@ -197,12 +169,15 @@ fn read_definition(list: Node, assigned: Option<Node>, src: &str, out: &mut Coll
 
     if FUNCTION_FORMS.contains(&head) {
         // Only a name makes a function reachable as `\foo`; an anonymous one
-        // in value position is nothing we can offer.
+        // in value position is nothing we can offer. The name's span is the
+        // assignment's left-hand side — the very node
+        // [`SYMBOL_QUERY`](crate::document::SYMBOL_QUERY) captures, which is
+        // how the document tells this binding and the query's view of it apart
+        // and keeps only one.
         if let Some(name) = assigned
             && let Some(command) = function(&elements, text(name, src), src)
         {
-            out.commands
-                .insert(text(name, src).to_string(), Arc::new(command));
+            out.push(binding(name, src, Some(Arc::new(command))));
         }
         return;
     }
@@ -211,28 +186,40 @@ fn read_definition(list: Node, assigned: Option<Node>, src: &str, out: &mut Coll
         && let [_, name, rest @ ..] = elements.as_slice()
         && name.kind() == "scheme_symbol"
     {
-        // `#(define-public myFunc …)`. The binding is a definition of `myFunc`
-        // whatever its value, because LilyPond resolves `\myFunc` against the
-        // module the binding lands in.
-        out.symbols.push(symbol(*name, src));
-
-        // Whether it is also a *command* depends on the value being one of the
-        // definition forms — matching on those rather than on `define-public`
-        // itself, so `#(define-public answer 42)` doesn't fabricate a signature
-        // for something that has none. A name for a procedure, `(define (f x) …)`,
-        // is a list rather than a symbol and so isn't a definition at all: `\f`
-        // wouldn't reach it either.
-        if let Some(value) = rest.first().filter(|n| n.kind() == "scheme_list") {
-            read_definition(*value, Some(*name), src, out);
-        }
+        // `#(define-public myFunc …)`. The binding defines `myFunc` whatever
+        // its value, because LilyPond resolves `\myFunc` against the module the
+        // binding lands in. Whether it also has a *signature* depends on the
+        // value being one of the definition forms — matched on the value rather
+        // than on `define-public` itself, so `#(define-public answer 42)`
+        // doesn't fabricate arguments for something that has none. A
+        // procedure's name, `(define (f x) …)`, is a list rather than a symbol
+        // and so isn't a definition at all: `\f` wouldn't reach it either.
+        let command = rest
+            .first()
+            .filter(|n| n.kind() == "scheme_list")
+            .and_then(|value| defined_function(*value, text(*name, src), src));
+        out.push(binding(*name, src, command));
     }
 }
 
-/// The [`Symbol`] a `scheme_symbol` node names.
-fn symbol(node: Node, src: &str) -> Symbol {
-    Symbol {
+/// The command a binding's value defines, if that value is one of the
+/// [`FUNCTION_FORMS`] rather than an ordinary Scheme expression.
+fn defined_function(list: Node, name: &str, src: &str) -> Option<Arc<dyn Command>> {
+    let elements = items(list);
+    let head = elements.first().filter(|n| n.kind() == "scheme_symbol")?;
+    if !FUNCTION_FORMS.contains(&text(*head, src)) {
+        return None;
+    }
+    Some(Arc::new(function(&elements, name, src)?))
+}
+
+/// The [`Binding`] a name node makes, of `command` where the definition says
+/// what arguments it takes.
+fn binding(node: Node, src: &str, command: Option<Arc<dyn Command>>) -> Binding {
+    Binding {
         name: text(node, src).to_string(),
         span: Span::new(node.start_byte(), node.end_byte()),
+        command,
     }
 }
 
@@ -457,28 +444,30 @@ fn text<'a>(node: Node, src: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::definition;
     use crate::document;
+    use crate::vocabulary::Layer;
 
     /// Reads `src` as the server would.
-    fn definitions(src: &str) -> Definitions {
+    fn bindings(src: &str) -> Vec<Binding> {
         read(&document::parse(src, None), src)
     }
 
-    /// The commands `src` defines.
+    /// The layer `src`'s Scheme alone makes — the document merges the
+    /// assignment query's bindings in too, which these tests don't exercise.
     fn layer(src: &str) -> Layer {
-        definitions(src).layer
+        definition::layer(bindings(src))
     }
 
     /// The names `src` binds from inside Scheme, with the text each span
     /// covers, so a test can check *where* a definition was found and not only
     /// that it was.
-    fn symbols(src: &str) -> Vec<(String, &str)> {
-        definitions(src)
-            .symbols
+    fn names(src: &str) -> Vec<(String, &str)> {
+        bindings(src)
             .into_iter()
-            .map(|symbol| {
-                let span = &src[symbol.span.start..symbol.span.end];
-                (symbol.name, span)
+            .map(|binding| {
+                let span = &src[binding.span.start..binding.span.end];
+                (binding.name, span)
             })
             .collect()
     }
@@ -556,32 +545,43 @@ mod tests {
         // This is the shape that used to produce a false-positive
         // undefined-reference diagnostic.
         let src = "#(define-public myFunc (define-music-function (m) (ly:music?) m))";
-        assert!(layer(src).get("myFunc").is_some());
-        assert_eq!(symbols(src), vec![("myFunc".to_string(), "myFunc")]);
+        assert_eq!(
+            layer(src).get("myFunc").expect("myFunc").signature().len(),
+            1
+        );
+        assert_eq!(names(src), vec![("myFunc".to_string(), "myFunc")]);
     }
 
     #[test]
-    fn a_scheme_binding_is_a_symbol_whatever_its_value() {
+    fn a_scheme_binding_defines_a_name_whatever_its_value() {
         // `\foo` resolves against the module the binding lands in, so the name
-        // is defined even where nothing about its arguments is knowable. The
-        // layer stays empty: a signature would be an invention.
+        // is defined even where nothing about its arguments is knowable. It
+        // takes no arguments as far as we're concerned: a signature would be an
+        // invention, and consuming nothing is what leaves whatever follows
+        // `\foo` to be read as ordinary music.
         let src = "#(define-public answer 42)\n#(define myColour (x11-color 'red))\n";
         assert_eq!(
-            symbols(src),
+            names(src),
             vec![
                 ("answer".to_string(), "answer"),
                 ("myColour".to_string(), "myColour"),
             ]
         );
-        assert_eq!(layer(src).len(), 0);
+        let layer = layer(src);
+        for name in ["answer", "myColour"] {
+            assert!(layer.get(name).expect(name).signature().is_empty());
+        }
     }
 
     #[test]
-    fn an_assigned_definition_is_left_to_the_symbol_query() {
+    fn an_assigned_definition_is_named_by_its_left_hand_side() {
         // `myFunc = #( … )` has an `assignment_lhs`, which the document's own
-        // query already captures. Reporting it here as well would double every
-        // go-to-definition result and every rename edit.
-        assert!(symbols("myFunc = #(define-music-function (m) (ly:music?) m)").is_empty());
+        // query captures too. Both name the same node, and it is that shared
+        // span which lets the document keep one binding rather than two — and
+        // so avoid doubling every go-to-definition result and rename edit.
+        let src = "myFunc = #(define-music-function (m) (ly:music?) m)";
+        assert_eq!(names(src), vec![("myFunc".to_string(), "myFunc")]);
+        assert_eq!(bindings(src)[0].span, Span::new(0, 6));
     }
 
     #[test]
@@ -596,15 +596,22 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_scheme_defines_no_command() {
+    fn ordinary_scheme_defines_no_music_function() {
         let src = "#(define (helper x) (* x 2))\n\
                    #(define-public answer 42)\n\
                    #(use-modules (lily accreg))\n\
                    plain = { c d e }\n";
-        assert_eq!(layer(src).len(), 0);
-        // …and of those, only the `answer` binding names anything `\foo` could
-        // reach: a procedure's name is a list, and `use-modules` binds nothing.
-        assert_eq!(symbols(src), vec![("answer".to_string(), "answer")]);
+        // Only the `answer` binding names anything `\foo` could reach: a
+        // procedure's name is a list, and `use-modules` binds nothing. (`plain`
+        // is an assignment, which the document's query reads, not this.)
+        assert_eq!(names(src), vec![("answer".to_string(), "answer")]);
+        assert!(
+            layer(src)
+                .get("answer")
+                .expect("answer")
+                .signature()
+                .is_empty()
+        );
     }
 
     #[test]

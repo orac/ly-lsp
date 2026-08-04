@@ -54,6 +54,50 @@ fn goto_definition_follows_include_to_file_on_disk() {
     );
 }
 
+/// A name bound twice in one file is two different bindings, and each `\foo`
+/// means the one in effect where it is written. Go-to-definition offers that
+/// one, not both.
+#[test]
+fn goto_definition_picks_the_definition_in_effect_at_the_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let score = dir.path().join("score.ly");
+    let source = "foo = { c }\npartOne = { \\foo }\nfoo = { d }\npartTwo = { \\foo }\n";
+    fs::write(&score, source).unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), source.to_string());
+
+    // The `\foo` on line 1 means `{ c }`, defined on line 0.
+    let first = ws.goto_definition(&url(&score), Position::new(1, 14));
+    assert_eq!(first.len(), 1, "one definition, not both");
+    assert_eq!(first[0].range, line_range(0, 0, 3));
+
+    // The `\foo` on line 3 means `{ d }`, defined on line 2.
+    let second = ws.goto_definition(&url(&score), Position::new(3, 14));
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].range, line_range(2, 0, 3));
+}
+
+/// The same name bound twice in an *included* file. The include is textually
+/// substituted, so every binding in it precedes the reference and the last one
+/// is what the reference means.
+#[test]
+fn goto_definition_across_an_include_takes_that_files_last_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("shared.ily");
+    let score = dir.path().join("score.ly");
+    fs::write(&shared, "melody = { c }\nmelody = { d }\n").unwrap();
+    fs::write(&score, "\\include \"shared.ily\"\n\\melody\n").unwrap();
+
+    let ws = DocumentGraph::new();
+    ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+    let locations = ws.goto_definition(&url(&score), Position::new(1, 2));
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, url(&shared));
+    assert_eq!(locations[0].range, line_range(1, 0, 6));
+}
+
 #[test]
 fn goto_definition_on_include_path_jumps_to_file() {
     let dir = tempfile::tempdir().unwrap();

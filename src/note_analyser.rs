@@ -921,7 +921,9 @@ mod tests {
         // The file's own music functions are in scope, as they are for a real
         // document; what it *includes* is the document graph's business, not
         // the analyser's.
-        let defined = std::sync::Arc::new(crate::command::scheme::read(&tree, src).layer);
+        let defined = std::sync::Arc::new(crate::command::definition::layer(
+            crate::command::scheme::read(&tree, src),
+        ));
         analyse(&tree, src, &Scope::new(None, vec![defined]))
     }
 

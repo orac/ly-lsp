@@ -7,10 +7,13 @@
 //! a name that `\foo` can reach. [`SYMBOL_QUERY`] captures the ordinary
 //! assignment, `foo = …`, from its left-hand side. [`command::scheme`] captures
 //! the Scheme binding forms, `#(define-public foo …)`, which produce no
-//! `assignment_lhs` for a query to match on. The two are disjoint by
-//! construction and merged in source order by [`Document::from_parts`], so
-//! go-to-definition, find-references, rename and the undefined-reference
-//! diagnostic treat both shapes alike.
+//! `assignment_lhs` for a query to match on. [`merge_bindings`] puts the two in
+//! source order, and the result is the file's
+//! [`Layer`]: a definition is a command that takes no
+//! arguments unless something says otherwise, so one table answers both "where
+//! is `\foo` defined?" and "what does `\foo` do?", and go-to-definition,
+//! find-references, rename, hover and the undefined-reference diagnostic all
+//! read from it.
 //!
 //! # Known limitations
 //!
@@ -22,6 +25,7 @@
 //!   included. That is what keeps the LilyPond and Scheme readers from becoming
 //!   mutually recursive; see [`command::scheme`]'s module docs.
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use streaming_iterator::StreamingIterator;
@@ -30,6 +34,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
+use crate::command::definition::{self, Binding};
 use crate::command::{self, Commands};
 use crate::line_struct::{LineIndex, Span};
 use crate::note_analyser;
@@ -67,13 +72,16 @@ pub struct Document {
     text: String,
     tree: Tree,
     line_index: LineIndex,
+    /// Every definition, in source order — the positional view of
+    /// `commands_defined`, which is a map and so has no order of its own.
+    /// Answers "what is under the cursor?"; the layer answers everything else.
     definitions: Vec<Symbol>,
     references: Vec<Symbol>,
     includes: Vec<Include>,
-    /// The commands *this file* defines, ready to be stacked into the
-    /// [`Scope`] of every document that can see it. Read once here, when the
-    /// document is built, which is what stops an include shared by a dozen
-    /// scores being read a dozen times.
+    /// What *this file* defines, ready to be stacked into the [`Scope`] of
+    /// every document that can see it. Read once here, when the document is
+    /// built, which is what stops an include shared by a dozen scores being
+    /// read a dozen times.
     commands_defined: Arc<Layer>,
     notes: NoteAnalysis,
     /// The [`Scope::fingerprint`] `notes` was analysed in. Compared against
@@ -99,23 +107,24 @@ impl Document {
     /// and never again.
     fn from_parts(text: String, tree: Tree) -> Self {
         let line_index = LineIndex::new(&text);
-        let mut analysis = extract(&tree, &text);
-        let scheme = command::scheme::read(&tree, &text);
-        // The query sees LilyPond assignments; the Scheme reader sees the
-        // bindings inside `#( … )`. Neither sees the other's, so the two sets
-        // are disjoint and simply concatenate — sorted back into source order,
-        // which is the order every consumer of `definitions` expects.
-        analysis.definitions.extend(scheme.symbols);
-        analysis.definitions.sort_by_key(|symbol| symbol.span.start);
+        let analysis = extract(&tree, &text);
+        let bindings = merge_bindings(&tree, &text, &analysis.definitions);
+        let definitions = bindings
+            .iter()
+            .map(|binding| Symbol {
+                name: binding.name.clone(),
+                span: binding.span,
+            })
+            .collect();
 
-        let commands_defined = Arc::new(scheme.layer);
+        let commands_defined = Arc::new(definition::layer(bindings));
         let scope = own_scope(&commands_defined);
         let notes = note_analyser::analyse(&tree, &text, &scope);
         Self {
             text,
             tree,
             line_index,
-            definitions: analysis.definitions,
+            definitions,
             references: analysis.references,
             includes: analysis.includes,
             commands_defined,
@@ -437,12 +446,63 @@ impl Document {
             .map(|s| s.name.as_str())
     }
 
-    /// Definitions matching `name`, as LSP ranges.
+    /// Definitions matching `name`, as LSP ranges, in source order.
+    ///
+    /// Asked of the layer rather than of [`definitions`](Self::definitions),
+    /// since the layer is where a name's definitions are gathered: a file that
+    /// binds `foo` twice has one entry, carrying both places through its
+    /// [`redefines`](command::Command::redefines) chain.
     pub fn definition_ranges(&self, name: &str) -> Vec<Range> {
-        self.ranges(&self.definitions, name)
+        self.commands_defined
+            .get(name)
+            .map(|command| {
+                command::definition_spans(command.as_ref())
+                    .into_iter()
+                    .map(|span| self.line_index.range_of(span))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// References matching `name`, as LSP ranges.
+    /// The single definition of `name` *in effect* at byte offset `at` — the
+    /// last one written at or before it.
+    ///
+    /// A later definition doesn't erase an earlier one; it replaces it from the
+    /// point it appears. LilyPond substitutes a variable where it is used, so
+    /// in
+    ///
+    /// ```lilypond
+    /// foo = { c }
+    /// partOne = { \foo }
+    /// foo = { d }
+    /// partTwo = { \foo }
+    /// ```
+    ///
+    /// the two `\foo`s are different music, and go-to-definition on each should
+    /// land on the one it actually means rather than offering both.
+    ///
+    /// `at` is `None` when the reference is in another file. An `\include` is
+    /// textually substituted, so every definition in *this* file precedes the
+    /// reference and the last one is the one in effect.
+    ///
+    /// A reference preceding every definition of the name is LilyPond's error,
+    /// not ours: the first definition is offered rather than nothing, since
+    /// somewhere to look beats a dead end while the file is being written.
+    pub fn definition_in_effect(&self, name: &str, at: Option<usize>) -> Option<Range> {
+        let command = self.commands_defined.get(name)?;
+        let spans = command::definition_spans(command.as_ref());
+        let in_effect = match at {
+            Some(at) => spans
+                .iter()
+                .take_while(|span| span.start <= at)
+                .last()
+                .or_else(|| spans.first()),
+            None => spans.last(),
+        };
+        in_effect.map(|span| self.line_index.range_of(*span))
+    }
+
     pub fn reference_ranges(&self, name: &str) -> Vec<Range> {
         self.ranges(&self.references, name)
     }
@@ -468,7 +528,7 @@ fn language() -> Language {
 /// and `\override` property paths. A `@reference` is any `\foo` command; most
 /// resolve to no definition because they're built-ins, which is exactly why
 /// go-to-definition leaves them alone.
-const SYMBOL_QUERY: &str = r#"
+pub(crate) const SYMBOL_QUERY: &str = r#"
 (lilypond_program (assignment_lhs (symbol) @definition))
 (escaped_word) @reference
 "#;
@@ -476,6 +536,28 @@ const SYMBOL_QUERY: &str = r#"
 fn symbol_query() -> &'static Query {
     static QUERY: OnceLock<Query> = OnceLock::new();
     QUERY.get_or_init(|| Query::new(&language(), SYMBOL_QUERY).expect("valid query"))
+}
+
+/// Everything a file defines, from both readers, in source order.
+///
+/// `assignments` are what [`SYMBOL_QUERY`] captured; the Scheme reader supplies
+/// the rest. The two overlap in exactly one shape: `myFunc = #(define-music-function …)`
+/// is an assignment whose value the Scheme reader can read a signature out of,
+/// and both name the *same* `symbol` node. Keeping the Scheme reader's binding
+/// and dropping the query's — matched on the span, since that node is what
+/// makes them the same definition — is what stops go-to-definition offering the
+/// same place twice while still giving the name its signature.
+fn merge_bindings(tree: &Tree, src: &str, assignments: &[Symbol]) -> Vec<Binding> {
+    let mut bindings = command::scheme::read(tree, src);
+    let bound: HashSet<usize> = bindings.iter().map(|binding| binding.span.start).collect();
+    bindings.extend(
+        assignments
+            .iter()
+            .filter(|symbol| !bound.contains(&symbol.span.start))
+            .map(|symbol| Binding::variable(symbol.name.clone(), symbol.span)),
+    );
+    bindings.sort_by_key(|binding| binding.span.start);
+    bindings
 }
 
 /// The scope a file makes on its own: the builtins, plus whatever it defines
@@ -974,11 +1056,17 @@ mod tests {
     fn a_scheme_binding_of_a_plain_value_is_a_definition_with_no_signature() {
         // `\foo` reaches anything bound in the module, so the binding is a
         // definition whatever its value — but only the `define-…-function`
-        // forms say what arguments `\foo` takes, so this one gets no signature.
+        // forms say what arguments `\foo` takes, so this one takes none.
         let doc = Document::new("#(define-public myColour \"red\")\n\\myColour\n".to_string());
         assert_eq!(names(doc.definitions()), vec!["myColour"]);
         assert!(undefined_references(&doc).is_empty());
-        assert!(doc.commands_defined().get("myColour").is_none());
+        assert!(
+            doc.commands_defined()
+                .get("myColour")
+                .expect("a definition, callable as \\myColour")
+                .signature()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -988,6 +1076,106 @@ mod tests {
         // the two are told apart.
         let doc = Document::new("#(define (helper x) (* x 2))\n".to_string());
         assert!(doc.definitions().is_empty());
+    }
+
+    #[test]
+    fn a_name_assigned_twice_keeps_both_definitions() {
+        // LilyPond takes the later binding, so that is what `\foo` resolves to
+        // — but both places are still written, and go-to-definition offers
+        // both, as it did when definitions were a flat list.
+        let doc = Document::new("foo = { c }\nbar = { d }\nfoo = { e }\n".to_string());
+        assert_eq!(names(doc.definitions()), vec!["foo", "bar", "foo"]);
+        assert_eq!(
+            doc.definition_ranges("foo"),
+            vec![
+                Range::new(Position::new(0, 0), Position::new(0, 3)),
+                Range::new(Position::new(2, 0), Position::new(2, 3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reference_resolves_to_the_definition_in_effect_where_it_is_written() {
+        // The two `\foo`s are different music: the first means `{ c }`, the
+        // second `{ d }`. Each should land on the one it actually means.
+        let src = "foo = { c }\npartOne = { \\foo }\nfoo = { d }\npartTwo = { \\foo }\n";
+        let doc = Document::new(src.to_string());
+        let first = src.find("\\foo").expect("the first reference");
+        let second = src.rfind("\\foo").expect("the second reference");
+
+        assert_eq!(
+            doc.definition_in_effect("foo", Some(first)),
+            Some(Range::new(Position::new(0, 0), Position::new(0, 3)))
+        );
+        assert_eq!(
+            doc.definition_in_effect("foo", Some(second)),
+            Some(Range::new(Position::new(2, 0), Position::new(2, 3)))
+        );
+    }
+
+    #[test]
+    fn without_a_position_the_last_definition_is_the_one_in_effect() {
+        // What a reference in an *including* file sees: the whole of this file
+        // precedes it, so the last binding wins.
+        let doc = Document::new("foo = { c }\nfoo = { d }\n".to_string());
+        assert_eq!(
+            doc.definition_in_effect("foo", None),
+            Some(Range::new(Position::new(1, 0), Position::new(1, 3)))
+        );
+    }
+
+    #[test]
+    fn a_reference_before_every_definition_falls_back_to_the_first() {
+        // LilyPond wouldn't resolve this at all, but a file mid-edit is full of
+        // such moments; somewhere to look beats a dead end.
+        let src = "partOne = { \\foo }\nfoo = { c }\n";
+        let doc = Document::new(src.to_string());
+        assert_eq!(
+            doc.definition_in_effect("foo", Some(src.find("\\foo").unwrap())),
+            Some(Range::new(Position::new(1, 0), Position::new(1, 3)))
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_a_definition_resolves_to_that_definition() {
+        // Not to whichever one happens to be last: the cursor is *at* the
+        // definition, so that is the one in effect there.
+        let src = "foo = { c }\nfoo = { d }\n";
+        let doc = Document::new(src.to_string());
+        assert_eq!(
+            doc.definition_in_effect("foo", Some(0)),
+            Some(Range::new(Position::new(0, 0), Position::new(0, 3)))
+        );
+    }
+
+    #[test]
+    fn a_later_definition_wins_and_carries_the_one_it_replaced() {
+        // The signature is the later definition's; the earlier one is still
+        // reachable behind it, which is what a "this shadows an earlier
+        // definition" warning would read.
+        let src = "myFunc = { c }\n\
+                   myFunc = #(define-music-function (m) (ly:music?) m)\n";
+        let doc = Document::new(src.to_string());
+        let my_func = doc.commands_defined().get("myFunc").expect("myFunc");
+        assert_eq!(my_func.signature().len(), 1);
+        let replaced = my_func.redefines().expect("the plain variable it replaced");
+        assert!(replaced.signature().is_empty());
+    }
+
+    #[test]
+    fn a_variable_reference_consumes_nothing_after_it() {
+        // `\foo` now resolves to a command, but a zero-argument one: the block
+        // after it is the enclosing music's, not an argument, and its notes are
+        // read as notes.
+        let doc = Document::new("foo = { c }\n{ \\foo { d e } }\n".to_string());
+        assert!(doc.diagnostics().is_empty());
+        let call = doc
+            .commands()
+            .iter()
+            .find(|call| call.name == "foo")
+            .expect("a call to the variable");
+        assert!(call.args.is_empty());
+        assert_eq!(doc.notes().iter().count(), 3, "c, d and e are all notes");
     }
 
     #[test]

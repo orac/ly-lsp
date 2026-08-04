@@ -264,7 +264,10 @@ mod tests {
             .join(" ");
         let predicates = vec!["ly:music?"; arity].join(" ");
         let src = format!("{name} = #(define-music-function ({args}) ({predicates}) #{{ #}})\n");
-        Arc::new(scheme::read(&crate::document::parse(&src, None), &src).layer)
+        Arc::new(crate::command::definition::layer(scheme::read(
+            &crate::document::parse(&src, None),
+            &src,
+        )))
     }
 
     #[test]

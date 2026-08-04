@@ -12,7 +12,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use ly_lsp::command::scheme;
+use ly_lsp::command::{definition, scheme};
 use ly_lsp::note_analyser::analyse;
 use ly_lsp::notes::{ChordNote, EventKind};
 use ly_lsp::vocabulary::Scope;
@@ -41,7 +41,10 @@ fn main() {
     // The file's own music functions count, so a `\myFunc { … }` in it is read
     // as a call with a music argument rather than a bare word and a block.
     // What it *includes* doesn't: this tool reads one file, with no graph.
-    let scope = Scope::new(None, vec![Arc::new(scheme::read(&tree, &src).layer)]);
+    let scope = Scope::new(
+        None,
+        vec![Arc::new(definition::layer(scheme::read(&tree, &src)))],
+    );
     let analysis = analyse(&tree, &src, &scope);
 
     for event in analysis.events.iter() {
