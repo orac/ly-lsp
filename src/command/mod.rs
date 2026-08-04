@@ -910,6 +910,7 @@ static VOICE_AND_MUSIC_PARAMS: &[Param] = &[
 static CLEF_PARAMS: &[Param] = &[Param::required("name", ArgKind::String)];
 static PROPERTY_PARAMS: &[Param] = &[Param::required("property", ArgKind::PropertyPath)];
 static LANGUAGE_PARAMS: &[Param] = &[Param::required("language", ArgKind::String)];
+static INCLUDE_PARAMS: &[Param] = &[Param::required("filename", ArgKind::String)];
 static KEY_PARAMS: &[Param] = &[
     Param::required("tonic", ArgKind::Pitch),
     Param::required("mode", ArgKind::Word),
@@ -1076,7 +1077,7 @@ static STATIC_ROWS: &[Row] = {
         Row(&["set"],                   PROPERTY_PARAMS,         Inherit,  None,                  &[]),
         Row(&["unset"],                 PROPERTY_PARAMS,         Inherit,  None,                  &[]),
         Row(&["language"],              LANGUAGE_PARAMS,         Inherit,  None,                  &[]),
-        Row(&["include"],               LANGUAGE_PARAMS,         Inherit,  None,                  &[]),
+        Row(&["include"],               INCLUDE_PARAMS,          Inherit,  None,                  &[]),
         Row(&["key"],                   KEY_PARAMS,              Inherit,  Some(KEY_DOC),         KEY_COMPLETIONS),
         Row(&["transpose"],             TRANSPOSE_PARAMS,        Inherit,  Some(TRANSPOSE_DOC),   &[]),
     ]
