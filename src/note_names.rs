@@ -1130,10 +1130,13 @@ static VLAAMS_NAMES: &[(&str, u8, i8)] = &[
 #[cfg(test)]
 mod tests {
     use super::Language;
+    use proptest::prelude::*;
 
     #[test]
     fn spell_prefers_the_short_form_over_a_spelled_out_alias() {
         // English lists both `ef` and `e-flat` for e-flat; the terse one wins.
+        // Kept as a literal pin of this specific spelling alongside the
+        // general shortest-spelling property below.
         assert_eq!(Language::English.spell(2, -2), Some("ef"));
         assert_eq!(Language::English.spell(0, 2), Some("cs"));
         // A natural keeps its bare letter, not `e-natural`.
@@ -1145,5 +1148,80 @@ mod tests {
         // No language names a pitch this sharp (alteration 6); the tables stop at
         // the double sharp, +4.
         assert_eq!(Language::English.spell(0, 6), None);
+    }
+
+    /// Every `Language` variant, for sampling and for exhaustive iteration.
+    const ALL_LANGUAGES: [Language; 13] = [
+        Language::Catalan,
+        Language::Deutsch,
+        Language::English,
+        Language::Espanol,
+        Language::Francais,
+        Language::Italiano,
+        Language::Nederlands,
+        Language::Norsk,
+        Language::Portugues,
+        Language::SemiGerman,
+        Language::Suomi,
+        Language::Svenska,
+        Language::Vlaams,
+    ];
+
+    fn language_strategy() -> impl Strategy<Value = Language> {
+        proptest::sample::select(&ALL_LANGUAGES[..])
+    }
+
+    proptest! {
+        /// Spelling a pitch and reading the spelling back must return the
+        /// pitch you started with — otherwise a refactoring that writes a
+        /// spelled note wouldn't be able to trust its own output.
+        #[test]
+        fn spell_and_note_round_trip(
+            language in language_strategy(),
+            note_name in 0u8..7,
+            alteration in -4i8..=4,
+        ) {
+            let Some(spelling) = language.spell(note_name, alteration) else {
+                // Not every language names every pitch; nothing to round-trip.
+                return Ok(());
+            };
+            prop_assert_eq!(language.note(spelling), Some((note_name, alteration)));
+        }
+
+        /// `spell` documents itself as choosing the shortest of several
+        /// spellings for the same pitch (English `ef` over `e-flat`); check
+        /// that against every other table entry sharing that pitch, not just
+        /// the one example the pinned test above covers.
+        #[test]
+        fn spell_returns_the_shortest_entry_for_the_pitch(
+            language in language_strategy(),
+            note_name in 0u8..7,
+            alteration in -4i8..=4,
+        ) {
+            let Some(spelling) = language.spell(note_name, alteration) else {
+                return Ok(());
+            };
+            for &(name, note, alt) in language.table() {
+                if note == note_name && alt == alteration {
+                    prop_assert!(spelling.len() <= name.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn note_agrees_with_every_table_entry() {
+        // Exhaustive rather than random: each language's table is small and
+        // fully enumerable, so checking every entry is strictly stronger
+        // than sampling and just as cheap.
+        for &language in &ALL_LANGUAGES {
+            for &(name, note, alt) in language.table() {
+                assert_eq!(
+                    language.note(name),
+                    Some((note, alt)),
+                    "{language:?} table entry {name:?} did not round-trip through note()"
+                );
+            }
+        }
     }
 }

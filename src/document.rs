@@ -1208,4 +1208,82 @@ mod tests {
         ));
         assert!(doc.definitions().is_empty());
     }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// A small LilyPond-ish alphabet: note letters (which also double as
+        /// the stuff of multi-letter symbol names, so an assignment or a
+        /// reference can appear by chance), digits, the punctuation an
+        /// assignment or call needs (`{ } = \ "`), and whitespace including
+        /// newlines. Deliberately not constrained to well-formed LilyPond —
+        /// `Document::new` recovers from garbage via tree-sitter's error
+        /// nodes, and the property under test holds regardless of
+        /// well-formedness, so garbage is as good a source of cases as
+        /// anything hand-picked.
+        fn text_strategy() -> impl Strategy<Value = String> {
+            "[a-g0-9=\"{}\\\\ \n]{0,40}"
+        }
+
+        /// A prospective edit, as fractions of the *current* document rather
+        /// than fixed offsets: the actual range is only known once applied,
+        /// since it depends on the text as it stands after the previous edit
+        /// in the sequence. `start_fraction` and `end_fraction` are mapped
+        /// onto char boundaries of the live text and ordered, so the range is
+        /// always valid regardless of which is larger.
+        fn edit_strategy() -> impl Strategy<Value = (f64, f64, String)> {
+            (0.0f64..=1.0, 0.0f64..=1.0, "[a-g0-9=\"{}\\\\ \n]{0,5}")
+        }
+
+        /// The char boundary `fraction` of the way through `boundary_count`
+        /// available ones (including the one past the end of the text).
+        fn boundary_index(fraction: f64, boundary_count: usize) -> usize {
+            let last = boundary_count - 1;
+            ((fraction * last as f64).round() as usize).min(last)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// Applying any sequence of ranged edits incrementally must leave
+            /// the document indistinguishable from constructing a fresh one
+            /// from the resulting text: same text, same definitions and
+            /// references (name and span alike), same diagnostics. Incremental
+            /// reparsing is an optimisation over `Document::new`, not a
+            /// different code path with its own semantics, and the three
+            /// hand-written tests above each pin one instance of that; this
+            /// is the general claim.
+            #[test]
+            fn incremental_editing_matches_a_full_reparse(
+                initial in text_strategy(),
+                edits in prop::collection::vec(edit_strategy(), 1..5),
+            ) {
+                let mut doc = Document::new(initial);
+                for (start_fraction, end_fraction, replacement) in edits {
+                    let boundaries: Vec<usize> = doc
+                        .text()
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .chain(std::iter::once(doc.text().len()))
+                        .collect();
+                    let start = boundaries[boundary_index(start_fraction, boundaries.len())];
+                    let end = boundaries[boundary_index(end_fraction, boundaries.len())];
+                    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+                    let range = Range::new(
+                        doc.line_index().position_at(lo),
+                        doc.line_index().position_at(hi),
+                    );
+                    doc.apply_change(change(range, &replacement));
+                }
+
+                let fresh = Document::new(doc.text().to_string());
+                prop_assert_eq!(doc.text(), fresh.text());
+                prop_assert_eq!(doc.definitions(), fresh.definitions());
+                prop_assert_eq!(doc.references(), fresh.references());
+                prop_assert_eq!(doc.diagnostics(), fresh.diagnostics());
+            }
+        }
+    }
 }

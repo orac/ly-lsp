@@ -173,46 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn deltas_are_relative_to_the_previous_token_not_absolute() {
-        let src = "\\repeat volta 2 { c } \\repeat unfold 3 { d }";
-        let doc = Document::new(src.to_string());
-        let tokens = semantic_tokens_full(&doc);
-        assert_eq!(tokens.len(), 2);
-
-        // First token: absolute position, since there is no previous one.
-        let first_start = src.find("volta").unwrap() as u32;
-        assert_eq!(tokens[0].delta_start, first_start);
-
-        // Second token: delta from the first token's *start*, not from its end,
-        // and both are on the same line so delta_line is 0.
-        let second_start = src.find("unfold").unwrap() as u32;
-        assert_eq!(tokens[1].delta_line, 0);
-        assert_eq!(tokens[1].delta_start, second_start - first_start);
-    }
-
-    #[test]
-    fn a_multi_byte_character_earlier_on_the_line_shifts_utf16_offsets() {
-        // "café " is 5 bytes for 4 chars ("é" is 2 bytes, 1 UTF-16 unit), so
-        // the byte offset of "volta" and its UTF-16 character offset differ:
-        // exercising this against LineIndex is the point of the test, not the
-        // exact numbers, which is why they're derived rather than hard-coded.
-        let src = "% café\n\\repeat volta 2 { c }";
-        let doc = Document::new(src.to_string());
-        let tokens = semantic_tokens_full(&doc);
-        assert_eq!(tokens.len(), 1);
-
-        let line_index = doc.line_index();
-        let byte_offset = src.find("volta").unwrap();
-        let expected = line_index.position_at(byte_offset);
-        assert_eq!(tokens[0].delta_line, expected.line);
-        assert_eq!(tokens[0].delta_start, expected.character);
-    }
-
-    #[test]
     fn tokens_are_sorted_by_position_even_across_nested_calls() {
         // An outer call's own bare-word argument, and a nested call's, must
         // come out in source order: `volta` (the outer `\repeat`'s kind) then
-        // `unfold` (the nested one's).
+        // `unfold` (the nested one's). Kept as a readable regression anchor
+        // for nesting specifically; the property test below covers the
+        // general delta/decode contract these hand-written cases each sample
+        // a corner of.
         let src = "\\repeat volta 2 { \\repeat unfold 3 { c } }";
         let doc = Document::new(src.to_string());
         let tokens = semantic_tokens_full(&doc);
@@ -222,5 +189,108 @@ mod tests {
         assert_eq!(tokens[0].delta_line, 0);
         assert_eq!(tokens[1].delta_line, 0);
         assert!(tokens[1].delta_start > 0, "the two tokens must not collide");
+    }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Snippets a generated document is assembled from by joining a random
+        /// selection in a random order: command calls with bare-word/word
+        /// arguments (the two kinds `semantic_tokens_full` emits), plain music
+        /// with no calls at all, and a comment holding multi-byte characters
+        /// (an accented letter and a four-byte musical symbol) so the UTF-16
+        /// conversion is exercised, not just the ASCII case.
+        const SNIPPETS: &[&str] = &[
+            "\\repeat volta 2 { c }",
+            "\\repeat unfold 3 { d }",
+            "\\key g \\major",
+            "c d e",
+            "% café 𝄞",
+        ];
+
+        const JOINERS: &[&str] = &[" ", "\n", "  \n", "\n\n"];
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// LSP semantic tokens are delta-encoded relative to the previous
+            /// token and must be emitted in position order, per the module
+            /// docs. Decoding the deltas back to absolute positions must
+            /// therefore yield a strictly increasing sequence, and every
+            /// decoded position and length must agree with what the
+            /// document's own `LineIndex` says about the source text at that
+            /// token's span — the real contract the three hand-written tests
+            /// above each sample one corner of (relative deltas, nesting
+            /// order, a multi-byte shift).
+            #[test]
+            fn deltas_decode_to_positions_matching_the_source(
+                snippet_indices in prop::collection::vec(0..SNIPPETS.len(), 1..8),
+                joiner_indices in prop::collection::vec(0..JOINERS.len(), 0..8),
+            ) {
+                let mut src = String::new();
+                for (i, &snippet) in snippet_indices.iter().enumerate() {
+                    if i > 0 {
+                        let joiner = joiner_indices.get(i - 1).copied().unwrap_or(0);
+                        src.push_str(JOINERS[joiner]);
+                    }
+                    src.push_str(SNIPPETS[snippet]);
+                }
+
+                let doc = Document::new(src);
+                let tokens = semantic_tokens_full(&doc);
+                let line_index = doc.line_index();
+
+                // Decode the delta stream back to absolute (line, character) positions.
+                let mut decoded = Vec::with_capacity(tokens.len());
+                let mut line = 0u32;
+                let mut character = 0u32;
+                for token in &tokens {
+                    character = if token.delta_line == 0 {
+                        character + token.delta_start
+                    } else {
+                        token.delta_start
+                    };
+                    line += token.delta_line;
+                    decoded.push((line, character, token.length));
+                }
+
+                // Strictly increasing in (line, character) order.
+                for pair in decoded.windows(2) {
+                    let (line0, character0, _) = pair[0];
+                    let (line1, character1, _) = pair[1];
+                    prop_assert!(
+                        (line1, character1) > (line0, character0),
+                        "tokens out of order: {:?} then {:?}",
+                        pair[0],
+                        pair[1],
+                    );
+                }
+
+                // Each decoded position/length must equal what `line_index` derives
+                // directly from the corresponding source span, rather than a
+                // hard-coded expectation.
+                let mut expected_spans: Vec<Span> = doc
+                    .commands()
+                    .iter()
+                    .flat_map(|call| &call.args)
+                    .filter_map(|arg| match arg {
+                        Arg::BareWord { span, .. } | Arg::Word { span, .. } => Some(*span),
+                        _ => None,
+                    })
+                    .collect();
+                expected_spans.sort_by_key(|span| span.start);
+
+                prop_assert_eq!(decoded.len(), expected_spans.len());
+                for (&(line, character, length), span) in decoded.iter().zip(&expected_spans) {
+                    let start = line_index.position_at(span.start);
+                    let end = line_index.position_at(span.end);
+                    prop_assert_eq!(line, start.line);
+                    prop_assert_eq!(character, start.character);
+                    prop_assert_eq!(length, end.character - start.character);
+                }
+            }
+        }
     }
 }

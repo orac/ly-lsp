@@ -15,3 +15,4 @@ streaming-iterator = "0.1" # required to consume tree-sitter query matches
 
 [dev-dependencies]
 tempfile = "3" # temporary directories for cross-file resolution tests
+proptest = "1" # property-based testing

@@ -86,3 +86,103 @@ impl LineIndex {
         Range::new(self.position_at(span.start), self.position_at(span.end))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strings that mix ASCII, a two-byte character (`é`) and a four-byte one
+    /// that needs a UTF-16 surrogate pair (the musical G clef, U+1D11E), plus
+    /// newlines, so a generated case exercises every width `position_at` and
+    /// `offset_at` have to convert between.
+    fn text_strategy() -> impl Strategy<Value = String> {
+        "[a-c\n\u{e9}\u{1D11E}]{0,40}"
+    }
+
+    /// Every byte offset the text actually has a character at, plus the
+    /// offset one past the end — the full set of positions a caller could
+    /// legitimately ask about.
+    fn char_boundaries(text: &str) -> Vec<usize> {
+        text.char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+            .collect()
+    }
+
+    proptest! {
+        /// Converting a char boundary to a position and back must return the
+        /// same offset: that round trip is the whole point of `LineIndex`,
+        /// since the LSP client only ever speaks in positions.
+        #[test]
+        fn offset_at_undoes_position_at_for_every_char_boundary(text in text_strategy()) {
+            let index = LineIndex::new(&text);
+            for o in char_boundaries(&text) {
+                prop_assert_eq!(index.offset_at(index.position_at(o)), Some(o));
+            }
+        }
+
+        /// `position_at` must not reorder offsets: a later byte in the text
+        /// can never map to an earlier (line, character) pair, or edits and
+        /// cursor placement downstream would go backwards.
+        #[test]
+        fn position_at_is_monotonic_in_the_offset(text in text_strategy()) {
+            let index = LineIndex::new(&text);
+            let boundaries = char_boundaries(&text);
+            for &a in &boundaries {
+                for &b in &boundaries {
+                    if a <= b {
+                        let pa = index.position_at(a);
+                        let pb = index.position_at(b);
+                        prop_assert!((pa.line, pa.character) <= (pb.line, pb.character));
+                    }
+                }
+            }
+        }
+
+        /// `offset_at` must only ever hand back an offset that sits on a char
+        /// boundary, even for a `Position` that names a character past the
+        /// end of its line or a line past the end of the document — a client
+        /// can send either, and the result must still be safe to slice with.
+        #[test]
+        fn offset_at_never_returns_a_non_char_boundary(
+            text in text_strategy(),
+            line in 0u32..10,
+            character in 0u32..80,
+        ) {
+            let index = LineIndex::new(&text);
+            if let Some(offset) = index.offset_at(Position::new(line, character)) {
+                prop_assert!(text.is_char_boundary(offset));
+            }
+        }
+
+        /// `offset_clamped` exists precisely so a caller never has to handle
+        /// a failed lookup: it must not panic, and whatever it returns must
+        /// be a valid, in-bounds char boundary, however far outside the
+        /// document the requested position lies.
+        #[test]
+        fn offset_clamped_never_panics_and_stays_in_bounds(
+            text in text_strategy(),
+            line in 0u32..10_000,
+            character in 0u32..10_000,
+        ) {
+            let index = LineIndex::new(&text);
+            let offset = index.offset_clamped(Position::new(line, character));
+            prop_assert!(offset <= text.len());
+            prop_assert!(text.is_char_boundary(offset));
+        }
+
+        /// The line component of a position is defined as a count of
+        /// newlines, so `position_at` had better agree with counting them
+        /// directly — otherwise `line_starts` and the newline scan it was
+        /// built from have drifted apart.
+        #[test]
+        fn position_at_line_counts_preceding_newlines(text in text_strategy()) {
+            let index = LineIndex::new(&text);
+            for o in char_boundaries(&text) {
+                let newlines_before = text.as_bytes()[..o].iter().filter(|&&b| b == b'\n').count();
+                prop_assert_eq!(index.position_at(o).line as usize, newlines_before);
+            }
+        }
+    }
+}

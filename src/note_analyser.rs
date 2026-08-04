@@ -911,6 +911,7 @@ fn is_non_note_context(context: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn run(src: &str) -> NoteAnalysis {
         let mut parser = tree_sitter::Parser::new();
@@ -1614,5 +1615,91 @@ mod tests {
             "expected no diagnostics in the broken region, got {:?}",
             analysis.problems
         );
+    }
+
+    /// A duration to write on a note, rendered via [`Duration`]'s own
+    /// `Display` impl so the generated source and the value under test are
+    /// derived the same way, never hand-duplicated. `log` is kept to
+    /// `0..=6` (whole down to 64th) so it renders as a plain power-of-two
+    /// digit the grammar reads back as the same log, rather than one of the
+    /// `\breve`/`\longa`/`\maxima` words the parser doesn't recognise (see
+    /// the module docs).
+    fn duration_strategy() -> impl Strategy<Value = Duration> {
+        (0i32..=6, 0u8..=2, 1u32..=9, 1u32..=9).prop_map(|(log, dots, n, d)| Duration {
+            log,
+            dots,
+            factor: (n, d),
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Every event's resolved duration is the last duration explicitly
+        /// written before it, dots and multiplier included, or
+        /// `Duration::DEFAULT` if none has been written yet at all —
+        /// [`duration_is_inherited`], [`dots_and_default_duration`] and
+        /// [`multiplier_is_part_of_inherited_duration`] above each sample one
+        /// facet of this single rule.
+        #[test]
+        fn duration_is_the_last_one_written_or_the_default(
+            specs in prop::collection::vec(prop::option::of(duration_strategy()), 1..8),
+        ) {
+            let mut src = String::from("{ ");
+            let mut expected = Vec::with_capacity(specs.len());
+            let mut last = Duration::DEFAULT;
+            for spec in &specs {
+                src.push('c');
+                match spec {
+                    Some(duration) => {
+                        src.push_str(&duration.to_string());
+                        last = *duration;
+                        expected.push((last, true));
+                    }
+                    None => expected.push((last, false)),
+                }
+                src.push(' ');
+            }
+            src.push('}');
+
+            let analysis = run(&src);
+            prop_assert_eq!(analysis.events.len(), expected.len());
+            for (event, &(duration, written)) in analysis.events.iter().zip(&expected) {
+                prop_assert_eq!(event.duration, duration);
+                prop_assert_eq!(event.duration_written, written);
+            }
+        }
+
+        /// In `\relative` mode, a note written with no octave marks resolves
+        /// to whichever octave puts it nearest the previous resolved pitch —
+        /// [`relative_nearest_octave`], [`relative_with_marks_shifts_octave`]
+        /// and [`relative_with_no_reference_defaults_to_middle_c`] above each
+        /// pin one instance of it. "Nearest" bounds the diatonic distance
+        /// between consecutive pitches to at most half an octave (3 diatonic
+        /// steps out of 7), which is what this checks directly rather than
+        /// re-deriving the expected pitch with the production code's own
+        /// [`relative_octave`] and asserting a tautology against it.
+        #[test]
+        fn a_bare_note_resolves_to_the_octave_nearest_the_previous_pitch(
+            names in prop::collection::vec(prop::sample::select(&["c", "d", "e", "f", "g", "a", "b"][..]), 2..8),
+        ) {
+            let src = format!("\\relative c' {{ {} }}", names.join(" "));
+            let analysis = run(&src);
+            let resolved = pitches(&analysis);
+            prop_assert_eq!(resolved.len(), names.len());
+
+            for window in resolved.windows(2) {
+                let (name0, octave0) = window[0];
+                let (name1, octave1) = window[1];
+                let steps0 = name0 as i32 + octave0 * 7;
+                let steps1 = name1 as i32 + octave1 * 7;
+                prop_assert!(
+                    (steps1 - steps0).abs() <= 3,
+                    "consecutive pitches {:?} and {:?} are more than a half-octave apart",
+                    window[0],
+                    window[1]
+                );
+            }
+        }
     }
 }

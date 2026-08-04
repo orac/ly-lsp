@@ -253,6 +253,7 @@ impl Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// A bare rest event spanning `start..end`, for exercising [`Events`].
     fn rest(start: usize, end: usize) -> Event {
@@ -272,7 +273,11 @@ mod tests {
 
     #[test]
     fn events_at_finds_the_containing_event() {
-        // Three events with gaps: [0,2), [4,6), [8,10).
+        // Three events with gaps: [0,2), [4,6), [8,10). Kept as a literal
+        // regression anchor alongside the property test below: it documents
+        // the half-open-span edge cases (the boundary at 2, the gap at 3) in
+        // one readable place rather than relying on shrinking to rediscover
+        // them.
         let events = Events::new(vec![rest(0, 2), rest(4, 6), rest(8, 10)]);
         assert_eq!(events.at(0).map(|e| e.span.start), Some(0));
         assert_eq!(events.at(1).map(|e| e.span.start), Some(0));
@@ -284,6 +289,9 @@ mod tests {
 
     #[test]
     fn events_overlapping_returns_the_touched_run() {
+        // Kept alongside the property test below for the same reason as
+        // `events_at_finds_the_containing_event`: it pins the specific
+        // boundary-touching cases in the contract's prose.
         let events = Events::new(vec![rest(0, 2), rest(4, 6), rest(8, 10)]);
         // A range falling entirely in a gap touches nothing.
         assert!(events.overlapping(2, 4).is_empty());
@@ -295,8 +303,86 @@ mod tests {
         assert_eq!(events.overlapping(0, 10).len(), 3);
     }
 
+    /// A naive linear scan for the event containing `offset`, obviously
+    /// correct by inspection, to check `Events::at`'s binary search against.
+    fn at_naive(events: &[Event], offset: usize) -> Option<&Event> {
+        events.iter().find(|e| e.span.contains(offset))
+    }
+
+    /// A naive linear scan for the events overlapping `start..end`, to check
+    /// `Events::overlapping`'s binary search against.
+    fn overlapping_naive(events: &[Event], start: usize, end: usize) -> Vec<(usize, usize)> {
+        events
+            .iter()
+            .filter(|e| e.span.start < end && start < e.span.end)
+            .map(|e| (e.span.start, e.span.end))
+            .collect()
+    }
+
+    /// Builds disjoint, ascending spans from a list of `(gap, length)` pairs,
+    /// each accumulated onto the previous end — the shape `Events::new`
+    /// requires — and wraps them as rest events.
+    fn events_from_gaps(gaps: Vec<(usize, usize)>) -> Events {
+        let mut cursor = 0;
+        let events = gaps
+            .into_iter()
+            .map(|(gap, length)| {
+                let start = cursor + gap;
+                let end = start + length.max(1);
+                cursor = end;
+                rest(start, end)
+            })
+            .collect();
+        Events::new(events)
+    }
+
+    proptest! {
+        /// `Events::at` binary-searches for the containing event; a linear
+        /// scan is obviously correct, so the two must always agree, for any
+        /// arrangement of disjoint spans and any query offset.
+        #[test]
+        fn events_at_agrees_with_a_linear_scan(
+            gaps in prop::collection::vec((0usize..5, 1usize..5), 0..20),
+            offset in 0usize..200,
+        ) {
+            let events = events_from_gaps(gaps);
+            let want = at_naive(&events, offset).map(|e| (e.span.start, e.span.end));
+            let got = events.at(offset).map(|e| (e.span.start, e.span.end));
+            prop_assert_eq!(got, want);
+        }
+
+        /// `Events::overlapping` binary-searches too; check it against the
+        /// same kind of linear-scan oracle, and check the documented part of
+        /// its contract that the result is always a contiguous run of the
+        /// underlying event list (not just the right *set* of events).
+        #[test]
+        fn events_overlapping_agrees_with_a_linear_scan_and_stays_contiguous(
+            gaps in prop::collection::vec((0usize..5, 1usize..5), 0..20),
+            a in 0usize..200,
+            b in 0usize..200,
+        ) {
+            let events = events_from_gaps(gaps);
+            let (start, end) = (a.min(b), a.max(b));
+            let want = overlapping_naive(&events, start, end);
+            let got = events.overlapping(start, end);
+            prop_assert_eq!(spans(got), want);
+
+            // Contiguity: the returned slice, if non-empty, must be exactly
+            // one run of the source events, identifiable by matching spans
+            // of its first and last element back into the full list.
+            if let (Some(first), Some(last)) = (got.first(), got.last()) {
+                let lo = events.iter().position(|e| e.span == first.span).unwrap();
+                let hi = events.iter().position(|e| e.span == last.span).unwrap();
+                prop_assert_eq!(hi - lo + 1, got.len());
+            }
+        }
+    }
+
     #[test]
     fn duration_display_matches_lilypond() {
+        // Kept as a literal pin of LilyPond's own notation for each duration
+        // shape, alongside the property test below that covers the general
+        // structure.
         assert_eq!(
             Duration {
                 log: 2,
@@ -333,5 +419,30 @@ mod tests {
             .to_string(),
             "\\breve"
         );
+    }
+
+    proptest! {
+        /// Whatever the log, dots and factor, the rendered duration must be
+        /// non-empty, carry exactly as many trailing dots as `dots` says, and
+        /// carry a `*` multiplier if and only if the factor isn't the
+        /// implicit `(1, 1)` — the structural shape the four pinned examples
+        /// above are each instances of.
+        #[test]
+        fn duration_display_has_the_right_dots_and_star(
+            log in -3i32..=6,
+            dots in 0u8..=3,
+            n in 1u32..=9,
+            d in 1u32..=9,
+        ) {
+            let duration = Duration { log, dots, factor: (n, d) };
+            let rendered = duration.to_string();
+            prop_assert!(!rendered.is_empty());
+
+            let dot_count = rendered.chars().filter(|&c| c == '.').count();
+            prop_assert_eq!(dot_count, dots as usize);
+
+            let has_star = rendered.contains('*');
+            prop_assert_eq!(has_star, (n, d) != (1, 1));
+        }
     }
 }

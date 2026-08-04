@@ -1320,7 +1320,12 @@ mod tests {
     #[test]
     fn volta_half_typed_stops_at_the_missing_body() {
         // The required `music` parameter isn't there yet: the number list is
-        // read, and consumption stops rather than yielding nothing.
+        // read, and consumption stops rather than yielding nothing. Kept as a
+        // named regression alongside the general
+        // `a_truncated_call_yields_a_prefix_of_the_complete_calls_arguments`
+        // property below: unlike the "yields no arguments at all" cases that
+        // property subsumed, this documents the specific non-empty prefix
+        // `\volta` stops at.
         let call = call("\\volta 1,2").expect("a partial volta call");
         assert_eq!(call.args.len(), 1);
         assert!(call.body().is_none());
@@ -1334,14 +1339,6 @@ mod tests {
         assert_eq!(call.args.len(), 1);
         let body = call.body().expect("a body");
         assert_eq!(&src[body.start..body.end], "{ { a } { b } }");
-    }
-
-    #[test]
-    fn alternative_half_typed_yields_no_arguments() {
-        // `\alternative` with nothing after it yet: its one required parameter
-        // fails to match, so consumption stops immediately.
-        let call = call("\\alternative").expect("a partial alternative call");
-        assert!(call.args.is_empty());
     }
 
     #[test]
@@ -1393,7 +1390,10 @@ mod tests {
     #[test]
     fn a_missing_argument_stops_consumption() {
         // Half-typed `\repeat volta` with no count or body yet: the kind is read,
-        // and the call simply has no further arguments.
+        // and the call simply has no further arguments. Kept alongside the
+        // property test below, which subsumed the family of "half-typed
+        // yields no arguments at all" cases but not this specific non-empty
+        // prefix.
         let call = call("\\repeat volta").expect("a partial repeat call");
         assert_eq!(call.args.len(), 1);
         assert!(call.body().is_none());
@@ -1448,12 +1448,6 @@ mod tests {
     }
 
     #[test]
-    fn relative_half_typed_yields_no_arguments() {
-        let call = call("\\relative").expect("a partial relative call");
-        assert!(call.args.is_empty());
-    }
-
-    #[test]
     fn fixed_reads_its_reference_pitch() {
         let call = call("\\fixed c' { c }").expect("a fixed call");
         assert!(matches!(call.args[0], Arg::Pitch { .. }));
@@ -1464,12 +1458,6 @@ mod tests {
         let call = call("\\notemode { c d }").expect("a notemode call");
         assert_eq!(call.args.len(), 1);
         assert!(matches!(call.args[0], Arg::Music { .. }));
-    }
-
-    #[test]
-    fn notemode_half_typed_yields_no_arguments() {
-        let call = call("\\notemode").expect("a partial notemode call");
-        assert!(call.args.is_empty());
     }
 
     #[test]
@@ -1514,12 +1502,6 @@ mod tests {
         let call = call("\\lyricsto { la }").expect("a lyricsto call");
         assert_eq!(call.args.len(), 1);
         assert!(matches!(call.args[0], Arg::Music { .. }));
-    }
-
-    #[test]
-    fn lyricsto_half_typed_yields_no_arguments() {
-        let call = call("\\lyricsto").expect("a partial lyricsto call");
-        assert!(call.args.is_empty());
     }
 
     #[test]
@@ -1577,12 +1559,6 @@ mod tests {
     }
 
     #[test]
-    fn clef_half_typed_yields_no_arguments() {
-        let call = call("\\clef").expect("a partial clef call");
-        assert!(call.args.is_empty());
-    }
-
-    #[test]
     fn set_reads_a_dotted_property_path() {
         let call = call("\\set Staff.instrumentName = \"x\"").expect("a set call");
         let Arg::PropertyPath { path, .. } = &call.args[0] else {
@@ -1598,12 +1574,6 @@ mod tests {
             panic!("expected a property path, got {:?}", call.args[0]);
         };
         assert_eq!(path, &["instrumentName"]);
-    }
-
-    #[test]
-    fn set_half_typed_yields_no_arguments() {
-        let call = call("\\set").expect("a partial set call");
-        assert!(call.args.is_empty());
     }
 
     #[test]
@@ -1640,7 +1610,9 @@ mod tests {
     #[test]
     fn key_half_typed_stops_at_the_missing_mode() {
         // The tonic is read; the required mode word isn't there yet, so
-        // consumption stops rather than guessing.
+        // consumption stops rather than guessing. Kept as a named regression
+        // for the specific non-empty prefix, alongside the property test
+        // below.
         let call = call("\\key g").expect("a partial key call");
         assert_eq!(call.args.len(), 1);
     }
@@ -1655,6 +1627,8 @@ mod tests {
 
     #[test]
     fn transpose_half_typed_stops_at_the_missing_body() {
+        // Kept as a named regression for this specific non-empty prefix,
+        // alongside the property test below.
         let call = call("\\transpose c d").expect("a partial transpose call");
         assert_eq!(call.args.len(), 2);
         assert!(call.body().is_none());
@@ -1690,12 +1664,6 @@ mod tests {
         let call = call("\\tempo 4 120").expect("a tempo call");
         assert_eq!(call.args.len(), 1);
         assert!(matches!(call.args[0], Arg::Count { value: 4, .. }));
-    }
-
-    #[test]
-    fn tempo_half_typed_yields_no_arguments() {
-        let call = call("\\tempo").expect("a partial tempo call");
-        assert!(call.args.is_empty());
     }
 
     /// The full [`Commands`] for `src`, nested calls and all — what
@@ -1810,5 +1778,85 @@ mod tests {
     fn call_site_none_outside_any_call() {
         let src = "c d e";
         assert!(commands(src).call_site_at(1, src).is_none());
+    }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Complete, recognised calls covering every signature shape in
+        /// [`BUILTIN`]: a bare word plus count and body (`repeat`), a number
+        /// list plus body (`volta`), an optional pitch plus body (`relative`),
+        /// a pitch plus word (`key`), two pitches plus body (`transpose`), a
+        /// string plus two counts (`tempo`), a bare-word-as-string (`clef`), a
+        /// property path (`set`), an optional string plus body (`lyricsto`)
+        /// and a bare body (`alternative`, `notemode`).
+        const COMPLETE_CALLS: &[&str] = &[
+            "\\repeat volta 2 { c }",
+            "\\volta 1,2,3 { c }",
+            "\\relative c' { c }",
+            "\\key g \\major",
+            "\\transpose c d { e }",
+            "\\tempo \"Allegro\" 4 = 120",
+            "\\clef bass",
+            "\\set Staff.instrumentName = \"x\"",
+            "\\lyricsto \"v\" { la }",
+            "\\alternative { { a } { b } }",
+            "\\notemode { c d }",
+        ];
+
+        /// The `Arg` variant an argument is, ignoring its span and decoded
+        /// value — what a truncated call's arguments are compared against the
+        /// complete call's on, since truncating necessarily changes spans
+        /// (and can change a `NumberList`'s or `Music` block's contents too).
+        fn kind(arg: &Arg) -> std::mem::Discriminant<Arg> {
+            std::mem::discriminant(arg)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// For any complete call and any truncation of it, parsing must
+            /// not panic, and the truncated call's arguments — compared kind
+            /// by kind — must be a prefix of the complete call's. This is the
+            /// real invariant the dozen near-identical `..._half_typed_...`
+            /// tests this replaced each sampled one instance of: a half-typed
+            /// call stops consuming rather than inventing or misreading an
+            /// argument.
+            #[test]
+            fn a_truncated_call_yields_a_prefix_of_the_complete_calls_arguments(
+                index in 0..COMPLETE_CALLS.len(),
+                fraction in 0.0f64..=1.0,
+            ) {
+                let full_src = COMPLETE_CALLS[index];
+                let full = call(full_src).expect("the table only holds complete, recognised calls");
+                let full_kinds: Vec<_> = full.args.iter().map(kind).collect();
+
+                let cut = (fraction * full_src.len() as f64).round() as usize;
+                let truncated_src = &full_src[..cut];
+                let truncated = call(truncated_src);
+                let truncated_kinds: Vec<_> = truncated
+                    .as_ref()
+                    .map(|c| c.args.iter().map(kind).collect())
+                    .unwrap_or_default();
+
+                prop_assert!(
+                    full_kinds.starts_with(&truncated_kinds[..]),
+                    "truncating {full_src:?} to {truncated_src:?} gave args of kinds {truncated_kinds:?}, not a prefix of the complete call's {full_kinds:?}",
+                );
+
+                // Truncating all the way down to the bare keyword — nothing
+                // typed of the arguments yet — yields no arguments at all.
+                let keyword_len = full_src.find(' ').unwrap_or(full_src.len());
+                let bare = call(&full_src[..keyword_len]);
+                let bare_is_empty = bare.as_ref().is_none_or(|c| c.args.is_empty());
+                prop_assert!(
+                    bare_is_empty,
+                    "the bare keyword {:?} yielded arguments",
+                    &full_src[..keyword_len],
+                );
+            }
+        }
     }
 }

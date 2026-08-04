@@ -447,6 +447,7 @@ mod tests {
     use crate::command::definition;
     use crate::document;
     use crate::vocabulary::Layer;
+    use proptest::prelude::*;
 
     /// Reads `src` as the server would.
     fn bindings(src: &str) -> Vec<Binding> {
@@ -720,6 +721,9 @@ dimin = #(define-music-function (parser location note) (ly:music?) #{ \\tweak No
 
     #[test]
     fn texinfo_markup_becomes_markdown() {
+        // Kept as a literal pin of the specific conversions alongside the
+        // property tests below, which cover the general shape rather than
+        // these exact examples.
         assert_eq!(texinfo_to_markdown("plain text"), "plain text");
         assert_eq!(texinfo_to_markdown("@var{x} and @code{y}"), "*x* and `y`");
         assert_eq!(
@@ -730,5 +734,60 @@ dimin = #(define-music-function (parser location note) (ly:music?) #{ \\tweak No
         assert_eq!(texinfo_to_markdown("100@@ @{braced@}"), "100@ {braced}");
         // Unbalanced braces leave the text as it is rather than swallowing it.
         assert_eq!(texinfo_to_markdown("@code{oops"), "code{oops");
+    }
+
+    /// Text with no `@` and no braces at all, the alphabet `texinfo_to_markdown`
+    /// has nothing to act on.
+    fn plain_text_strategy() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9 ,.!?]{0,15}"
+    }
+
+    /// A mix of `@`, `{`, `}` and letters, dense enough to throw up real
+    /// markup commands, escapes, and unbalanced or nested braces at random.
+    fn markup_strategy() -> impl Strategy<Value = String> {
+        "[@{}a-zA-Z]{0,30}"
+    }
+
+    proptest! {
+        /// A docstring is workspace-authored text handed to us over LSP: no
+        /// arrangement of `@`, `{` and `}` a user could type may crash the
+        /// server, however malformed as Texinfo it is.
+        #[test]
+        fn texinfo_to_markdown_never_panics(text in markup_strategy()) {
+            let _ = texinfo_to_markdown(&text);
+        }
+
+        /// With no `@` and no braces there is no markup to find, so the
+        /// converter must be the identity — the base case the escape and
+        /// command-handling branches all fall back to.
+        #[test]
+        fn texinfo_to_markdown_is_identity_without_markup(text in plain_text_strategy()) {
+            prop_assert_eq!(texinfo_to_markdown(&text), text);
+        }
+
+        /// `@@`, `@{` and `@}` are Texinfo's escapes for the three characters
+        /// it otherwise reserves; wrapping plain text around each escape
+        /// must unescape to exactly that character and nothing else.
+        #[test]
+        fn escapes_decode_to_the_reserved_character(t in plain_text_strategy()) {
+            prop_assert_eq!(texinfo_to_markdown(&format!("{t}@@{t}")), format!("{t}@{t}"));
+            prop_assert_eq!(texinfo_to_markdown(&format!("{t}@{{{t}")), format!("{t}{{{t}"));
+            prop_assert_eq!(texinfo_to_markdown(&format!("{t}@}}{t}")), format!("{t}}}{t}"));
+        }
+
+        /// A recognised `@command{...}` is always rewritten to its Markdown
+        /// equivalent, so the literal Texinfo form must never survive into
+        /// the output — *except* where the `@` itself was reintroduced by an
+        /// `@@` escape rather than written as a command, which is excluded
+        /// here since it is a different (and correctly handled) case.
+        #[test]
+        fn no_recognised_markup_command_survives(text in markup_strategy()) {
+            prop_assume!(!text.contains("@@"));
+            let markdown = texinfo_to_markdown(&text);
+            let survived = ["@var{", "@code{", "@bold{"]
+                .into_iter()
+                .find(|marker| markdown.contains(marker));
+            prop_assert_eq!(survived, None);
+        }
     }
 }
