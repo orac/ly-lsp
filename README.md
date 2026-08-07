@@ -12,10 +12,6 @@ The refactorings and quick fixes (extract-to-variable and friends) follow a two-
 
 ## Testing
 
-Run all tests with `cargo test`.
+Run all tests with `cargo test`. They read a real LilyPond installation rather than copies of its files checked into this repository, so one has to be installed; the tests then run against every version they find.
 
-The extract-to-variable refactoring has its own file-based test suite in `tests/extract/`. Each `.extract` file contains one or more cases: annotated LilyPond source (with a `^` underline marking the selection, like vscode-tmgrammar-test) followed by the expected document after the refactoring is applied. See [`tests/extract/FORMAT.md`](tests/extract/FORMAT.md) for the full format, how to write a new case, and how to diagnose a failure.
-
-The inline-variable refactoring (the inverse) has a parallel suite in `tests/inline/`, where a `^here`/`^all` caret marks the cursor and the action to run; see [`tests/inline/FORMAT.md`](tests/inline/FORMAT.md). On top of that, `tests/extract.rs` drives every extract case through extract *then* inline and checks the resolved music is unchanged, exercising the two as inverses.
-
-The make-explicit refactorings (make durations explicit, make pitches explicit, and both) share a third suite in `tests/explicit/`, where each case pairs one selection with the output of all three actions (`--- dur`/`--- pitch`/`--- both`); see [`tests/explicit/FORMAT.md`](tests/explicit/FORMAT.md).
+[`TESTING.md`](TESTING.md) covers how an installation is found, how to install another version to test against, and the file-based case formats the refactorings use.

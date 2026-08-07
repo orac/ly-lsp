@@ -11,14 +11,24 @@ env:
 
 jobs:
   build:
-    name: Build and test (${{ matrix.os }})
+    name: Build and test (${{ matrix.os }}, LilyPond ${{ matrix.lilypond }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # Every version we support gets its own run, because what the tests read out of an installation changes between versions. Add one here to start testing against it.
+        lilypond: ['2.24.3']
+    env:
+      # Relative to the workspace, so the same value works in bash, in Rust and on every runner without any path conversion.
+      LILYPOND_TEST_INSTALL_DIR: .lilypond-installs
     steps:
       - uses: actions/checkout@v5
+
+      # The tests read files out of a real installation rather than copies checked into the repository, so CI has to supply one.
+      - name: Install LilyPond ${{ matrix.lilypond }}
+        shell: bash
+        run: scripts/install-lilypond.sh '${{ matrix.lilypond }}' > /dev/null
 
       - uses: dtolnay/rust-toolchain@stable
 
