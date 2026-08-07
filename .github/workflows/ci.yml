@@ -28,7 +28,7 @@ jobs:
       # The tests read files out of a real installation rather than copies checked into the repository, so CI has to supply one.
       - name: Install LilyPond ${{ matrix.lilypond }}
         shell: bash
-        run: scripts/install-lilypond.sh '${{ matrix.lilypond }}' > /dev/null
+        run: bash scripts/install-lilypond.sh '${{ matrix.lilypond }}' > /dev/null
 
       - uses: dtolnay/rust-toolchain@stable
 
