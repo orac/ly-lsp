@@ -185,6 +185,7 @@ Measured (via `examples/install_timing.rs`, release build): LilyPond 2.24.3 on W
 - **Markup commands**, the ~173 `define-markup-command`s in `scm/lily/define-markup-commands.scm` plus a few smaller files. Worth having — they are what a user is typing when they are inside `\markup` — but they need a reading path this design doesn't have: a `.scm` file is a sequence of top-level Scheme forms with no LilyPond around them, so the LilyPond grammar can't be pointed at one as it stands. Wrapping the file in `#(begin … )` and teaching `scheme.rs` to descend through a `begin` is the cheap route. The definition form's own shape is friendly: `(define-markup-command (bold layout props arg) (markup?) …)` puts the name first in the argument list, and the right-alignment rule already in place drops `layout` and `props` for free.
 - **Go-to-definition into the install**, which needs a definition that carries a file as well as a span.
 - **Hover rendering a variable's value**, which is what `command_assist::hover` currently declines to do.
+- **Documentation from the published manual**, to put a section of the Notation Reference behind a command that has no docstring, or a fuller answer behind one that has. It can't come from the install, which ships no documentation at all, so it needs a fetch-and-cache of its own: [`manual-hover.md`](manual-hover.md).
 
 ### What the words file still knows that we don't
 
