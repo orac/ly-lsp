@@ -33,21 +33,21 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // The client tells us where LilyPond's `lilypond-words` file lives so we
-        // can recognise built-in commands; without it, undefined-reference
-        // diagnostics stay off.
+        // The client tells us where LilyPond's version-specific share
+        // directory lives so we can recognise built-in commands; without it,
+        // undefined-reference diagnostics stay off.
         let options = params.initialization_options;
 
         if let Some(path) = options
             .as_ref()
-            .and_then(|opts| opts.get("lilypondWordsPath"))
+            .and_then(|opts| opts.get("lilypondShareDir"))
             .and_then(|value| value.as_str())
             && !self.documents.load_vocabulary(Path::new(path))
         {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!("could not load LilyPond words from {path}"),
+                    format!("could not load LilyPond's vocabulary from {path}"),
                 )
                 .await;
         }

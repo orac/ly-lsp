@@ -53,7 +53,7 @@ fn durations(analysis: &NoteAnalysis) -> Vec<(i32, u8)> {
 /// tests use.
 fn assert_same_events(with: &str, without: &str) {
     for lily in require_installs() {
-        let base = vocabulary::workspace_base(&lily.words_file())
+        let base = vocabulary::workspace_base(&lily.share_dir())
             .unwrap_or_else(|| panic!("LilyPond {}: words file didn't load", lily.version));
         let scope = base.for_document(&[]);
 

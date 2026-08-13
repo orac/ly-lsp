@@ -15,7 +15,7 @@
 //! of that section's "Order of work", not built here.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::command::Command;
@@ -98,38 +98,9 @@ pub fn load(ly_dir: &Path) -> Layer {
     Layer::new(commands)
 }
 
-/// The `ly` directory of the installation whose `lilypond-words` file is at
-/// `words_path`.
-///
-/// The client passes `lilypondWordsPath` as `<share>/vim/syntax/lilypond-words`
-/// at `initialize`, and `ly` is a sibling of `vim` under that same `<share>`
-/// directory — `words_path`'s third ancestor. `None` if `words_path` isn't
-/// nested that deep, which a well-formed words path always is.
-pub fn ly_dir(words_path: &Path) -> Option<PathBuf> {
-    Some(words_path.ancestors().nth(3)?.join("ly"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ly_dir_is_the_third_ancestor_joined_with_ly() {
-        let words =
-            Path::new("/opt/lilypond-2.24.3/share/lilypond/2.24.3/vim/syntax/lilypond-words");
-        assert_eq!(
-            ly_dir(words),
-            Some(PathBuf::from(
-                "/opt/lilypond-2.24.3/share/lilypond/2.24.3/ly"
-            ))
-        );
-    }
-
-    #[test]
-    fn ly_dir_is_none_for_a_path_too_shallow_to_have_one() {
-        assert_eq!(ly_dir(Path::new("lilypond-words")), None);
-        assert_eq!(ly_dir(Path::new("syntax/lilypond-words")), None);
-    }
 
     #[test]
     fn a_missing_directory_yields_an_empty_layer_rather_than_failing() {

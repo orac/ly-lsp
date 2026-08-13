@@ -159,7 +159,7 @@ Writing the closure out rather than following the `\include`s is the point: it l
 
 ### Finding the install
 
-The client already passes `lilypondWordsPath` at `initialize`, pointing at `<share>/lilypond/<version>/vim/syntax/lilypond-words`. The `ly` directory is that path's third ancestor plus `ly`, so this needs no change to the client or the protocol. If a future client wants to point the server at a share directory directly, that is an additive option, not a replacement.
+The client passes `lilypondShareDir` at `initialize`, pointing at `<share>/lilypond/<version>` — the directory whose children include `ly/` and `vim/syntax/`. Both the words file and the `ly` directory are found by joining onto it directly.
 
 ### How they're read
 

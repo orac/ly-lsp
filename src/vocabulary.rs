@@ -234,17 +234,22 @@ impl std::fmt::Debug for Scope {
 /// LilyPond's `lilypond-words` file lists at the bottom, the definitions read
 /// out of the same installation over them, and our curated signatures on top.
 ///
+/// `share_dir` is LilyPond's version-specific share directory — the one
+/// whose children include `vim/syntax/lilypond-words` and `ly/` — as passed
+/// by the client at `initialize`, so both are found by joining onto it
+/// directly rather than working back up from either.
+///
 /// Returns `None` if the words file can't be read, so the caller can leave
 /// undefined-reference diagnostics switched off rather than flag everything.
 /// The install layer is a lesser concern: if its directory can't be found or
 /// read, the base still loads with an empty install layer — see
 /// [`install::load`](crate::install::load).
-pub fn workspace_base(words_path: &Path) -> Option<Scope> {
+pub fn workspace_base(share_dir: &Path) -> Option<Scope> {
+    let words_path = share_dir.join("vim").join("syntax").join("lilypond-words");
     let text = std::fs::read_to_string(words_path).ok()?;
-    let mut base = Scope::EMPTY.extended_with(Arc::new(words_layer(&text)));
-    if let Some(ly_dir) = crate::install::ly_dir(words_path) {
-        base = base.extended_with(Arc::new(crate::install::load(&ly_dir)));
-    }
+    let base = Scope::EMPTY
+        .extended_with(Arc::new(words_layer(&text)))
+        .extended_with(Arc::new(crate::install::load(&share_dir.join("ly"))));
     Some(base.extended_with(Arc::clone(&command::CURATED)))
 }
 

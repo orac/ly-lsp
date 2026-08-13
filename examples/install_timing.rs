@@ -4,7 +4,7 @@
 //! before reaching for anything more complex than doing this synchronously.
 //!
 //! ```text
-//! cargo run --release --example install_timing -- "<share>/vim/syntax/lilypond-words"
+//! cargo run --release --example install_timing -- "<share>/lilypond/<version>"
 //! ```
 
 use std::time::Instant;
@@ -14,12 +14,13 @@ use ly_lsp::{install, vocabulary};
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| panic!("usage: install_timing <path to lilypond-words>"));
+        .unwrap_or_else(|| panic!("usage: install_timing <path to share/lilypond/<version>>"));
 
-    let words = std::path::Path::new(&path);
+    let share_dir = std::path::Path::new(&path);
 
     let start = Instant::now();
-    let base = vocabulary::workspace_base(words).unwrap_or_else(|| panic!("could not load {path}"));
+    let base =
+        vocabulary::workspace_base(share_dir).unwrap_or_else(|| panic!("could not load {path}"));
     let elapsed = start.elapsed();
 
     println!("loaded in {elapsed:?}");
@@ -29,6 +30,6 @@ fn main() {
     }
     println!(
         "install layer alone defines {} commands",
-        install::ly_dir(words).map_or(0, |dir| install::load(&dir).len())
+        install::load(&share_dir.join("ly")).len()
     );
 }

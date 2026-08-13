@@ -71,13 +71,15 @@ impl DocumentGraph {
         }
     }
 
-    /// Loads the command vocabulary from LilyPond's `lilypond-words` file.
+    /// Loads the command vocabulary from a LilyPond installation's
+    /// version-specific share directory (the one holding `ly/` and
+    /// `vim/syntax/`).
     ///
     /// Returns whether loading succeeded. On any failure (missing file, read
     /// error) the vocabulary stays unset and undefined-reference diagnostics
     /// remain off, so we never flag every command as undefined.
-    pub fn load_vocabulary(&self, path: &Path) -> bool {
-        match vocabulary::workspace_base(path) {
+    pub fn load_vocabulary(&self, share_dir: &Path) -> bool {
+        match vocabulary::workspace_base(share_dir) {
             Some(base) => self.base.set(base).is_ok(),
             None => false,
         }

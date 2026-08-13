@@ -43,7 +43,7 @@ fn every_listed_file_exists_in_every_install() {
 #[test]
 fn the_layer_defines_the_documented_handful() {
     for lily in require_installs() {
-        let base = vocabulary::workspace_base(&lily.words_file())
+        let base = vocabulary::workspace_base(&lily.share_dir())
             .unwrap_or_else(|| panic!("LilyPond {}: words file didn't load", lily.version));
         let scope = base.for_document(&[]);
 
@@ -76,7 +76,7 @@ fn the_layer_defines_the_documented_handful() {
 #[test]
 fn a_documented_music_function_carries_its_docstring_and_signature() {
     for lily in require_installs() {
-        let base = vocabulary::workspace_base(&lily.words_file())
+        let base = vocabulary::workspace_base(&lily.share_dir())
             .unwrap_or_else(|| panic!("LilyPond {}: words file didn't load", lily.version));
         let scope = base.for_document(&[]);
 
@@ -108,9 +108,7 @@ fn a_documented_music_function_carries_its_docstring_and_signature() {
 #[test]
 fn the_install_layer_clears_a_sensible_lower_bound() {
     for lily in require_installs() {
-        let ly_dir = install::ly_dir(&lily.words_file())
-            .unwrap_or_else(|| panic!("LilyPond {}: no ly directory", lily.version));
-        let layer = install::load(&ly_dir);
+        let layer = install::load(&lily.share_dir().join("ly"));
         assert!(
             layer.len() >= 300,
             "LilyPond {}: only {} commands in the install layer, expected several hundred",
@@ -133,9 +131,7 @@ fn the_install_layer_clears_a_sensible_lower_bound() {
 #[test]
 fn the_hand_written_layers_split_on_what_the_install_defines() {
     for lily in require_installs() {
-        let ly_dir = install::ly_dir(&lily.words_file())
-            .unwrap_or_else(|| panic!("LilyPond {}: no ly directory", lily.version));
-        let layer = install::load(&ly_dir);
+        let layer = install::load(&lily.share_dir().join("ly"));
 
         for name in command::CURATED.names() {
             assert!(
