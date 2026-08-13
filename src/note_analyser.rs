@@ -149,7 +149,7 @@ struct Analyser<'a> {
     /// The commands visible from this document, consulted for every `\word`
     /// the walk meets. Borrowed for the walk rather than owned: a scope stacks
     /// layers shared with every other document that can see the same files.
-    scope: &'a Scope<'a>,
+    scope: &'a Scope,
     events: Vec<Event>,
     problems: Vec<Problem>,
     /// Structured command invocations recognised by the shared command parser, in source order (preorder, so a `\repeat` precedes the `\volta`s nested in its body).
@@ -925,7 +925,7 @@ mod tests {
         let defined = std::sync::Arc::new(crate::command::definition::layer(
             crate::command::scheme::read(&tree, src),
         ));
-        analyse(&tree, src, &Scope::new(None, vec![defined]))
+        analyse(&tree, src, &Scope::builtins().for_document(&[defined]))
     }
 
     /// The resolved pitches of every `Note` event, as `(note_name, octave)`.

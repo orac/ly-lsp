@@ -1,7 +1,5 @@
 //! `\tempo`, in each of its three written forms.
 
-use crate::command::curated;
-
 use super::static_command::{StaticCommand, static_command};
 use super::{Arg, ArgKind, ArgReader, Candidate, Command, MusicContext, Param};
 
@@ -58,14 +56,18 @@ impl Command for TempoCommand {
     }
 }
 
-/// Builds the `\tempo` entry for [`BUILTIN`](super::BUILTIN).
+/// Builds the `\tempo` entry for [`RESERVED`](super::RESERVED).
 pub(super) fn command() -> TempoCommand {
     TempoCommand {
         base: static_command(
             "tempo",
             TEMPO_PARAMS,
             MusicContext::Inherit,
-            curated("Sets the tempo. `\\tempo \"Allegro\" 4=120` Either argument may be omitted."),
+            Some(super::Documentation {
+                markdown:
+                    "Sets the tempo. `\\tempo \"Allegro\" 4=120` Either argument may be omitted."
+                        .to_string(),
+            }),
             &[],
         ),
     }

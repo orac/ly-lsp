@@ -560,18 +560,28 @@ fn merge_bindings(tree: &Tree, src: &str, assignments: &[Symbol]) -> Vec<Binding
     bindings
 }
 
-/// The scope a file makes on its own: the builtins, plus whatever it defines
-/// itself. Stacked the same way [`DocumentGraph::scope_for`](crate::document_graph::DocumentGraph)
-/// stacks it — the document's own layer first, empty layers left out — so a
-/// document with no includes fingerprints identically either way and is never
-/// re-analysed for the sake of it.
-fn own_scope(defined: &Arc<Layer>) -> Scope<'static> {
-    let layers = if defined.is_empty() {
-        Vec::new()
-    } else {
-        vec![Arc::clone(defined)]
-    };
-    Scope::new(None, layers)
+/// Parses `src` fresh and reads everything it binds, from both readers, in
+/// source order — the same merge [`from_parts`](Document::from_parts) folds
+/// into a `Document`'s layer, but usable without building a whole `Document`
+/// (and without running note analysis over source that will never be
+/// queried for notes).
+///
+/// [`crate::install`] is the reason this exists: LilyPond's own
+/// initialisation files are ordinary `.ly` files as far as either reader is
+/// concerned, so reading them for the commands they bind needs nothing a
+/// `Document` does beyond this.
+pub(crate) fn parse_bindings(src: &str) -> Vec<Binding> {
+    let tree = parse(src, None);
+    let analysis = extract(&tree, src);
+    merge_bindings(&tree, src, &analysis.definitions)
+}
+
+/// The scope a file makes on its own: the hand-written layers, plus whatever
+/// it defines itself. Assembled by the same [`Scope::for_document`] the graph
+/// uses, so a document with no includes fingerprints identically either way
+/// and is never re-analysed for the sake of it.
+fn own_scope(defined: &Arc<Layer>) -> Scope {
+    Scope::builtins().for_document(std::slice::from_ref(defined))
 }
 
 /// Parses `src`, reusing `old_tree` for incremental reparsing when supplied.

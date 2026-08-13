@@ -1,6 +1,6 @@
 //! `\relative [pitch] { … }`.
 
-use super::static_command::{StaticCommand, curated, static_command};
+use super::static_command::{StaticCommand, static_command};
 use super::{Arg, Candidate, Command, CommandCall, MusicContext, Param, REFERENCE_PITCH_PARAMS};
 use crate::notes::Pitch;
 
@@ -53,18 +53,19 @@ impl Command for RelativeCommand {
     }
 }
 
-/// Builds the `\relative` entry for [`BUILTIN`](super::BUILTIN).
+/// Builds the `\relative` entry for [`CURATED`](super::CURATED).
 pub(super) fn command() -> RelativeCommand {
     RelativeCommand {
         base: static_command(
             "relative",
             REFERENCE_PITCH_PARAMS,
             MusicContext::Inherit,
-            curated(
-                "Reads `music` with octaves written relative to the previous note: each \
+            Some(super::Documentation {
+                markdown: "Reads `music` with octaves written relative to the previous note: each \
                  note is placed in the octave closest to the one before it, starting from \
-                 `reference` (middle C if omitted).",
-            ),
+                 `reference` (middle C if omitted)."
+                    .to_string(),
+            }),
             &[],
         ),
     }

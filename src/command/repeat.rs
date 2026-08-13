@@ -2,7 +2,7 @@
 
 use tower_lsp::lsp_types::Diagnostic;
 
-use super::static_command::{StaticCommand, curated, static_command};
+use super::static_command::{StaticCommand, static_command};
 use super::{Arg, ArgKind, Candidate, CheckContext, Command, CommandCall, MusicContext, Param};
 
 static REPEAT_PARAMS: &[Param] = &[
@@ -98,21 +98,22 @@ impl Command for RepeatCommand {
     }
 }
 
-/// Builds the `\repeat` entry for [`BUILTIN`](super::BUILTIN).
+/// Builds the `\repeat` entry for [`RESERVED`](super::RESERVED).
 pub(super) fn command() -> RepeatCommand {
     RepeatCommand {
         base: static_command(
             "repeat",
             REPEAT_PARAMS,
             MusicContext::Inherit,
-            curated(
-                "Repeats `music` `count` times, using `kind` to say how: `volta` for \
+            Some(super::Documentation {
+                markdown: "Repeats `music` `count` times, using `kind` to say how: `volta` for \
                  numbered alternate endings (with a following `\\alternative` supplying \
                  them), `unfold` to write the repeat out in full, `percent` for a percent \
                  (simile) repeat sign, `tremolo` for a tremolo repeat, or `segno` for a \
                  volta-shaped repeat marked with segno/coda signs and D.S./D.C. markup \
-                 instead of numbered brackets.",
-            ),
+                 instead of numbered brackets."
+                    .to_string(),
+            }),
             REPEAT_COMPLETIONS,
         ),
     }

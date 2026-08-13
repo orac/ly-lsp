@@ -6,7 +6,7 @@ use super::{Candidate, Command, CommandCall, Documentation, MusicContext, Param}
 /// establishes one, set a fixed [`MusicContext`] for its body — every
 /// hand-written command except `\relative`, `\fixed` (whose context depends on
 /// the pitch they themselves parse) and `\tempo` (whose shape isn't a plain
-/// parameter list). One instance per row of [`STATIC_ROWS`](super::STATIC_ROWS)'s
+/// parameter list). One instance per row of the hand-written tables'
 /// table, plus one `base` inside each bespoke wrapper in this module's sibling
 /// files; `\chordmode` and its alias `\chords` are two separate instances
 /// sharing the same `params`/`context` but each reporting its own `name`.
@@ -20,7 +20,7 @@ pub(super) struct StaticCommand {
     /// what it was itself found in).
     pub(super) context: MusicContext,
     /// Curated hover prose, where we have any worth showing. `None` for the
-    /// majority of rows in [`STATIC_ROWS`](super::STATIC_ROWS)'s table, which say
+    /// majority of rows in the hand-written tables, which say
     /// nothing beyond their signature — padding every mode-switch and
     /// header-block command with a restatement of its own name would cost
     /// more reading than it saves.
@@ -58,7 +58,7 @@ impl Command for StaticCommand {
 }
 
 /// Builds an owned [`StaticCommand`], the shared constructor every row of
-/// [`STATIC_ROWS`](super::STATIC_ROWS) uses, and every bespoke wrapper in this
+/// the hand-written tables use, and every bespoke wrapper in this
 /// module's sibling files uses for its `base`.
 pub(super) fn static_command(
     name: &'static str,
@@ -76,13 +76,10 @@ pub(super) fn static_command(
     }
 }
 
-/// Wraps hand-written Markdown as [`Documentation`] with
-/// [`DocSource::Curated`](super::DocSource::Curated) — every documentation
-/// string under `src/command/` is our own wording, never LilyPond's, so the
-/// source is always the same here.
+/// Wraps hand-written Markdown as [`Documentation`] — every documentation
+/// string under `src/command/` is our own wording.
 pub(super) fn curated(markdown: &str) -> Option<Documentation> {
     Some(Documentation {
         markdown: markdown.to_string(),
-        source: super::DocSource::Curated,
     })
 }

@@ -8,6 +8,7 @@ pub mod command;
 pub mod command_assist;
 pub mod document;
 pub mod document_graph;
+pub mod install;
 pub mod line_struct;
 pub mod note_analyser;
 pub mod note_names;

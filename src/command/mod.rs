@@ -10,13 +10,17 @@
 //! share instead of each re-deriving the shape ad hoc.
 //!
 //! The knowledge of *which* commands exist and what their arguments look like
-//! lives behind the [`Command`] trait. [`BUILTIN`] is the hand-written layer —
-//! the keyword commands (`\repeat`, `\relative`, `\set`, the mode switches, …)
-//! which are reserved words in LilyPond's grammar. Most of them are plain rows
-//! of the [`STATIC_ROWS`] table, built as a [`StaticCommand`](static_command::StaticCommand); the
-//! handful with genuinely irregular behaviour — [`relative`], [`fixed`],
-//! [`tempo`] and [`repeat`] — each get their own file here, wrapping
-//! a `StaticCommand` and overriding the one method that makes them bespoke.
+//! lives behind the [`Command`] trait. The hand-written knowledge is two
+//! layers, because it answers two different questions: [`RESERVED`] holds the
+//! words LilyPond's own grammar recognises (`\repeat`, `\set`, the mode
+//! switches, …), which nothing can rebind; [`CURATED`] holds our better
+//! signatures for ordinary music functions LilyPond defines in `ly/`
+//! (`\clef`, `\key`, `\relative`, …), which a file *can* shadow. Most of
+//! both are plain rows of [`RESERVED_ROWS`] and [`CURATED_ROWS`], built as a
+//! [`StaticCommand`](static_command::StaticCommand); the handful with
+//! genuinely irregular behaviour — [`relative`], [`fixed`], [`tempo`] and
+//! [`repeat`] — each get their own file here, wrapping a `StaticCommand` and
+//! overriding the one method that makes them bespoke.
 //! The other layer built so far is the user's own files. [`definition`] builds
 //! one [`Layer`] per file out of everything it binds — a definition being a
 //! command that takes no arguments unless something says otherwise — and the
@@ -52,7 +56,7 @@ use static_command::{curated, static_command};
 ///
 /// There is one impl per *source of knowledge*, not one per command:
 /// [`StaticCommand`](static_command::StaticCommand) is a single struct,
-/// instantiated once per row of [`STATIC_ROWS`]'s table, for every hand-written
+/// instantiated once per row of the hand-written tables, for every
 /// command whose only job is to consume a fixed signature and (maybe) set a
 /// fixed [`MusicContext`] for its body; [`relative::RelativeCommand`],
 /// [`fixed::FixedCommand`] and [`tempo::TempoCommand`] are the three whose
@@ -66,7 +70,7 @@ use static_command::{curated, static_command};
 /// [`definition`](Self::definition) and [`redefines`](Self::redefines) are
 /// implemented once for every source of knowledge rather than once each.
 ///
-/// Deliberately object-safe: [`Vocabulary`](crate::vocabulary::Vocabulary)
+/// Deliberately object-safe: a [`Layer`](crate::vocabulary::Layer)
 /// stores `Arc<dyn Command>` and hands them out by name, so no method may be
 /// generic or return `Self`. In particular `check` returns a `Vec` rather than
 /// `impl Iterator`, because an RPITIT would make the trait dyn-incompatible.
@@ -118,7 +122,7 @@ pub trait Command: Send + Sync {
     }
 
     /// Hover documentation, already rendered to Markdown. `None` for a command
-    /// we recognise but can say nothing about — most of [`STATIC_ROWS`]'s
+    /// we recognise but can say nothing about — most of the hand-written
     /// rows, which say nothing beyond their signature.
     fn documentation(&self) -> Option<&Documentation> {
         None
@@ -373,18 +377,10 @@ pub fn definition_spans(command: &dyn Command) -> Vec<Span> {
     spans
 }
 
-/// Hover text plus where it came from, so the table can prefer our curated
-/// wording over LilyPond's own when both exist.
+/// Hover text for a command.
 pub struct Documentation {
     /// Markdown, ready for an LSP `MarkupContent`.
     pub markdown: String,
-    pub source: DocSource,
-}
-
-pub enum DocSource {
-    Curated,
-    Workspace,
-    Install,
 }
 
 /// A value worth completing at one parameter position — one of a command's
@@ -478,8 +474,8 @@ pub struct CommandCall {
     /// is mid-edit and an argument is still missing.
     pub args: Vec<Arg>,
     /// The [`Command`] impl that `name` resolved to during parsing — the same
-    /// one [`BUILTIN`] would hand back for `name` today, and later whichever
-    /// [`Vocabulary`](crate::vocabulary::Vocabulary) entry resolved it. Carried
+    /// whichever layer of the [`Scope`](crate::vocabulary::Scope) resolved
+    /// the name — see [`Scope::get`](crate::vocabulary::Scope::get). Carried
     /// here so a caller that already has a `CommandCall` never needs a second
     /// name lookup to ask it anything.
     pub cmd: Arc<dyn Command>,
@@ -665,7 +661,19 @@ fn consume_arg(
         }
         ArgKind::String => consume_string(children, i, src),
         ArgKind::PropertyPath => consume_property_path(children, i, src),
-        ArgKind::Unknown(_) => Some((
+        // `Unknown` must never claim a node `ArgKind::Music` would also claim.
+        // It has no shape check of its own — that's the whole point of it —
+        // so an *optional* `Unknown` parameter would otherwise consume
+        // whatever sits next unconditionally, including the real music
+        // argument that follows when the optional one was simply omitted.
+        // `\tuplet 3/2 { c d e }` is the case that matters most: the
+        // (optional, unmapped) tuplet-span predicate sits directly before the
+        // required music, and every real score omits the span. Declining
+        // here is what makes that `Unknown` parameter fail to match instead
+        // of swallowing the block whole, so `default_parse` skips it (it's
+        // optional) and tries the block against `music` instead, where it
+        // belongs. See `looks_like_music`.
+        ArgKind::Unknown(_) if !looks_like_music(node.kind()) => Some((
             Arg::Unknown {
                 span: node_span(node),
             },
@@ -673,6 +681,14 @@ fn consume_arg(
         )),
         _ => None,
     }
+}
+
+/// Whether `kind` is a node [`ArgKind::Music`] would itself consume: a `{ … }`
+/// or `<< … >>` block, or the leading token of a braceless note or chord.
+/// [`ArgKind::Unknown`] must decline these — see the comment where it's
+/// matched in [`consume_arg`].
+fn looks_like_music(kind: &str) -> bool {
+    is_block(kind) || kind == "symbol" || kind == "chord"
 }
 
 /// Consumes a braceless music argument — a single note or chord written without
@@ -1007,7 +1023,7 @@ static KEY_MODE_CANDIDATES: &[Candidate] = &[
 static KEY_COMPLETIONS: &[&[Candidate]] = &[&[], KEY_MODE_CANDIDATES];
 
 /// Curated hover prose for the plain [`StaticCommand`](static_command::StaticCommand)
-/// rows that have any worth showing, hoisted out of [`STATIC_ROWS`] so each
+/// rows that have any worth showing, hoisted out of the tables so each
 /// row there stays one line. Most rows say nothing beyond their signature and
 /// leave [`Row`]'s doc field `None`.
 const ALTERNATIVE_DOC: &str = "Supplies the alternate endings for an enclosing `\\repeat volta` \
@@ -1020,7 +1036,7 @@ const KEY_DOC: &str = "Sets the key signature to `tonic` in `mode` (e.g. `\\majo
 const TRANSPOSE_DOC: &str = "Transposes `music` so that the pitch written as `from` sounds as \
      `to`, shifting every pitch in `music` by the same interval.";
 
-/// One row of [`STATIC_ROWS`]: a [`StaticCommand`](static_command::StaticCommand)'s
+/// One row of [`RESERVED_ROWS`] or [`CURATED_ROWS`]: a [`StaticCommand`](static_command::StaticCommand)'s
 /// data, keyed by one or more names, params, [`MusicContext`], curated doc (if
 /// any) and completions (if any), in that order. More than one name is an
 /// alias LilyPond itself recognises (`\chordmode`/`\chords`, …); each still
@@ -1036,7 +1052,7 @@ struct Row(
     &'static [&'static [Candidate]],
 );
 
-/// The plain data-driven layer of [`BUILTIN`]: every hand-written command
+/// LilyPond's reserved words: every hand-written command
 /// whose only job is to consume a fixed signature and (maybe) set a fixed
 /// [`MusicContext`] for its body. `\repeat`, `\relative`, `\fixed` and
 /// `\tempo` aren't here — each needs one method [`StaticCommand`](static_command::StaticCommand)
@@ -1054,11 +1070,10 @@ struct Row(
 /// five lines apiece — exactly the wall of near-duplicated shape this table
 /// exists to avoid. Kept hand-aligned instead, one row per line.
 #[rustfmt::skip]
-static STATIC_ROWS: &[Row] = {
+static RESERVED_ROWS: &[Row] = {
     use MusicContext::{Absolute, Chord, Inherit, NonNote};
     &[
         Row(&["alternative"],           MUSIC_ONLY_PARAMS,       Inherit,  Some(ALTERNATIVE_DOC), &[]),
-        Row(&["volta"],                 VOLTA_PARAMS,            Inherit,  Some(VOLTA_DOC),       &[]),
         Row(&["notemode", "notes"],     MUSIC_ONLY_PARAMS,       Absolute, None,                  &[]),
         Row(&["chordmode", "chords"],   MUSIC_ONLY_PARAMS,       Chord,    None,                  &[]),
         Row(&["drummode", "drums"],     MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
@@ -1073,25 +1088,43 @@ static STATIC_ROWS: &[Row] = {
         Row(&["layout"],                MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["midi"],                  MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["with"],                  MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["clef"],                  CLEF_PARAMS,             Inherit,  Some(CLEF_DOC),        CLEF_COMPLETIONS),
         Row(&["set"],                   PROPERTY_PARAMS,         Inherit,  None,                  &[]),
         Row(&["unset"],                 PROPERTY_PARAMS,         Inherit,  None,                  &[]),
-        Row(&["language"],              LANGUAGE_PARAMS,         Inherit,  None,                  &[]),
         Row(&["include"],               INCLUDE_PARAMS,          Inherit,  None,                  &[]),
+    ]
+};
+
+/// The other half of the hand-written table: names LilyPond defines in its own
+/// `ly/music-functions-init.ly` as ordinary `define-music-function`s, for which
+/// we keep a curated signature and wording because ours is better than what
+/// [`scheme`] can read back out of the definition — `\relative` and `\fixed`
+/// most of all, whose octave-reference behaviour no signature can express.
+///
+/// Being ordinary functions, they are *shadowable*: a file that binds `clef`
+/// itself means its own, exactly as LilyPond's name lookup does, which is why
+/// this layer sits below a document's files rather than above them. That every
+/// name here is one the install defines, and no name in [`RESERVED_ROWS`] is,
+/// is checked by `install_layer_defines_every_curated_name`.
+#[rustfmt::skip]
+static CURATED_ROWS: &[Row] = {
+    use MusicContext::Inherit;
+    &[
+        Row(&["volta"],                 VOLTA_PARAMS,            Inherit,  Some(VOLTA_DOC),       &[]),
+        Row(&["clef"],                  CLEF_PARAMS,             Inherit,  Some(CLEF_DOC),        CLEF_COMPLETIONS),
+        Row(&["language"],              LANGUAGE_PARAMS,         Inherit,  None,                  &[]),
         Row(&["key"],                   KEY_PARAMS,              Inherit,  Some(KEY_DOC),         KEY_COMPLETIONS),
         Row(&["transpose"],             TRANSPOSE_PARAMS,        Inherit,  Some(TRANSPOSE_DOC),   &[]),
     ]
 };
 
-/// Builds the hand-written command table: [`STATIC_ROWS`]' plain rows, plus
-/// `\repeat`, `\relative`, `\fixed` and `\tempo`, each of which wraps a
-/// [`StaticCommand`](static_command::StaticCommand) and overrides the one
-/// method that makes it bespoke. Keyed by name without the leading backslash.
-/// Read once into [`BUILTIN`].
-fn builtin_table() -> Layer {
+/// Builds a [`Layer`] from a row table, keyed by name without the leading
+/// backslash. `bespoke` supplies the handful that can't be a plain row: each
+/// wraps a [`StaticCommand`](static_command::StaticCommand) and overrides the
+/// one method that makes it irregular.
+fn table(rows: &[Row], bespoke: Vec<(&str, Arc<dyn Command>)>) -> Layer {
     let mut table: HashMap<String, Arc<dyn Command>> = HashMap::new();
 
-    for Row(names, params, context, doc, completions) in STATIC_ROWS {
+    for Row(names, params, context, doc, completions) in rows {
         for &name in *names {
             table.insert(
                 name.to_string(),
@@ -1106,20 +1139,41 @@ fn builtin_table() -> Layer {
         }
     }
 
-    table.insert("repeat".to_string(), Arc::new(repeat::command()));
-    table.insert("relative".to_string(), Arc::new(relative::command()));
-    table.insert("fixed".to_string(), Arc::new(fixed::command()));
-    table.insert("tempo".to_string(), Arc::new(tempo::command()));
+    for (name, command) in bespoke {
+        table.insert(name.to_string(), command);
+    }
 
     Layer::new(table)
 }
 
-/// The hand-written command layer, built once and stacked first by every
-/// [`Scope`](crate::vocabulary::Scope). It is a [`Layer`] like any other, so
-/// the one way of asking "does ly-lsp know `\foo`?" serves both parsing a call
-/// and checking `is_known`, rather than two hand-maintained lists having to
-/// agree.
-pub(crate) static BUILTIN: LazyLock<Layer> = LazyLock::new(builtin_table);
+/// LilyPond's reserved words, which its grammar recognises before any name
+/// lookup happens and no file can rebind. Pinned above every other layer by
+/// [`Scope::for_document`](crate::vocabulary::Scope::for_document).
+pub static RESERVED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
+    Arc::new(table(
+        RESERVED_ROWS,
+        vec![
+            ("repeat", Arc::new(repeat::command()) as Arc<dyn Command>),
+            ("tempo", Arc::new(tempo::command())),
+        ],
+    ))
+});
+
+/// Our curated signatures for ordinary LilyPond music functions — better than
+/// the ones [`scheme`] reads out of the install, but shadowable by a file that
+/// defines the name itself. See [`CURATED_ROWS`].
+pub static CURATED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
+    Arc::new(table(
+        CURATED_ROWS,
+        vec![
+            (
+                "relative",
+                Arc::new(relative::command()) as Arc<dyn Command>,
+            ),
+            ("fixed", Arc::new(fixed::command())),
+        ],
+    ))
+});
 
 /// The source-ordered command calls found in a document, queryable by the
 /// position or span a refactoring is working at. Mirrors [`Events`] so a call
@@ -1787,7 +1841,7 @@ mod tests {
         use super::*;
 
         /// Complete, recognised calls covering every signature shape in
-        /// [`BUILTIN`]: a bare word plus count and body (`repeat`), a number
+        /// the hand-written tables: a bare word plus count and body (`repeat`), a number
         /// list plus body (`volta`), an optional pitch plus body (`relative`),
         /// a pitch plus word (`key`), two pitches plus body (`transpose`), a
         /// string plus two counts (`tempo`), a bare-word-as-string (`clef`), a

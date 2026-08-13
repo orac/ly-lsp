@@ -1,6 +1,6 @@
 //! `\fixed reference { … }`.
 
-use super::static_command::{StaticCommand, curated, static_command};
+use super::static_command::{StaticCommand, static_command};
 use super::{
     Arg, Candidate, Command, CommandCall, MusicContext, Param, REFERENCE_PITCH_PARAMS, clamp_octave,
 };
@@ -46,17 +46,19 @@ impl Command for FixedCommand {
     }
 }
 
-/// Builds the `\fixed` entry for [`BUILTIN`](super::BUILTIN).
+/// Builds the `\fixed` entry for [`CURATED`](super::CURATED).
 pub(super) fn command() -> FixedCommand {
     FixedCommand {
         base: static_command(
             "fixed",
             REFERENCE_PITCH_PARAMS,
             MusicContext::Inherit,
-            curated(
-                "Reads `music` with a fixed reference octave: an unmarked note sits in the \
-                 same octave as `reference`, and octave marks (`'`, `,`) shift from there.",
-            ),
+            Some(super::Documentation {
+                markdown:
+                    "Reads `music` with a fixed reference octave: an unmarked note sits in the \
+                 same octave as `reference`, and octave marks (`'`, `,`) shift from there."
+                        .to_string(),
+            }),
             &[],
         ),
     }

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 use super::definition::Binding;
-use super::{ArgKind, Command, DocSource, Documentation, Param};
+use super::{ArgKind, Command, Documentation, Param};
 use crate::line_struct::Span;
 
 /// The definition forms that produce a `\command`. `define-void-function` and
@@ -261,10 +261,8 @@ fn function(elements: &[Node], name: &str, src: &str) -> Option<SchemeCommand> {
     Some(SchemeCommand {
         name: name.to_string(),
         params,
-        documentation: docstring(elements, predicate_list, src).map(|markdown| Documentation {
-            markdown,
-            source: DocSource::Workspace,
-        }),
+        documentation: docstring(elements, predicate_list, src)
+            .map(|markdown| Documentation { markdown }),
     })
 }
 
@@ -298,12 +296,45 @@ fn predicate<'a>(node: Node, src: &'a str) -> Option<Predicate<'a>> {
 /// [`ArgKind::Unknown`] named after the predicate, so signature help and hover
 /// can still say what is expected even where the parser can only guess at its
 /// extent.
+///
+/// This list is driven by a survey of the predicates actually used across the
+/// install's own `define-…-function`s (see "The risk: several hundred
+/// signatures arriving at once" in `doc/command-parsing.md`), not by every
+/// predicate LilyPond's manual documents — a predicate that never appears in
+/// a real signature costs nothing left as `Unknown`.
 fn arg_kind(predicate: &str) -> ArgKind {
     match predicate {
         "ly:music?" => ArgKind::Music,
+        // `key-list-or-music?` and `symbol-list-or-music?` are how `\tweak`'s
+        // relatives (`\shape`, `\parenthesize`, `\hide`, `\omit`, …) and
+        // `\skip` (`duration-or-music?`) accept a music event directly: the
+        // argument they're given is very often the note or chord that
+        // follows. Mapping these to `Music` is the one substitution that
+        // matters most in this table — `Unknown` would consume that note and
+        // never walk into it, which is exactly the silent note loss and
+        // `\relative` octave drift "The risk" section warns about. The price
+        // is a rarer false positive when the argument is genuinely a grob
+        // path instead (`\shape #'(...) NoteHead`) rather than music: the
+        // path reads as an unresolved note name and gets flagged. That's a
+        // spurious diagnostic, not a vanished note, so it's the shape to get
+        // wrong if one has to be.
+        "key-list-or-music?" | "symbol-list-or-music?" | "duration-or-music?" => ArgKind::Music,
         "ly:pitch?" => ArgKind::Pitch,
         "string?" => ArgKind::String,
         "integer?" | "index?" | "positive-integer?" | "non-negative-integer?" => ArgKind::Count,
+        // A plain bare word naming something other than a note — a tag, tweak
+        // key, or similar — rather than an arbitrary predicate we can't place.
+        "symbol?" => ArgKind::BareWord,
+        // The property-path shorthand LilyPond gives these two predicates —
+        // `Stem.color`, or a bare `color` — is exactly `\set`'s own
+        // `Staff.instrumentName` shape, which `ArgKind::PropertyPath` already
+        // parses. Both predicates also accept a quoted Scheme list
+        // (`#'(Stem color)`), which this doesn't cover; that form simply
+        // isn't matched, which is the safe failure (see [`consume_arg`]).
+        "symbol-list-or-symbol?" | "key-list-or-symbol?" => ArgKind::PropertyPath,
+        // `\time`'s beat structure (`\time 3,3,2 8/8`) is written exactly
+        // like `\volta`'s numbers.
+        "number-list?" => ArgKind::NumberList,
         other => ArgKind::Unknown(Cow::Owned(other.to_string())),
     }
 }
@@ -449,7 +480,7 @@ mod tests {
     use crate::vocabulary::Layer;
     use proptest::prelude::*;
 
-    /// Reads `src` as the server would.
+    /// Reads `src` as the server would, for a user's own file.
     fn bindings(src: &str) -> Vec<Binding> {
         read(&document::parse(src, None), src)
     }
@@ -638,7 +669,6 @@ mod tests {
             .documentation()
             .expect("a docstring");
         assert_eq!(doc.markdown, "Repeat *m* twice, as `c4 c4`.");
-        assert!(matches!(doc.source, DocSource::Workspace));
     }
 
     #[test]

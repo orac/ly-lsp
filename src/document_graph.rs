@@ -19,17 +19,18 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::Document;
-use crate::vocabulary::{Scope, Vocabulary};
+use crate::vocabulary::{self, Scope};
 
 #[derive(Debug, Default)]
 pub struct DocumentGraph {
     /// Documents currently open in the editor, keyed by URI.
     open: DashMap<Url, Document>,
-    /// The commands LilyPond recognises, loaded once from its `lilypond-words`
-    /// file. Unset until successfully loaded, which keeps undefined-reference
-    /// diagnostics disabled rather than flagging every command when the words
-    /// file is unavailable.
-    vocabulary: OnceLock<Vocabulary>,
+    /// The layers every document in the workspace shares — LilyPond's words
+    /// list, its install, and our curated signatures — loaded once from the
+    /// install. Unset until successfully loaded, which keeps
+    /// undefined-reference diagnostics disabled rather than flagging every
+    /// command when the words file is unavailable.
+    base: OnceLock<Scope>,
     /// Directories from LilyPond's `-I` option, searched (after the including
     /// file's own directory) when resolving `\include`.
     search_paths: OnceLock<Vec<PathBuf>>,
@@ -76,10 +77,16 @@ impl DocumentGraph {
     /// error) the vocabulary stays unset and undefined-reference diagnostics
     /// remain off, so we never flag every command as undefined.
     pub fn load_vocabulary(&self, path: &Path) -> bool {
-        match Vocabulary::load(path) {
-            Some(vocabulary) => self.vocabulary.set(vocabulary).is_ok(),
+        match vocabulary::workspace_base(path) {
+            Some(base) => self.base.set(base).is_ok(),
             None => false,
         }
+    }
+
+    /// The layers under every document here: what was loaded from the
+    /// installation, or our hand-written ones alone until that succeeds.
+    fn base(&self) -> Scope {
+        self.base.get().cloned().unwrap_or_else(Scope::builtins)
     }
 
     /// Sets the `-I` include search directories, in priority order.
@@ -103,7 +110,7 @@ impl DocumentGraph {
         // walk of the include graph answers for every kind of name: a
         // definition is a command in its file's layer, whether or not anything
         // says what arguments it takes.
-        let known = self.vocabulary.get().map(|_| {
+        let known = self.base.get().map(|_| {
             let scope = self.scope_for(uri);
             move |name: &str| scope.is_known(name)
         });
@@ -421,17 +428,14 @@ impl DocumentGraph {
     /// Each file contributes the layer its [`Document`] built when it was
     /// parsed, so a header included by twenty scores is read once and its
     /// layer shared twenty times over rather than re-read per score.
-    fn scope_for(&self, uri: &Url) -> Scope<'_> {
+    fn scope_for(&self, uri: &Url) -> Scope {
         let mut layers = Vec::new();
         for file in self.include_closure(uri) {
             self.with_document_raw(&file, |doc| {
-                let layer = doc.commands_defined();
-                if !layer.is_empty() {
-                    layers.push(Arc::clone(layer));
-                }
+                layers.push(Arc::clone(doc.commands_defined()));
             });
         }
-        Scope::new(self.vocabulary.get(), layers)
+        self.base().for_document(&layers)
     }
 
     /// Runs `f` against the document at `uri` without refreshing its

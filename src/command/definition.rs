@@ -207,7 +207,7 @@ mod tests {
     fn a_builtin_command_is_defined_nowhere() {
         // The hand-written layer's commands are defined in this repo, not in
         // anyone's score, so there is nothing to navigate to.
-        let repeat = crate::command::BUILTIN.get("repeat").expect("repeat");
+        let repeat = crate::command::RESERVED.get("repeat").expect("repeat");
         assert!(definition_spans(repeat.as_ref()).is_empty());
     }
 }
