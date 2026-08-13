@@ -363,8 +363,40 @@ fn docstring(elements: &[Node], predicate_list: Node, src: &str) -> Option<Strin
         }
         _ => return None,
     };
-    let fragment = child_of_kind(string, "scheme_string_fragment")?;
-    Some(texinfo_to_markdown(text(fragment, src)))
+    Some(texinfo_to_markdown(&string_value(string, src)))
+}
+
+/// The text a `scheme_string` node stands for, with its escapes decoded.
+///
+/// The grammar splits a string at every escape, into a run of
+/// `scheme_string_fragment` and `scheme_escape_sequence` children, so the
+/// fragments alone are the string only for a string that has no escapes. A
+/// docstring that mentions a LilyPond command — `@code{\\clef}`, which nearly
+/// every one of them does sooner or later — is cut off at its first backslash
+/// otherwise.
+fn string_value(string: Node, src: &str) -> String {
+    let mut cursor = string.walk();
+    let mut out = String::new();
+    for child in string.named_children(&mut cursor) {
+        match child.kind() {
+            "scheme_string_fragment" => out.push_str(text(child, src)),
+            "scheme_escape_sequence" => out.push_str(unescape(text(child, src))),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What one `\x` escape stands for. Scheme's three whitespace escapes are
+/// spelled out; every other escape in a docstring is the character escaping
+/// itself, `\\` and `\"` being the two that actually occur.
+fn unescape(escape: &str) -> &str {
+    match escape.strip_prefix('\\').unwrap_or(escape) {
+        "n" => "\n",
+        "t" => "\t",
+        "r" => "\r",
+        other => other,
+    }
 }
 
 /// Converts a Texinfo docstring to Markdown: `@var{x}` and `@emph{x}` become
@@ -372,10 +404,142 @@ fn docstring(elements: &[Node], predicate_list: Node, src: &str) -> Option<Strin
 /// any other `@command{…}` keeps its contents unadorned. `@@`, `@{` and `@}`
 /// are Texinfo's escapes for the three characters it reserves.
 ///
-/// Deliberately shallow: this handles the inline markup that appears in
-/// function docstrings, not Texinfo's block structure (`@example`, `@table`,
-/// …), which docstrings don't use.
+/// On top of that inline markup there are the [`ENVIRONMENTS`]: a line reading
+/// `@example`, `@verbatim` or `@lilypond[…]` opens a fenced code block that
+/// runs to its `@end`. Those are the only block environments the install's
+/// docstrings use, and all three hold code — Texinfo's prose environments
+/// (`@table`, `@itemize`) appear in the manual but in no docstring, and would
+/// come through as run-on prose if one ever did.
 fn texinfo_to_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut open: Option<&Environment> = None;
+    // `split_inclusive` keeps each line's terminator, so a docstring's own line
+    // breaks survive into the Markdown and the final line stays unterminated if
+    // that is how it arrived.
+    for line in text.split_inclusive('\n') {
+        match open {
+            Some(environment) if closes(line, environment) => {
+                close_fence(&mut out);
+                open = None;
+            }
+            Some(environment) => out.push_str(&convert(line, environment.style)),
+            None => match opens(line) {
+                Some(environment) => {
+                    open_fence(&mut out, environment);
+                    open = Some(environment);
+                }
+                None => out.push_str(&convert(line, Style::Prose)),
+            },
+        }
+    }
+    // A docstring cut off mid-block still has to produce valid Markdown, or the
+    // unterminated fence swallows the hover.
+    if open.is_some() {
+        close_fence(&mut out);
+    }
+    out
+}
+
+/// A Texinfo block environment that holds code, and the fenced Markdown code
+/// block it becomes.
+///
+/// These three are the ones LilyPond's docstrings actually open; the manual's
+/// prose environments (`@table`, `@itemize`) appear in the documentation
+/// proper but not in a single `define-…-function` docstring in the install.
+struct Environment {
+    /// The word after the `@`, which `@example` and `@end example` share.
+    name: &'static str,
+    /// What to label the fence with, so the hover highlights the snippet.
+    /// Empty where the contents could be either LilyPond or Scheme.
+    language: &'static str,
+    /// How @-commands inside the block are treated. Texinfo expands them
+    /// everywhere except `@verbatim`, which is why an `@example` writes its
+    /// braces as `@{`@ and `@}` while a `@lilypond` block writes LilyPond
+    /// source exactly as you would type it into a file.
+    style: Style,
+}
+
+const ENVIRONMENTS: &[Environment] = &[
+    Environment {
+        name: "example",
+        language: "",
+        style: Style::Code,
+    },
+    Environment {
+        name: "verbatim",
+        language: "",
+        style: Style::Literal,
+    },
+    Environment {
+        name: "lilypond",
+        language: "lilypond",
+        style: Style::Literal,
+    },
+];
+
+/// The environment `line` opens, if it is a line like `@example` or
+/// `@lilypond[quote,verbatim]` and nothing else. An environment is opened by a
+/// line of its own, so a `@code{@example}` mid-sentence isn't one.
+fn opens(line: &str) -> Option<&'static Environment> {
+    let (word, _) = at_command(line)?;
+    ENVIRONMENTS.iter().find(|e| e.name == word)
+}
+
+/// Whether `line` is the `@end example` that closes `environment`. Any other
+/// `@end` inside the block is left to be part of it.
+fn closes(line: &str, environment: &Environment) -> bool {
+    at_command(line).is_some_and(|(word, rest)| word == "end" && rest.trim() == environment.name)
+}
+
+/// The `@word` a line begins with and whatever follows it, for a line that
+/// begins with one at all.
+fn at_command(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().strip_prefix('@')?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(rest.len());
+    Some(rest.split_at(end))
+}
+
+fn open_fence(out: &mut String, environment: &Environment) {
+    if !(out.is_empty() || out.ends_with('\n')) {
+        out.push('\n');
+    }
+    out.push_str("```");
+    out.push_str(environment.language);
+    out.push('\n');
+}
+
+fn close_fence(out: &mut String) {
+    if !(out.is_empty() || out.ends_with('\n')) {
+        out.push('\n');
+    }
+    out.push_str("```\n");
+}
+
+/// How much markup a stretch of Texinfo should grow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Style {
+    /// Ordinary prose: `@code{x}` becomes `` `x` `` and so on.
+    Prose,
+    /// Inside a code fence, where Markdown's own markup would show up as the
+    /// literal asterisks and backticks it is written with. Commands are
+    /// unwrapped to their contents, and the escapes still decoded — `@{` is how
+    /// an `@example` has to spell a brace.
+    Code,
+    /// Inside `@verbatim`, where Texinfo itself expands nothing.
+    Literal,
+}
+
+/// Converts one stretch of Texinfo, at the level of markup `style` calls for.
+fn convert(text: &str, style: Style) -> Cow<'_, str> {
+    if style == Style::Literal {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(convert_inline(text, style))
+}
+
+fn convert_inline(text: &str, style: Style) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('@') {
@@ -401,8 +565,19 @@ fn texinfo_to_markdown(text: &str) -> String {
                     rest = tail;
                     continue;
                 };
-                let inner = texinfo_to_markdown(body);
+                let inner = convert_inline(body, style);
                 match command {
+                    // The two empty-bodied commands that stand for a character
+                    // rather than wrapping one. Dropping them, as an
+                    // unrecognised command would, runs `@tie{}for` together
+                    // into "for" and loses the space the tie *is*.
+                    "dots" => out.push('…'),
+                    "tie" => out.push(if style == Style::Prose { '\u{a0}' } else { ' ' }),
+                    // Inside a code fence Markdown's markup isn't markup: a
+                    // `*` there is the asterisk it looks like. Every command
+                    // is unwrapped to its contents instead, which is what
+                    // Texinfo shows in an `@example` anyway.
+                    _ if style == Style::Code => out.push_str(&inner),
                     "code" | "samp" | "file" | "kbd" | "key" => {
                         out.push('`');
                         out.push_str(&inner);
@@ -417,6 +592,18 @@ fn texinfo_to_markdown(text: &str) -> String {
                         out.push_str("**");
                         out.push_str(&inner);
                         out.push_str("**");
+                    }
+                    // Texinfo's typographic quotes. LilyPond uses these a lot
+                    // in prose about `@q{durations}` and the like.
+                    "q" => {
+                        out.push('‘');
+                        out.push_str(&inner);
+                        out.push('’');
+                    }
+                    "qq" => {
+                        out.push('“');
+                        out.push_str(&inner);
+                        out.push('”');
                     }
                     _ => out.push_str(&inner),
                 }
@@ -672,6 +859,26 @@ mod tests {
     }
 
     #[test]
+    fn a_docstring_survives_the_backslashes_in_it() {
+        // The grammar cuts a string into fragments at every escape, so a
+        // docstring naming a LilyPond command — which is most of them — used
+        // to stop dead at its first `\\`.
+        let src = "setClef = #(define-music-function (type) (string?)\n\
+                   \x20 (_i \"The usual @code{\\\\clef}, plus @code{\\\"stradella\\\"}.\")\n\
+                   \x20 #{ #})";
+        let layer = layer(src);
+        assert_eq!(
+            layer
+                .get("setClef")
+                .expect("setClef")
+                .documentation()
+                .expect("a docstring")
+                .markdown,
+            "The usual `\\clef`, plus `\"stradella\"`."
+        );
+    }
+
+    #[test]
     fn unwraps_a_gettext_docstring() {
         let src = "myFunc = #(define-music-function (m) (ly:music?) (_i \"Do a thing.\") m)";
         let layer = layer(src);
@@ -761,9 +968,55 @@ dimin = #(define-music-function (parser location note) (ly:music?) #{ \\tweak No
             "**very *bold***"
         );
         assert_eq!(texinfo_to_markdown("@unknown{kept}"), "kept");
+        assert_eq!(texinfo_to_markdown("@q{a} @qq{b}"), "‘a’ “b”");
+        // The empty-bodied pair: a tie is the space between two words, so
+        // dropping it would join them.
+        assert_eq!(texinfo_to_markdown("3@tie{}beats@dots{}"), "3\u{a0}beats…");
         assert_eq!(texinfo_to_markdown("100@@ @{braced@}"), "100@ {braced}");
         // Unbalanced braces leave the text as it is rather than swallowing it.
         assert_eq!(texinfo_to_markdown("@code{oops"), "code{oops");
+    }
+
+    #[test]
+    fn an_example_block_becomes_a_code_fence() {
+        // `\tuplet`'s docstring, near enough. Inside the block the braces are
+        // written `@{ @}` and have to come back as braces, while `@var` loses
+        // its emphasis: asterisks inside a fence are asterisks.
+        let markdown = texinfo_to_markdown(
+            "For example,\n@example\n\\tuplet @{ c8 @var{c} @}\n@end example\nwill result in two groups.",
+        );
+        assert_eq!(
+            markdown,
+            "For example,\n```\n\\tuplet { c8 c }\n```\nwill result in two groups."
+        );
+    }
+
+    #[test]
+    fn a_lilypond_block_is_fenced_as_lilypond_and_taken_literally() {
+        // `@lilypond[…]` carries options in brackets, and its body is LilyPond
+        // source exactly as typed — no `@` escaping, so nothing to expand.
+        let markdown = texinfo_to_markdown(
+            "Connect slurs.\n@lilypond[quote,verbatim]\n\\fixed c' { c\\=1( d\\=2) }\n@end lilypond\n",
+        );
+        assert_eq!(
+            markdown,
+            "Connect slurs.\n```lilypond\n\\fixed c' { c\\=1( d\\=2) }\n```\n"
+        );
+    }
+
+    #[test]
+    fn a_verbatim_block_expands_nothing() {
+        let markdown =
+            texinfo_to_markdown("Example:\n@verbatim\n  A = { c @var{d} }\n@end verbatim\n");
+        assert_eq!(markdown, "Example:\n```\n  A = { c @var{d} }\n```\n");
+    }
+
+    #[test]
+    fn an_unclosed_block_still_closes_its_fence() {
+        // A docstring truncated mid-block — or one whose `@end` we failed to
+        // recognise — must not leave a fence open, which would swallow
+        // everything after it in the hover.
+        assert_eq!(texinfo_to_markdown("@example\nc4 d4"), "```\nc4 d4\n```\n");
     }
 
     /// Text with no `@` and no braces at all, the alphabet `texinfo_to_markdown`
