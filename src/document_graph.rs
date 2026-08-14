@@ -46,6 +46,42 @@ struct CachedDocument {
     document: Document,
 }
 
+/// Why [`DocumentGraph::load_vocabulary`] failed.
+#[derive(Debug)]
+pub enum LoadVocabularyError {
+    /// The words file, or something else read while building the base scope,
+    /// could not be read.
+    Io(std::io::Error),
+    /// The vocabulary was already loaded; a later call is rejected rather
+    /// than silently overwriting the first (the underlying `OnceLock` only
+    /// ever accepts one value).
+    AlreadyLoaded,
+}
+
+impl std::fmt::Display for LoadVocabularyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadVocabularyError::Io(err) => write!(f, "{err}"),
+            LoadVocabularyError::AlreadyLoaded => write!(f, "vocabulary was already loaded"),
+        }
+    }
+}
+
+impl std::error::Error for LoadVocabularyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoadVocabularyError::Io(err) => Some(err),
+            LoadVocabularyError::AlreadyLoaded => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for LoadVocabularyError {
+    fn from(err: std::io::Error) -> Self {
+        LoadVocabularyError::Io(err)
+    }
+}
+
 impl DocumentGraph {
     pub fn new() -> Self {
         Self::default()
@@ -75,14 +111,14 @@ impl DocumentGraph {
     /// version-specific share directory (the one holding `ly/` and
     /// `vim/syntax/`).
     ///
-    /// Returns whether loading succeeded. On any failure (missing file, read
-    /// error) the vocabulary stays unset and undefined-reference diagnostics
-    /// remain off, so we never flag every command as undefined.
-    pub fn load_vocabulary(&self, share_dir: &Path) -> bool {
-        match vocabulary::workspace_base(share_dir) {
-            Some(base) => self.base.set(base).is_ok(),
-            None => false,
-        }
+    /// On failure the vocabulary stays unset and undefined-reference
+    /// diagnostics remain off, so we never flag every command as undefined;
+    /// the returned error says why, for the caller to log.
+    pub fn load_vocabulary(&self, share_dir: &Path) -> Result<(), LoadVocabularyError> {
+        let base = vocabulary::workspace_base(share_dir)?;
+        self.base
+            .set(base)
+            .map_err(|_| LoadVocabularyError::AlreadyLoaded)
     }
 
     /// The layers under every document here: what was loaded from the

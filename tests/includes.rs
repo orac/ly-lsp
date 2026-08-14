@@ -2,7 +2,7 @@
 //! graph, exercised against real files on disk.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use ly_lsp::document_graph::DocumentGraph;
@@ -10,6 +10,16 @@ use tower_lsp::lsp_types::{DiagnosticSeverity, Location, Position, Range, Url};
 
 fn url(path: &Path) -> Url {
     Url::from_file_path(path).expect("absolute path")
+}
+
+/// Lays out a fake LilyPond share directory under `dir`, with `words` as its
+/// `vim/syntax/lilypond-words` file, and returns the share directory —
+/// `load_vocabulary`'s expected argument.
+fn share_dir_with_words(dir: &Path, words: &str) -> PathBuf {
+    let syntax_dir = dir.join("vim").join("syntax");
+    fs::create_dir_all(&syntax_dir).unwrap();
+    fs::write(syntax_dir.join("lilypond-words"), words).unwrap();
+    dir.to_path_buf()
 }
 
 /// Forces a file's modification time, so cache-invalidation behaviour can be
@@ -219,11 +229,10 @@ fn line_range(line: u32, start: u32, end: u32) -> Range {
 #[test]
 fn undefined_reference_is_flagged_but_builtins_and_includes_are_not() {
     let dir = tempfile::tempdir().unwrap();
-    let words = dir.path().join("lilypond-words");
+    // Built-in commands carry a doubled backslash; context/grob names don't.
+    let share_dir = share_dir_with_words(dir.path(), "\\\\relative\n\\\\new\nStaff\nScore\n");
     let shared = dir.path().join("shared.ily");
     let score = dir.path().join("score.ly");
-    // Built-in commands carry a doubled backslash; context/grob names don't.
-    fs::write(&words, "\\\\relative\n\\\\new\nStaff\nScore\n").unwrap();
     fs::write(&shared, "melody = { c }\n").unwrap();
     // `\relative` is a builtin, `\melody` is defined in the include, `\wibble`
     // is neither.
@@ -234,7 +243,7 @@ fn undefined_reference_is_flagged_but_builtins_and_includes_are_not() {
     .unwrap();
 
     let ws = DocumentGraph::new();
-    assert!(ws.load_vocabulary(&words));
+    ws.load_vocabulary(&share_dir).unwrap();
     ws.open(url(&score), fs::read_to_string(&score).unwrap());
 
     let diagnostics = ws.diagnostics(&url(&score));
@@ -388,10 +397,9 @@ fn music_function_defined_in_an_included_file_resolves_across_the_include_graph(
     // diagnostic is raised for `\myFunc`. See `doc/command-parsing.md`'s
     // "Go-to-definition for user-defined music functions" table.
     let dir = tempfile::tempdir().unwrap();
-    let words = dir.path().join("lilypond-words");
+    let share_dir = share_dir_with_words(dir.path(), "\\\\relative\n");
     let functions = dir.path().join("functions.ily");
     let score = dir.path().join("score.ly");
-    fs::write(&words, "\\\\relative\n").unwrap();
     fs::write(
         &functions,
         "myFunc = #(define-music-function (m) (ly:music?) m)\n",
@@ -400,7 +408,7 @@ fn music_function_defined_in_an_included_file_resolves_across_the_include_graph(
     fs::write(&score, "\\include \"functions.ily\"\n\\myFunc { c4 }\n").unwrap();
 
     let ws = DocumentGraph::new();
-    assert!(ws.load_vocabulary(&words));
+    ws.load_vocabulary(&share_dir).unwrap();
     ws.open(url(&score), fs::read_to_string(&score).unwrap());
 
     // Cursor on `\myFunc` (line 1).
@@ -497,10 +505,9 @@ fn a_function_defined_only_inside_scheme_resolves_like_any_other() {
     // undefined-reference diagnostic, and go-to-definition landing on the name
     // inside the `#( … )`.
     let dir = tempfile::tempdir().unwrap();
-    let words = dir.path().join("lilypond-words");
+    let share_dir = share_dir_with_words(dir.path(), "\\\\relative\n");
     let functions = dir.path().join("functions.ily");
     let score = dir.path().join("score.ly");
-    fs::write(&words, "\\\\relative\n").unwrap();
     fs::write(
         &functions,
         "#(define-public myFunc (define-music-function (m) (ly:music?) m))\n",
@@ -509,7 +516,7 @@ fn a_function_defined_only_inside_scheme_resolves_like_any_other() {
     fs::write(&score, "\\include \"functions.ily\"\n\\myFunc { c4 }\n").unwrap();
 
     let ws = DocumentGraph::new();
-    assert!(ws.load_vocabulary(&words));
+    ws.load_vocabulary(&share_dir).unwrap();
     ws.open(url(&score), fs::read_to_string(&score).unwrap());
 
     let diagnostics = ws.diagnostics(&url(&score));

@@ -42,12 +42,12 @@ impl LanguageServer for Backend {
             .as_ref()
             .and_then(|opts| opts.get("lilypondShareDir"))
             .and_then(|value| value.as_str())
-            && !self.documents.load_vocabulary(Path::new(path))
+            && let Err(err) = self.documents.load_vocabulary(Path::new(path))
         {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!("could not load LilyPond's vocabulary from {path}"),
+                    format!("could not load LilyPond's vocabulary from {path}: {err}"),
                 )
                 .await;
         }

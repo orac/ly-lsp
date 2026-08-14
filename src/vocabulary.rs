@@ -239,18 +239,19 @@ impl std::fmt::Debug for Scope {
 /// by the client at `initialize`, so both are found by joining onto it
 /// directly rather than working back up from either.
 ///
-/// Returns `None` if the words file can't be read, so the caller can leave
-/// undefined-reference diagnostics switched off rather than flag everything.
+/// Returns `Err` if the words file can't be read, so the caller can leave
+/// undefined-reference diagnostics switched off rather than flag everything,
+/// while still reporting why.
 /// The install layer is a lesser concern: if its directory can't be found or
 /// read, the base still loads with an empty install layer — see
 /// [`install::load`](crate::install::load).
-pub fn workspace_base(share_dir: &Path) -> Option<Scope> {
+pub fn workspace_base(share_dir: &Path) -> std::io::Result<Scope> {
     let words_path = share_dir.join("vim").join("syntax").join("lilypond-words");
-    let text = std::fs::read_to_string(words_path).ok()?;
+    let text = std::fs::read_to_string(words_path)?;
     let base = Scope::EMPTY
         .extended_with(Arc::new(words_layer(&text)))
         .extended_with(Arc::new(crate::install::load(&share_dir.join("ly"))));
-    Some(base.extended_with(Arc::clone(&command::CURATED)))
+    Ok(base.extended_with(Arc::clone(&command::CURATED)))
 }
 
 /// The bottom layer: every name `lilypond-words` lists, with nothing behind it

@@ -19,8 +19,8 @@ fn main() {
     let share_dir = std::path::Path::new(&path);
 
     let start = Instant::now();
-    let base =
-        vocabulary::workspace_base(share_dir).unwrap_or_else(|| panic!("could not load {path}"));
+    let base = vocabulary::workspace_base(share_dir)
+        .unwrap_or_else(|err| panic!("could not load {path}: {err}"));
     let elapsed = start.elapsed();
 
     println!("loaded in {elapsed:?}");

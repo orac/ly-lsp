@@ -43,8 +43,9 @@ fn every_listed_file_exists_in_every_install() {
 #[test]
 fn the_layer_defines_the_documented_handful() {
     for lily in require_installs() {
-        let base = vocabulary::workspace_base(&lily.share_dir())
-            .unwrap_or_else(|| panic!("LilyPond {}: words file didn't load", lily.version));
+        let base = vocabulary::workspace_base(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: words file didn't load: {err}", lily.version)
+        });
         let scope = base.for_document(&[]);
 
         for name in ["appoggiatura", "accent", "pp", "slurUp", "break"] {
@@ -76,8 +77,9 @@ fn the_layer_defines_the_documented_handful() {
 #[test]
 fn a_documented_music_function_carries_its_docstring_and_signature() {
     for lily in require_installs() {
-        let base = vocabulary::workspace_base(&lily.share_dir())
-            .unwrap_or_else(|| panic!("LilyPond {}: words file didn't load", lily.version));
+        let base = vocabulary::workspace_base(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: words file didn't load: {err}", lily.version)
+        });
         let scope = base.for_document(&[]);
 
         let absolute = scope
