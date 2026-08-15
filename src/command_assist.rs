@@ -1,11 +1,13 @@
 //! Cursor-driven editor features built on the command table: signature help,
-//! argument completion and hover.
+//! completion and hover.
 //!
-//! All three answer the same underlying question — [`Commands::call_site_at`],
+//! Mostly they answer the same underlying question — [`Commands::call_site_at`],
 //! "which [`CommandCall`] is the cursor in, and at which argument position" —
-//! so this module's job is purely to render that one answer into the three
+//! so this module's job is largely to render that one answer into the three
 //! different shapes `textDocument/signatureHelp`, `textDocument/completion`
-//! and `textDocument/hover` each want. It sits alongside [`document`] rather
+//! and `textDocument/hover` each want. Completing a *name* is the exception,
+//! and has to be: a half-typed `\rela` is no call at all, so that answer comes
+//! from the document's [`Scope`] instead. It sits alongside [`document`] rather
 //! than growing it, because rendering three LSP response shapes is a
 //! self-contained job with no call for [`Document`]'s own parsing/symbol
 //! concerns, and a fair amount of formatting logic of its own.
@@ -15,12 +17,15 @@
 //! [`CommandCall`]: crate::command::CommandCall
 
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, Hover, HoverContents, MarkupContent, MarkupKind,
-    ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation,
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, Hover, HoverContents,
+    MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, Position, Range,
+    SignatureHelp, SignatureInformation, TextEdit,
 };
 
-use crate::command::{ArgKind, CallSite, Candidate, Param};
+use crate::command::{ArgKind, CallSite, Candidate, Command, CompletionContext, Param};
 use crate::document::Document;
+use crate::line_struct::Span;
+use crate::vocabulary::Scope;
 
 /// Resolves `position` to the [`CallSite`] the cursor is in — the "where is
 /// the cursor, and what command is it in" question shared by
@@ -65,23 +70,119 @@ pub fn signature_help(doc: &Document, position: Position) -> Option<SignatureHel
     })
 }
 
-/// The completion candidates for the argument position at `position`, if the
-/// cursor is in one and that parameter has a closed set of accepted values
-/// (see [`Command::completions`](crate::command::Command::completions)). Empty
-/// otherwise — an open-ended parameter (a pitch, a music block, most strings)
-/// offers nothing here rather than guessing.
-pub fn completions(doc: &Document, position: Position) -> Vec<CompletionItem> {
-    let Some((_offset, site)) = call_at(doc, position) else {
+/// What can be written at `position`, which is one of two quite different
+/// questions depending on where the cursor is.
+///
+/// The narrower answer comes first: at an argument position whose parameter
+/// has a closed set of accepted values, those values and nothing else. So
+/// `\key c \|` still offers the nine modes rather than burying them in every
+/// command in the language.
+///
+/// Failing that, a cursor inside a `\word` is naming a command, and the answer
+/// is every command the document's [`Scope`] can resolve — the user's own
+/// definitions, their LilyPond's, and the bare names from its word list — each
+/// labelled with where it came from.
+///
+/// Everywhere else, nothing: an open-ended parameter (a pitch, a music block,
+/// most strings) is better left alone than guessed at.
+pub fn completions(
+    doc: &Document,
+    position: Position,
+    ctx: &CompletionContext,
+) -> Vec<CompletionItem> {
+    let arguments = argument_completions(doc, position, ctx);
+    if !arguments.is_empty() {
+        return arguments;
+    }
+
+    let Some(offset) = doc.line_index().offset_at(position) else {
         return Vec::new();
     };
+    match word_being_typed(doc.text(), offset) {
+        Some(typed) => command_names(doc.scope(), doc.line_index().range_of(typed)),
+        None => Vec::new(),
+    }
+}
+
+/// The values the command at `position` accepts at the argument the cursor is
+/// in — see [`Command::completions`](crate::command::Command::completions).
+///
+/// Nothing while the cursor is still in the command word itself: `\ver|sion`
+/// reports argument 0 (there is nowhere else for a cursor in a call to be),
+/// but the thing being typed there is the name, not what follows it.
+fn argument_completions(
+    doc: &Document,
+    position: Position,
+    ctx: &CompletionContext,
+) -> Vec<CompletionItem> {
+    let Some((offset, site)) = call_at(doc, position) else {
+        return Vec::new();
+    };
+    if site.call.keyword.contains(offset) {
+        return Vec::new();
+    }
     let cmd = &site.call.cmd;
     let Some(param) = cmd.signature().get(site.index) else {
         return Vec::new();
     };
 
-    cmd.completions(site.index)
+    cmd.completions(site.index, ctx)
         .iter()
         .map(|candidate| completion_item(param, candidate))
+        .collect()
+}
+
+/// The span of the `\word` the cursor is in the middle of writing: from a
+/// backslash to `offset`, with only name characters between. `None` when the
+/// cursor is anywhere else.
+///
+/// Read straight from the text rather than from the parse tree, because the
+/// point of asking is to complete a name that isn't finished and so very
+/// likely isn't a command yet: a half-typed `\rela` resolves to nothing, and
+/// tree-sitter has no call there for [`call_at`] to find.
+fn word_being_typed(src: &str, offset: usize) -> Option<Span> {
+    let before = src.get(..offset)?;
+    let start = before
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '-'))
+        .filter(|&at| before.as_bytes()[at] == b'\\')?;
+    Some(Span::new(start, offset))
+}
+
+/// Every command the document can see, as completion items replacing `range`
+/// — the `\word` written so far, backslash and all, so that accepting one
+/// doesn't leave the backslash doubled.
+///
+/// Each says where it came from in its `detail`, which is the line the client
+/// shows beside the label: the same attribution [`hover`] leads with, and the
+/// answer to "whose `\foo` is this?" while choosing between two of them.
+fn command_names(scope: &Scope, range: Range) -> Vec<CompletionItem> {
+    scope
+        .visible()
+        .into_iter()
+        .map(|(name, known)| {
+            let text = format!("\\{name}");
+            CompletionItem {
+                label: text.clone(),
+                // A LilyPond command is a binding like any other: one that
+                // takes arguments is a music function, one that doesn't is a
+                // variable holding music.
+                kind: Some(if known.command.signature().is_empty() {
+                    CompletionItemKind::VARIABLE
+                } else {
+                    CompletionItemKind::FUNCTION
+                }),
+                detail: Some(known.layer.origin().to_string()),
+                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: describe(name, known.command.as_ref()),
+                })),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: text,
+                })),
+                ..CompletionItem::default()
+            }
+        })
         .collect()
 }
 
@@ -106,15 +207,11 @@ pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
     // Italic and above the signature: where a command comes from is a question
     // about it rather than part of what it says, so it reads as an attribution
     // rather than as code.
-    let mut markdown = format!("*{}*\n\n", site.call.origin);
-    markdown.push_str(&format!(
-        "```\n{}\n```",
-        signature_label(&site.call.name, cmd.signature())
-    ));
-    if let Some(documentation) = cmd.documentation() {
-        markdown.push_str("\n\n");
-        markdown.push_str(&documentation.markdown);
-    }
+    let markdown = format!(
+        "*{}*\n\n{}",
+        site.call.origin,
+        describe(&site.call.name, cmd.as_ref())
+    );
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -123,6 +220,19 @@ pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
         }),
         range: Some(doc.line_index().range_of(site.call.keyword)),
     })
+}
+
+/// What a command *is*, as Markdown: its signature, and its documentation
+/// where there is any. Shared by [`hover`], which puts the command's origin
+/// above it, and by the name completions, which show it in the detail pane
+/// beside the list.
+fn describe(name: &str, cmd: &dyn Command) -> String {
+    let mut markdown = format!("```\n{}\n```", signature_label(name, cmd.signature()));
+    if let Some(documentation) = cmd.documentation() {
+        markdown.push_str("\n\n");
+        markdown.push_str(&documentation.markdown);
+    }
+    markdown
 }
 
 /// Renders a command's signature as `\name param [optional]`, the label
@@ -150,13 +260,15 @@ fn parameter_information(param: &Param) -> ParameterInformation {
     }
 }
 
-/// Renders one [`Candidate`] for `param`, prefixing a leading backslash on
-/// insertion for an [`ArgKind::Word`] value (`\major`) — the one place a
-/// candidate's on-page label and what actually needs typing differ, since
-/// [`Candidate::label`] deliberately carries neither.
+/// Renders one [`Candidate`] for `param`, adding whatever punctuation the
+/// parameter it fills calls for: a leading backslash for an [`ArgKind::Word`]
+/// value (`\major`), quotes for an [`ArgKind::String`] (`"2.24.3"`). That's
+/// the one place a candidate's on-page label and what actually needs typing
+/// differ, since [`Candidate::label`] deliberately carries neither.
 fn completion_item(param: &Param, candidate: &Candidate) -> CompletionItem {
     let text = match param.kind {
         ArgKind::Word => format!("\\{}", candidate.label),
+        ArgKind::String => format!("\"{}\"", candidate.label),
         _ => candidate.label.to_string(),
     };
     CompletionItem {
@@ -219,13 +331,28 @@ mod tests {
         assert!(signature_help(&doc, pos).is_none());
     }
 
+    /// A workspace with no installation behind it, which is what every test
+    /// here but [`the_version_argument_completes_to_the_installed_version`]
+    /// wants: it makes no difference to any completion but `\version`'s.
+    fn no_install() -> CompletionContext<'static> {
+        CompletionContext {
+            lilypond_version: None,
+        }
+    }
+
+    /// The labels of the completions at `position`, in the order offered.
+    fn labels_at(doc: &Document, position: Position, ctx: &CompletionContext) -> Vec<String> {
+        completions(doc, position, ctx)
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
     #[test]
     fn completions_offers_repeat_kinds() {
         let (doc, pos) = doc_at("\\repeat |");
-        let items = completions(&doc, pos);
-        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(
-            labels,
+            labels_at(&doc, pos, &no_install()),
             vec!["volta", "unfold", "percent", "tremolo", "segno"]
         );
     }
@@ -233,22 +360,104 @@ mod tests {
     #[test]
     fn completions_prefixes_a_backslash_for_word_arguments() {
         let (doc, pos) = doc_at("\\key c |");
-        let items = completions(&doc, pos);
-        assert!(items.iter().any(|i| i.label == "\\major"));
-        assert!(items.iter().any(|i| i.label == "\\minor"));
+        let labels = labels_at(&doc, pos, &no_install());
+        assert!(labels.iter().any(|label| label == "\\major"));
+        assert!(labels.iter().any(|label| label == "\\minor"));
+    }
+
+    #[test]
+    fn a_closed_set_of_argument_values_beats_the_whole_vocabulary() {
+        // The cursor is inside a `\word`, so command names are on offer in
+        // principle — but this one can only be a mode, and every command in
+        // the language would bury the nine that fit.
+        let (doc, pos) = doc_at("\\key c \\m|");
+        let labels = labels_at(&doc, pos, &no_install());
+        assert!(labels.iter().any(|label| label == "\\major"));
+        assert!(!labels.iter().any(|label| label == "\\relative"));
     }
 
     #[test]
     fn completions_empty_for_an_open_ended_parameter() {
         // `\repeat`'s `count` (index 1) has no closed set of values.
         let (doc, pos) = doc_at("\\repeat volta 2|");
-        assert!(completions(&doc, pos).is_empty());
+        assert!(completions(&doc, pos, &no_install()).is_empty());
     }
 
     #[test]
     fn completions_empty_outside_a_call() {
         let (doc, pos) = doc_at("c d |e");
-        assert!(completions(&doc, pos).is_empty());
+        assert!(completions(&doc, pos, &no_install()).is_empty());
+    }
+
+    #[test]
+    fn a_half_typed_command_completes_to_every_name_in_scope() {
+        // `\rela` resolves to nothing, so there is no call here to read a
+        // signature from: the whole vocabulary is the answer, and the client
+        // narrows it to what has been typed.
+        let (doc, pos) = doc_at("{ \\rela| }");
+        let labels = labels_at(&doc, pos, &no_install());
+        assert!(labels.iter().any(|label| label == "\\relative"));
+        assert!(labels.iter().any(|label| label == "\\repeat"));
+    }
+
+    #[test]
+    fn a_name_completion_says_where_the_command_came_from() {
+        let (text, offset) = cursor("foo = { c }\n{ \\f| }\n");
+        let doc = Document::named("song.ly", text);
+        let items = completions(&doc, doc.line_index().position_at(offset), &no_install());
+        let own = items.iter().find(|item| item.label == "\\foo").unwrap();
+        assert_eq!(own.detail.as_deref(), Some("song.ly"));
+        let built_in = items
+            .iter()
+            .find(|item| item.label == "\\relative")
+            .unwrap();
+        assert_eq!(built_in.detail.as_deref(), Some("built-in"));
+    }
+
+    #[test]
+    fn a_name_completion_replaces_the_backslash_already_typed() {
+        // On pain of `\\relative`: the range must reach back over the `\`,
+        // which the editor's own idea of a word may well not include.
+        let (doc, pos) = doc_at("{ \\rela| }");
+        let items = completions(&doc, pos, &no_install());
+        let item = items
+            .iter()
+            .find(|item| item.label == "\\relative")
+            .unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("expected a text edit");
+        };
+        assert_eq!(edit.range.start.character, 2);
+        assert_eq!(edit.range.end.character, 7);
+        assert_eq!(edit.new_text, "\\relative");
+    }
+
+    #[test]
+    fn rewriting_a_command_name_completes_the_name_not_its_argument() {
+        // The cursor is in `\version`'s keyword, which is argument position 0
+        // as far as the call goes — but what's being typed is the name.
+        let (doc, pos) = doc_at("\\ver|sion \"2.24.3\"\n");
+        let ctx = CompletionContext {
+            lilypond_version: Some("2.24.3"),
+        };
+        let labels = labels_at(&doc, pos, &ctx);
+        assert!(labels.iter().any(|label| label == "\\version"));
+        assert!(!labels.iter().any(|label| label == "\"2.24.3\""));
+    }
+
+    #[test]
+    fn the_version_argument_completes_to_the_installed_version() {
+        let (doc, pos) = doc_at("\\version |");
+        let ctx = CompletionContext {
+            lilypond_version: Some("2.24.3"),
+        };
+        assert_eq!(labels_at(&doc, pos, &ctx), vec!["\"2.24.3\""]);
+    }
+
+    #[test]
+    fn the_version_argument_offers_nothing_without_an_installation() {
+        let (doc, pos) = doc_at("\\version |");
+        assert!(completions(&doc, pos, &no_install()).is_empty());
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod scheme;
 mod static_command;
 mod tempo;
 pub mod variable;
+mod version;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -156,8 +157,15 @@ pub trait Command: Send + Sync {
 
     /// The values worth completing at parameter `index`. Empty when the
     /// parameter is open-ended, which is most parameters of most commands.
-    fn completions(&self, _index: usize) -> &[Candidate] {
-        &[]
+    ///
+    /// Owned, and given a [`CompletionContext`], so that a command can
+    /// *compute* its candidates rather than only point at a table:
+    /// [`version`] offers the number of the install the workspace was loaded
+    /// from, which nothing written here could know. The price is a clone of
+    /// the handful of candidates a table holds, paid only when a completion
+    /// list is actually asked for.
+    fn completions(&self, _index: usize, _ctx: &CompletionContext) -> Vec<Candidate> {
+        Vec::new()
     }
 
     /// Problems with a parsed call beyond "an argument didn't match" —
@@ -390,16 +398,45 @@ pub struct Documentation {
 ///
 /// Kept as a plain label/documentation pair rather than an LSP
 /// `CompletionItem`: whether the value needs a leading backslash on insertion
-/// (an [`ArgKind::Word`] does, a [`ArgKind::BareWord`] doesn't) depends on the
-/// parameter it fills, not on the candidate itself, so that decision belongs
-/// to the completion feature that renders these, not to `Command` impls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (an [`ArgKind::Word`] does, a [`ArgKind::BareWord`] doesn't), or a pair of
+/// quotes (an [`ArgKind::String`]), depends on the parameter it fills, not on
+/// the candidate itself, so that decision belongs to the completion feature
+/// that renders these, not to `Command` impls.
+///
+/// [`Cow`] because nearly every candidate is written out in a `static` table
+/// here, while a few — the install's number, offered by [`version`] — are
+/// known only once the workspace has loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     /// The word as written in source, without a leading backslash even where
-    /// the parameter's [`ArgKind`] is [`Word`](ArgKind::Word).
-    pub label: &'static str,
+    /// the parameter's [`ArgKind`] is [`Word`](ArgKind::Word), and without
+    /// quotes where it is [`String`](ArgKind::String).
+    pub label: Cow<'static, str>,
     /// A short, one-line description shown alongside the label.
-    pub documentation: &'static str,
+    pub documentation: Cow<'static, str>,
+}
+
+impl Candidate {
+    /// A candidate spelled out in a table here, both halves `'static`.
+    pub const fn new(label: &'static str, documentation: &'static str) -> Self {
+        Self {
+            label: Cow::Borrowed(label),
+            documentation: Cow::Borrowed(documentation),
+        }
+    }
+}
+
+/// What a [`Command`] may consult when asked for completions: the knowledge
+/// that belongs to the workspace rather than to the command.
+///
+/// Handed down from [`DocumentGraph`](crate::document_graph::DocumentGraph)
+/// rather than read here, because the hand-written commands are built once, by
+/// a `LazyLock` that runs long before any client says which LilyPond it means.
+pub struct CompletionContext<'a> {
+    /// The version of the installation the workspace was loaded from
+    /// (`2.24.3`), or `None` when the client named none — see
+    /// [`install::version`](crate::install::version).
+    pub lilypond_version: Option<&'a str>,
 }
 
 /// What a command may consult while checking a call, and the means to report
@@ -961,72 +998,30 @@ static REFERENCE_PITCH_PARAMS: &[Param] = &[
 /// (`varbaritone`, `subbass`, transposed variants with `_8`/`^8`, …) — but
 /// these cover what the overwhelming majority of scores actually use.
 static CLEF_NAME_CANDIDATES: &[Candidate] = &[
-    Candidate {
-        label: "treble",
-        documentation: "G clef on the second line.",
-    },
-    Candidate {
-        label: "bass",
-        documentation: "F clef on the fourth line.",
-    },
-    Candidate {
-        label: "alto",
-        documentation: "C clef on the third line.",
-    },
-    Candidate {
-        label: "tenor",
-        documentation: "C clef on the fourth line.",
-    },
-    Candidate {
-        label: "percussion",
-        documentation: "Neutral clef for unpitched percussion.",
-    },
-    Candidate {
-        label: "treble_8",
-        documentation: "Treble clef, sounding an octave lower.",
-    },
+    Candidate::new("treble", "G clef on the second line."),
+    Candidate::new("bass", "F clef on the fourth line."),
+    Candidate::new("alto", "C clef on the third line."),
+    Candidate::new("tenor", "C clef on the fourth line."),
+    Candidate::new("percussion", "Neutral clef for unpitched percussion."),
+    Candidate::new("treble_8", "Treble clef, sounding an octave lower."),
 ];
 static CLEF_COMPLETIONS: &[&[Candidate]] = &[CLEF_NAME_CANDIDATES];
 
 /// `\key`'s mode word, offered at its `mode` parameter (index 1); index 0
 /// (the tonic pitch) is open-ended, so it gets no candidates of its own.
 static KEY_MODE_CANDIDATES: &[Candidate] = &[
-    Candidate {
-        label: "major",
-        documentation: "Major (Ionian).",
-    },
-    Candidate {
-        label: "minor",
-        documentation: "Natural minor (Aeolian).",
-    },
-    Candidate {
-        label: "ionian",
-        documentation: "The major scale, named as a church mode.",
-    },
-    Candidate {
-        label: "dorian",
-        documentation: "Minor with a raised sixth.",
-    },
-    Candidate {
-        label: "phrygian",
-        documentation: "Minor with a lowered second.",
-    },
-    Candidate {
-        label: "lydian",
-        documentation: "Major with a raised fourth.",
-    },
-    Candidate {
-        label: "mixolydian",
-        documentation: "Major with a lowered seventh.",
-    },
-    Candidate {
-        label: "aeolian",
-        documentation: "The natural minor scale, named as a church mode.",
-    },
-    Candidate {
-        label: "locrian",
-        documentation: "Diminished-fifth mode, rarely used as a key.",
-    },
+    Candidate::new("major", "Major (Ionian)."),
+    Candidate::new("minor", "Natural minor (Aeolian)."),
+    Candidate::new("ionian", "The major scale, named as a church mode."),
+    Candidate::new("dorian", "Minor with a raised sixth."),
+    Candidate::new("phrygian", "Minor with a lowered second."),
+    Candidate::new("lydian", "Major with a raised fourth."),
+    Candidate::new("mixolydian", "Major with a lowered seventh."),
+    Candidate::new(
+        "aeolian",
+        "The natural minor scale, named as a church mode.",
+    ),
+    Candidate::new("locrian", "Diminished-fifth mode, rarely used as a key."),
 ];
 static KEY_COMPLETIONS: &[&[Candidate]] = &[&[], KEY_MODE_CANDIDATES];
 
@@ -1168,6 +1163,7 @@ pub static RESERVED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
         vec![
             ("repeat", Arc::new(repeat::command()) as Arc<dyn Command>),
             ("tempo", Arc::new(tempo::command())),
+            ("version", Arc::new(version::command())),
         ],
     ))
 });

@@ -3,7 +3,10 @@
 use tower_lsp::lsp_types::Diagnostic;
 
 use super::static_command::{StaticCommand, static_command};
-use super::{Arg, ArgKind, Candidate, CheckContext, Command, CommandCall, MusicContext, Param};
+use super::{
+    Arg, ArgKind, Candidate, CheckContext, Command, CommandCall, CompletionContext, MusicContext,
+    Param,
+};
 
 static REPEAT_PARAMS: &[Param] = &[
     Param::required("kind", ArgKind::BareWord),
@@ -14,26 +17,26 @@ static REPEAT_PARAMS: &[Param] = &[
 /// `\repeat`'s four kinds, offered as completions at its `kind` parameter
 /// (index 0).
 static REPEAT_KIND_CANDIDATES: &[Candidate] = &[
-    Candidate {
-        label: "volta",
-        documentation: "Double-dot repeat barlines, optionally with alternate endings (first time bar &c.). Usually full bars, and vertically aligned across a full system.",
-    },
-    Candidate {
-        label: "unfold",
-        documentation: "Writes the repeated music out in full, `count` times. Can be used on an individual voice or staff.",
-    },
-    Candidate {
-        label: "percent",
-        documentation: "Slash or percent signs for repeating a single beat or bar within the structure of bars. Common for percussion. Can be used on one staff of a system.",
-    },
-    Candidate {
-        label: "tremolo",
-        documentation: "A tremolo repeat, beamed between the repeated notes.",
-    },
-    Candidate {
-        label: "segno",
-        documentation: "For D.C./D.S. al coda/fine repeats, often with volta repeats nested inside. Vertically aligned across a full system.",
-    },
+    Candidate::new(
+        "volta",
+        "Double-dot repeat barlines, optionally with alternate endings (first time bar &c.). Usually full bars, and vertically aligned across a full system.",
+    ),
+    Candidate::new(
+        "unfold",
+        "Writes the repeated music out in full, `count` times. Can be used on an individual voice or staff.",
+    ),
+    Candidate::new(
+        "percent",
+        "Slash or percent signs for repeating a single beat or bar within the structure of bars. Common for percussion. Can be used on one staff of a system.",
+    ),
+    Candidate::new(
+        "tremolo",
+        "A tremolo repeat, beamed between the repeated notes.",
+    ),
+    Candidate::new(
+        "segno",
+        "For D.C./D.S. al coda/fine repeats, often with volta repeats nested inside. Vertically aligned across a full system.",
+    ),
 ];
 static REPEAT_COMPLETIONS: &[&[Candidate]] = &[REPEAT_KIND_CANDIDATES];
 
@@ -67,8 +70,8 @@ impl Command for RepeatCommand {
         self.base.documentation()
     }
 
-    fn completions(&self, index: usize) -> &[Candidate] {
-        self.base.completions(index)
+    fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {
+        self.base.completions(index, ctx)
     }
 
     fn check(&self, call: &CommandCall, ctx: &CheckContext) -> Vec<Diagnostic> {

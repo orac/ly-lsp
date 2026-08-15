@@ -23,8 +23,8 @@ use crate::vocabulary::Layer;
 
 use super::variable::Variable;
 use super::{
-    Arg, ArgReader, Candidate, CheckContext, Command, CommandCall, Documentation, MusicContext,
-    Param,
+    Arg, ArgReader, Candidate, CheckContext, Command, CommandCall, CompletionContext,
+    Documentation, MusicContext, Param,
 };
 
 /// One name a file binds, as either reader found it — the input [`layer`]
@@ -144,8 +144,8 @@ impl Command for Definition {
         self.command.documentation()
     }
 
-    fn completions(&self, index: usize) -> &[Candidate] {
-        self.command.completions(index)
+    fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {
+        self.command.completions(index, ctx)
     }
 
     fn check(

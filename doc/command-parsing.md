@@ -4,7 +4,7 @@ The server understands the *arguments* to commands, not just their names. `\repe
 
 ## What it buys
 
-- **Completion** inside an argument (e.g. `\repeat volta`).
+- **Completion** of a command name, from everything in scope, each labelled with where it came from — and inside an argument (e.g. `\repeat volta`), which is offered in preference wherever a parameter has a closed set of values.
 - **Signature help** — `textDocument/signatureHelp`, argument-position-aware, as the user types.
 - **Semantic highlighting** of bare-word arguments, which the TextMate grammar can't get right because it doesn't know which words are arguments to what.
 - **Hover** with per-command and per-argument documentation.
@@ -53,11 +53,15 @@ Each source of knowledge is a `Layer`, and what a document sees is a `Scope`: a 
 | the install | what LilyPond itself defines |
 | the words list | names with nothing behind them |
 
-**Precedence is the order of the stack.** `Scope::get` is a search from the top, and returns the command and which layer it came rfom; `Scope::is_known` is that plus the CamelCase rule (a rule about the *shape* of a name, which no map of names can hold). Every scope is assembled by `Scope::for_document`, so that function is the single place the order is stated.
+**Precedence is the order of the stack.** `Scope::get` is a search from the top, and returns the command and which layer it came from; `Scope::is_known` is that plus the CamelCase rule (a rule about the *shape* of a name, which no map of names can hold). Every scope is assembled by `Scope::for_document`, so that function is the single place the order is stated.
 
 **The hand-written table is two layers because it answers two questions.** `\repeat`, `\set` and the mode switches are reserved words in LilyPond's own grammar and cannot be shadowed by declarations in files. `\clef`, `\key`, `\relative` etc. are ordinary `define-music-function`s in `ly/music-functions-init.ly`; we keep curated signatures for them because ours are better than what the reader recovers (`\relative` and `\fixed` most of all, whose octave-reference behaviour no signature expresses), but LilyPond's own lookup lets a file shadow them, so they sit *below* the file layers.
 
 **Every layer says where its knowledge came from**, as a `Layer::origin`: the file's name for a document, `lilypond-2.24.3` for the install, `lilypond-words` for the words list, `built-in` for the two hand-written layers. Hover shows it as its first line, so a reader can tell their own `\foo` from LilyPond's. It sits on the layer rather than on each command because it is a property of the source, one per layer, and every command in a layer shares it. Every layer has one: a buffer with no file behind it is `untitled`, as its URI would be.
+
+**Completing a name is a question for the whole scope**, not for any one command: `Scope::visible` is `get` asked of every name at once, each answered by the nearest layer that has it, so a shadowed `\foo` is never offered alongside the one that would actually be called. Each item's `detail` is that layer's origin, which is what tells two `\foo`s apart in a list where hover can't reach. Because the point is to complete a name that isn't finished, the cursor position is read lexically — the backslash-word being typed — rather than from the parse tree, which has no call there to find; the completion replaces that whole word, backslash included, since the editor's own idea of a word may not include it.
+
+**A command can compute its completions**, through `Command::completions(index, ctx)`. Nearly all of them return a slice of a table written in the source, but `\version` offers the version of the installed LilyPond, which no table here can know: the `CompletionContext` carries it down from `DocumentGraph`, which reads it from the share directory the client named at `initialize`. With no installation behind it, `\version` offers nothing rather than a number that would be a lie.
 
 A words-list entry resolves to a `Variable`: a command with an empty signature. A call to one consumes nothing, so the block after `\break` is read as ordinary music.
 

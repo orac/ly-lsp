@@ -1,7 +1,7 @@
 //! `\tempo`, in each of its three written forms.
 
 use super::static_command::{StaticCommand, static_command};
-use super::{Arg, ArgKind, ArgReader, Candidate, Command, MusicContext, Param};
+use super::{Arg, ArgKind, ArgReader, Candidate, Command, CompletionContext, MusicContext, Param};
 
 static TEMPO_PARAMS: &[Param] = &[
     Param::optional("text", ArgKind::String),
@@ -51,8 +51,8 @@ impl Command for TempoCommand {
         self.base.documentation()
     }
 
-    fn completions(&self, index: usize) -> &[Candidate] {
-        self.base.completions(index)
+    fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {
+        self.base.completions(index, ctx)
     }
 }
 

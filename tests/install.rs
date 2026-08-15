@@ -6,8 +6,10 @@ mod common;
 
 use common::require_installs;
 use ly_lsp::command;
+use ly_lsp::document_graph::DocumentGraph;
 use ly_lsp::install;
 use ly_lsp::vocabulary;
+use tower_lsp::lsp_types::{Position, Url};
 
 /// The fixed file list is only staleness-proof if a version that renames or
 /// drops one of these files fails a test loudly, rather than quietly losing
@@ -118,6 +120,47 @@ fn the_install_layer_clears_a_sensible_lower_bound() {
             "LilyPond {}: only {} commands in the install layer, expected several hundred",
             lily.version,
             layer.len()
+        );
+    }
+}
+
+/// The two things completion knows only because a real installation is
+/// behind it: the number to write in `\version`, and where a name that came
+/// out of the install says it came from.
+///
+/// End to end through the [`DocumentGraph`], because that is where the version
+/// is picked out of the share directory the client named, and a version
+/// derived correctly but never threaded to the command that offers it would
+/// pass any narrower test.
+#[test]
+fn completion_offers_what_the_installation_says() {
+    for lily in require_installs() {
+        let ws = DocumentGraph::new();
+        ws.load_vocabulary(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: vocabulary didn't load: {err}", lily.version)
+        });
+        let uri = Url::parse("untitled:score.ly").unwrap();
+        ws.open(uri.clone(), "\\version \n{ \\acce }\n".to_string());
+
+        let versions = ws.completions(&uri, Position::new(0, 9));
+        let labels: Vec<&str> = versions.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![format!("\"{}\"", lily.version)],
+            "LilyPond {}: `\\version ` should complete to the installed version",
+            lily.version
+        );
+
+        let names = ws.completions(&uri, Position::new(1, 7));
+        let accent = names
+            .iter()
+            .find(|item| item.label == "\\accent")
+            .unwrap_or_else(|| panic!("LilyPond {}: \\accent should be offered", lily.version));
+        assert_eq!(
+            accent.detail.as_deref(),
+            Some(format!("lilypond-{}", lily.version).as_str()),
+            "LilyPond {}: \\accent comes from the install, and should say so",
+            lily.version
         );
     }
 }

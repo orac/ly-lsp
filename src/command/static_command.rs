@@ -1,6 +1,8 @@
 //! The plain-signature layer every hand-written command starts from.
 
-use super::{Candidate, Command, CommandCall, Documentation, MusicContext, Param};
+use super::{
+    Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext, Param,
+};
 
 /// A command whose only job is to consume a fixed signature and, if it
 /// establishes one, set a fixed [`MusicContext`] for its body — every
@@ -52,8 +54,10 @@ impl Command for StaticCommand {
         self.documentation.as_ref()
     }
 
-    fn completions(&self, index: usize) -> &[Candidate] {
-        self.completions.get(index).copied().unwrap_or(&[])
+    fn completions(&self, index: usize, _ctx: &CompletionContext) -> Vec<Candidate> {
+        self.completions
+            .get(index)
+            .map_or_else(Vec::new, |candidates| candidates.to_vec())
     }
 }
 

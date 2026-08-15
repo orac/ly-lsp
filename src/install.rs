@@ -98,16 +98,23 @@ pub fn load(ly_dir: &Path) -> Layer {
     Layer::new(origin(ly_dir), commands)
 }
 
-/// What hover calls this layer: `lilypond-2.24.3`, naming the version whose
-/// files it read.
+/// The version an installation is of, read from the name of its
+/// version-specific share directory: `share/lilypond/2.24.3` is `2.24.3`.
 ///
-/// Taken from the directory holding `ly_dir`, which in an installation is the
-/// version-specific share directory (`share/lilypond/2.24.3/ly`) — the same
-/// layout [`load`] relies on to find [`FILES`] at all. A directory not laid
-/// out that way still names LilyPond, just not which one.
+/// The same layout assumption [`load`] relies on to find [`FILES`] at all, and
+/// the one the client makes in passing that directory as `lilypondShareDir`.
+/// `None` for a directory not laid out that way, which is honest: we would
+/// rather offer no version than a wrong one.
+pub fn version(share_dir: &Path) -> Option<&str> {
+    share_dir.file_name()?.to_str()
+}
+
+/// What hover calls this layer: `lilypond-2.24.3`, naming the version whose
+/// files it read. A directory that doesn't name a [`version`] still names
+/// LilyPond, just not which one.
 fn origin(ly_dir: &Path) -> String {
-    match ly_dir.parent().and_then(Path::file_name) {
-        Some(version) => format!("lilypond-{}", version.to_string_lossy()),
+    match ly_dir.parent().and_then(version) {
+        Some(version) => format!("lilypond-{version}"),
         None => "lilypond".to_string(),
     }
 }

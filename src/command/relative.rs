@@ -1,7 +1,10 @@
 //! `\relative [pitch] { … }`.
 
 use super::static_command::{StaticCommand, static_command};
-use super::{Arg, Candidate, Command, CommandCall, MusicContext, Param, REFERENCE_PITCH_PARAMS};
+use super::{
+    Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, Param,
+    REFERENCE_PITCH_PARAMS,
+};
 use crate::notes::Pitch;
 
 /// LilyPond's default `\relative` reference when none is written: middle C.
@@ -48,8 +51,8 @@ impl Command for RelativeCommand {
         self.base.documentation()
     }
 
-    fn completions(&self, index: usize) -> &[Candidate] {
-        self.base.completions(index)
+    fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {
+        self.base.completions(index, ctx)
     }
 }
 

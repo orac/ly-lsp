@@ -33,7 +33,7 @@
 //! See [`doc/command-parsing.md`](../doc/command-parsing.md) for the fuller
 //! design.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -112,6 +112,14 @@ impl Layer {
     /// Every name this layer defines, in no particular order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.commands.keys().map(String::as_str)
+    }
+
+    /// Every command this layer defines, with the name it answers to, in no
+    /// particular order.
+    pub fn commands(&self) -> impl Iterator<Item = (&str, &Arc<dyn Command>)> {
+        self.commands
+            .iter()
+            .map(|(name, command)| (name.as_str(), command))
     }
 }
 
@@ -225,6 +233,28 @@ impl Scope {
                 layer,
             })
         })
+    }
+
+    /// Everything this scope can resolve, with the name each command answers
+    /// to: what [`get`](Self::get) says, for every name at once, which is what
+    /// a completion list is. A name bound in more than one layer appears
+    /// once, from the nearest — the same shadowing rule `get` follows, so the
+    /// list can never offer a `\foo` that means something else once written.
+    ///
+    /// A `Vec` rather than an iterator because remembering which names have
+    /// already been answered for takes state the caller has no use for, and
+    /// the caller wants the whole lot anyway.
+    pub fn visible(&self) -> Vec<(&str, Known<'_>)> {
+        let mut seen = HashSet::new();
+        let mut visible = Vec::new();
+        for layer in self.layers() {
+            for (name, command) in layer.commands() {
+                if seen.insert(name) {
+                    visible.push((name, Known { command, layer }));
+                }
+            }
+        }
+        visible
     }
 
     /// Whether `\name` is a command we recognise at all. `name` is the command
@@ -452,6 +482,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_shadowed_name_is_listed_once_by_the_layer_that_wins() {
+        // What a completion list must not do: offer `\dup` twice, one of them
+        // a signature no call in this document would ever get.
+        let near = layer_defining("dup", 1);
+        let far = layer_defining("dup", 2);
+        let scope = Scope::EMPTY.for_document(&[near, far]);
+        let dups: Vec<_> = scope
+            .visible()
+            .into_iter()
+            .filter(|(name, _)| *name == "dup")
+            .collect();
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].1.command.signature().len(), 1);
     }
 
     #[test]

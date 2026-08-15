@@ -100,10 +100,14 @@ pub struct Document {
     /// read a dozen times.
     commands_defined: Arc<Layer>,
     notes: NoteAnalysis,
-    /// The [`Scope::fingerprint`] `notes` was analysed in. Compared against
-    /// the current scope by [`refresh`](Self::refresh), which is what makes an
-    /// edit to an included file re-analyse the files that include it.
-    analysed_in: u64,
+    /// The scope `notes` was analysed in. Compared (by
+    /// [`Scope::fingerprint`]) against the current scope by
+    /// [`refresh`](Self::refresh), which is what makes an edit to an included
+    /// file re-analyse the files that include it — and kept whole rather than
+    /// as its fingerprint alone because it is also the answer to "what could
+    /// be written here?", which completion asks. Cheap to hold: a [`Scope`] is
+    /// a shared list of `Arc<Layer>`.
+    analysed_in: Scope,
 }
 
 impl Document {
@@ -162,8 +166,15 @@ impl Document {
             includes: analysis.includes,
             commands_defined,
             notes,
-            analysed_in: scope.fingerprint(),
+            analysed_in: scope,
         }
+    }
+
+    /// What this document can see: the layers it was last analysed in, which
+    /// is what completion offers and what any other "what does `\foo` mean
+    /// here?" question is answered from.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.analysed_in
     }
 
     /// The layer of commands this file defines, for stacking into a [`Scope`].
@@ -184,12 +195,11 @@ impl Document {
     /// moment of an edit, means the cost falls only on documents actually
     /// queried, and needs no reverse include index to find them.
     pub(crate) fn refresh(&mut self, scope: &Scope) {
-        let fingerprint = scope.fingerprint();
-        if fingerprint == self.analysed_in {
+        if scope.fingerprint() == self.analysed_in.fingerprint() {
             return;
         }
         self.notes = note_analyser::analyse(&self.tree, &self.text, scope);
-        self.analysed_in = fingerprint;
+        self.analysed_in = scope.clone();
     }
 
     /// Applies a single LSP content change. A change with a `range` is spliced

@@ -18,6 +18,7 @@ use tower_lsp::lsp_types::{
     TextDocumentContentChangeEvent, TextEdit, Url, WorkspaceEdit,
 };
 
+use crate::command::CompletionContext;
 use crate::document::Document;
 use crate::vocabulary::{self, Scope};
 
@@ -31,6 +32,13 @@ pub struct DocumentGraph {
     /// undefined-reference diagnostics disabled rather than flagging every
     /// command when the words file is unavailable.
     base: OnceLock<Scope>,
+    /// The version of the installation [`base`](Self::base) was loaded from
+    /// (`2.24.3`), for the commands whose completions depend on it — which is
+    /// `\version`'s, and so far only `\version`'s. Kept beside the base rather
+    /// than dug back out of it, since a layer's
+    /// [`origin`](crate::vocabulary::Layer::origin) is a label to show a
+    /// reader, not a field to parse.
+    lilypond_version: OnceLock<String>,
     /// Directories from LilyPond's `-I` option, searched (after the including
     /// file's own directory) when resolving `\include`.
     search_paths: OnceLock<Vec<PathBuf>>,
@@ -117,6 +125,9 @@ impl DocumentGraph {
     /// the returned error says why, for the caller to log.
     pub fn load_vocabulary(&self, share_dir: &Path) -> Result<(), LoadVocabularyError> {
         let base = vocabulary::workspace_base(share_dir)?;
+        if let Some(version) = crate::install::version(share_dir) {
+            let _ = self.lilypond_version.set(version.to_string());
+        }
         self.base
             .set(base)
             .map_err(|_| LoadVocabularyError::AlreadyLoaded)
@@ -377,11 +388,17 @@ impl DocumentGraph {
         .flatten()
     }
 
-    /// Argument completions at `position` in `uri`. See
+    /// Completions at `position` in `uri` — command names or a closed-set
+    /// argument, depending on where the cursor is. See
     /// [`command_assist::completions`](crate::command_assist::completions).
     pub fn completions(&self, uri: &Url, position: Position) -> Vec<CompletionItem> {
-        self.with_document(uri, |doc| crate::command_assist::completions(doc, position))
-            .unwrap_or_default()
+        let ctx = CompletionContext {
+            lilypond_version: self.lilypond_version.get().map(String::as_str),
+        };
+        self.with_document(uri, |doc| {
+            crate::command_assist::completions(doc, position, &ctx)
+        })
+        .unwrap_or_default()
     }
 
     /// Hover documentation for the command word at `position` in `uri`. See
