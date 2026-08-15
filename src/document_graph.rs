@@ -91,7 +91,8 @@ impl DocumentGraph {
         // Once a file is open its live buffer supersedes any on-disk parse we
         // cached while it was merely an include; drop the now-shadowed entry.
         self.cache.remove(&uri);
-        self.open.insert(uri, Document::new(text));
+        let document = Document::named(file_name(&uri), text);
+        self.open.insert(uri, document);
     }
 
     pub fn close(&self, uri: &Url) {
@@ -501,7 +502,7 @@ impl DocumentGraph {
         }
 
         // Absent or stale: (re)read and parse, then cache.
-        let mut document = Document::new(std::fs::read_to_string(&path).ok()?);
+        let mut document = Document::named(file_name(uri), std::fs::read_to_string(&path).ok()?);
         let result = f(&mut document);
         self.cache
             .insert(uri.clone(), CachedDocument { modified, document });
@@ -529,6 +530,27 @@ fn resolve_include(base: &Url, path: &str, search_paths: &[PathBuf]) -> Option<U
     Url::from_file_path(resolved).ok()
 }
 
+/// What to call the document at `uri` when hover says where a command came
+/// from: the last segment of the path, `parts/violin.ly` becoming `violin.ly`.
+///
+/// Two includes with the same file name are told apart only by hovering the
+/// second one, which is a price worth paying for a line short enough to read:
+/// where the command *is* remains go-to-definition's answer, not hover's.
+/// Taken through the file path rather than off the URI's last segment, so that
+/// the name reads as it does on disk (`my%20score.ly` is `my score.ly`). A URI
+/// that names no file — an unsaved buffer's `untitled:` — falls back to the
+/// whole of it rather than to nothing.
+fn file_name(uri: &Url) -> String {
+    uri.to_file_path()
+        .ok()
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or_else(
+            || uri.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+}
+
 /// The zero-width range at the start of a file.
 fn start_of_file() -> Range {
     Range::new(Position::new(0, 0), Position::new(0, 0))
@@ -541,6 +563,18 @@ mod tests {
 
     fn url(path: &Path) -> Url {
         Url::from_file_path(path).expect("absolute path")
+    }
+
+    #[test]
+    fn a_document_is_named_for_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("my score.ly");
+        let graph = DocumentGraph::new();
+        graph.open(url(&score), "foo = { c }\n".to_string());
+        let named = graph.with_document(&url(&score), |document| {
+            document.commands_defined().origin().to_string()
+        });
+        assert_eq!(named.as_deref(), Some("my score.ly"));
     }
 
     /// Two scores including one shared file of music functions. The scope each

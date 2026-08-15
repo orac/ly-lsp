@@ -20,16 +20,18 @@ use ly_lsp::vocabulary::Scope;
 use tree_sitter::Parser;
 
 fn main() {
-    let src = match std::env::args().nth(1) {
+    let (name, src) = match std::env::args().nth(1) {
         Some(path) => {
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+            (path, src)
         }
         None => {
             let mut buf = String::new();
             std::io::stdin()
                 .read_to_string(&mut buf)
                 .expect("read stdin");
-            buf
+            ("stdin".to_string(), buf)
         }
     };
 
@@ -44,6 +46,7 @@ fn main() {
     let scope = Scope::builtins().for_document(&[Arc::new(definition::layer(
         scheme::read(&tree, &src),
         Arc::from(src.as_str()),
+        Arc::from(name.as_str()),
     ))]);
     let analysis = analyse(&tree, &src, &scope);
 

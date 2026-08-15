@@ -59,7 +59,8 @@ fn the_layer_defines_the_documented_handful() {
         for name in ["accent", "pp", "slurUp", "break"] {
             let command = scope
                 .get(name)
-                .unwrap_or_else(|| panic!("LilyPond {}: \\{name} should resolve", lily.version));
+                .unwrap_or_else(|| panic!("LilyPond {}: \\{name} should resolve", lily.version))
+                .command;
             assert!(
                 command.signature().is_empty(),
                 "LilyPond {}: \\{name} should take no arguments, got {:?}",
@@ -84,7 +85,8 @@ fn a_documented_music_function_carries_its_docstring_and_signature() {
 
         let absolute = scope
             .get("absolute")
-            .unwrap_or_else(|| panic!("LilyPond {}: \\absolute should resolve", lily.version));
+            .unwrap_or_else(|| panic!("LilyPond {}: \\absolute should resolve", lily.version))
+            .command;
         assert_eq!(
             absolute
                 .signature()

@@ -86,12 +86,13 @@ pub fn completions(doc: &Document, position: Position) -> Vec<CompletionItem> {
 }
 
 /// Hover documentation for the command word at `position`, if the cursor sits
-/// on one: its signature, plus its documentation where there is any — curated
-/// prose for a built-in, a summary of the value for a variable. `None` when the
-/// cursor is elsewhere in a call's header or body — hovering an argument value
-/// isn't wired up here, only the command word itself — and `None` for a command
-/// with neither parameters nor documentation: a popup reading just `\foo` over
-/// the `\foo` you are already looking at is worse than nothing.
+/// on one: where the command came from, its signature, and its documentation
+/// where there is any — curated prose for a built-in, a summary of the value
+/// for a variable. `None` when the cursor is elsewhere in a call's header or
+/// body — hovering an argument value isn't wired up here, only the command word
+/// itself — and `None` for a command with neither parameters nor documentation:
+/// a popup reading just `\foo` over the `\foo` you are already looking at is
+/// worse than nothing.
 pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
     let (offset, site) = call_at(doc, position)?;
     if !site.call.keyword.contains(offset) {
@@ -102,10 +103,14 @@ pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
         return None;
     }
 
-    let mut markdown = format!(
+    // Italic and above the signature: where a command comes from is a question
+    // about it rather than part of what it says, so it reads as an attribution
+    // rather than as code.
+    let mut markdown = format!("*{}*\n\n", site.call.origin);
+    markdown.push_str(&format!(
         "```\n{}\n```",
         signature_label(&site.call.name, cmd.signature())
-    );
+    ));
     if let Some(documentation) = cmd.documentation() {
         markdown.push_str("\n\n");
         markdown.push_str(&documentation.markdown);
@@ -168,14 +173,28 @@ mod tests {
     use super::*;
     use tower_lsp::lsp_types::Position;
 
+    /// Splits `src` at its `|` cursor mark into the text without it and the
+    /// offset it stood at.
+    fn cursor(src: &str) -> (String, usize) {
+        let offset = src.find('|').expect("src must contain a `|` cursor mark");
+        (format!("{}{}", &src[..offset], &src[offset + 1..]), offset)
+    }
+
     /// Builds a document from `src` (`|` marks the cursor, stripped before
     /// parsing) and returns it with the cursor's position.
     fn doc_at(src: &str) -> (Document, Position) {
-        let offset = src.find('|').expect("src must contain a `|` cursor mark");
-        let text = format!("{}{}", &src[..offset], &src[offset + 1..]);
-        let doc = Document::new(text.clone());
+        let (text, offset) = cursor(src);
+        let doc = Document::new(text);
         let position = doc.line_index().position_at(offset);
         (doc, position)
+    }
+
+    /// The markdown of the hover at `position`, which there must be one of.
+    fn markup_of(doc: &Document, position: Position) -> String {
+        let HoverContents::Markup(markup) = hover(doc, position).expect("hover").contents else {
+            panic!("expected markup content");
+        };
+        markup.value
     }
 
     #[test]
@@ -254,6 +273,28 @@ mod tests {
             panic!("expected markup content");
         };
         assert!(markup.value.contains("foo = { c }"), "{}", markup.value);
+    }
+
+    #[test]
+    fn hover_names_the_file_a_command_was_defined_in() {
+        // The first line of every hover says where the knowledge came from;
+        // for a definition in a file, that is the file's name.
+        let (text, offset) = cursor("foo = { c }\n\\f|oo\n");
+        let doc = Document::named("song.ly", text);
+        let markup = markup_of(&doc, doc.line_index().position_at(offset));
+        assert!(markup.starts_with("*song.ly*"), "{markup}");
+    }
+
+    #[test]
+    fn hover_over_our_own_knowledge_says_so() {
+        let (doc, pos) = doc_at("\\rela|tive c' { c }");
+        assert!(markup_of(&doc, pos).starts_with("*built-in*"));
+    }
+
+    #[test]
+    fn a_document_with_no_file_behind_it_still_says_what_it_is() {
+        let (doc, pos) = doc_at("foo = { c }\n\\f|oo\n");
+        assert!(markup_of(&doc, pos).starts_with("*untitled*"));
     }
 
     #[test]

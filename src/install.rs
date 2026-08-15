@@ -95,7 +95,21 @@ pub fn load(ly_dir: &Path) -> Layer {
             commands.insert(binding.name, command);
         }
     }
-    Layer::new(commands)
+    Layer::new(origin(ly_dir), commands)
+}
+
+/// What hover calls this layer: `lilypond-2.24.3`, naming the version whose
+/// files it read.
+///
+/// Taken from the directory holding `ly_dir`, which in an installation is the
+/// version-specific share directory (`share/lilypond/2.24.3/ly`) — the same
+/// layout [`load`] relies on to find [`FILES`] at all. A directory not laid
+/// out that way still names LilyPond, just not which one.
+fn origin(ly_dir: &Path) -> String {
+    match ly_dir.parent().and_then(Path::file_name) {
+        Some(version) => format!("lilypond-{}", version.to_string_lossy()),
+        None => "lilypond".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +120,14 @@ mod tests {
     fn a_missing_directory_yields_an_empty_layer_rather_than_failing() {
         let layer = load(Path::new("/does/not/exist/ever/ly"));
         assert!(layer.is_empty());
+    }
+
+    #[test]
+    fn the_layer_is_named_for_the_version_it_read() {
+        assert_eq!(
+            origin(Path::new("/usr/share/lilypond/2.24.3/ly")),
+            "lilypond-2.24.3"
+        );
     }
 
     #[test]

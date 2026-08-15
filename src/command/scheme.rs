@@ -678,7 +678,7 @@ mod tests {
     /// The layer `src`'s Scheme alone makes — the document merges the
     /// assignment query's bindings in too, which these tests don't exercise.
     fn layer(src: &str) -> Layer {
-        definition::layer(bindings(src), Arc::from(src))
+        definition::layer(bindings(src), Arc::from(src), Arc::from("test.ly"))
     }
 
     /// The names `src` binds from inside Scheme, with the text each span

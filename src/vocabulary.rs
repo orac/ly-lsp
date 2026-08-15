@@ -63,15 +63,31 @@ static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(0);
 /// alone.
 pub struct Layer {
     id: u64,
+    origin: Arc<str>,
     commands: HashMap<String, Arc<dyn Command>>,
 }
 
 impl Layer {
-    pub fn new(commands: HashMap<String, Arc<dyn Command>>) -> Self {
+    /// `origin` is what to call the source these commands came from: a file
+    /// name, `lilypond-2.24.3`, `lilypond-words`. See [`origin`](Self::origin).
+    pub fn new(origin: impl Into<Arc<str>>, commands: HashMap<String, Arc<dyn Command>>) -> Self {
         Self {
             id: NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed),
+            origin: origin.into(),
             commands,
         }
+    }
+
+    /// Where this layer's knowledge came from, to be shown to the reader —
+    /// hover names it, so that `\foo` says whether it is the user's own, their
+    /// LilyPond's, or merely a word in a list.
+    ///
+    /// Held here rather than on each [`Command`] because it is a property of
+    /// the *source*, one per layer, and every command a layer holds shares it.
+    /// A [`Scope`] lookup hands it back alongside the command it found, since a
+    /// command on its own can't say which layer answered for it.
+    pub fn origin(&self) -> &Arc<str> {
+        &self.origin
     }
 
     /// The command this layer defines for `name`, if any.
@@ -109,9 +125,21 @@ impl std::fmt::Debug for Layer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Layer")
             .field("id", &self.id)
+            .field("origin", &self.origin)
             .field("commands", &self.commands.len())
             .finish()
     }
+}
+
+/// What a [`Scope`] knows about a name: the [`Command`] it resolves to, and the
+/// [`Layer`] that answered for it.
+///
+/// The layer travels with the command because the command can't say which one
+/// holds it — the same `Arc<dyn Command>` may sit in several — and where a name
+/// was found is part of the answer to "what is `\foo`?"; see [`Layer::origin`].
+pub struct Known<'a> {
+    pub command: &'a Arc<dyn Command>,
+    pub layer: &'a Arc<Layer>,
 }
 
 /// The commands visible from one document: layers, nearest first.
@@ -188,9 +216,15 @@ impl Scope {
             .map(|cell| &cell.layer)
     }
 
-    /// The command `\name` refers to: the nearest layer that has one wins.
-    pub fn get(&self, name: &str) -> Option<&Arc<dyn Command>> {
-        self.layers().find_map(|layer| layer.get(name))
+    /// What `\name` refers to: the nearest layer that has a command for it
+    /// wins.
+    pub fn get(&self, name: &str) -> Option<Known<'_>> {
+        self.layers().find_map(|layer| {
+            Some(Known {
+                command: layer.get(name)?,
+                layer,
+            })
+        })
     }
 
     /// Whether `\name` is a command we recognise at all. `name` is the command
@@ -260,15 +294,19 @@ pub fn workspace_base(share_dir: &Path) -> std::io::Result<Scope> {
 /// Each becomes a [`Variable`] — a command with no arguments, so a block
 /// after it is read as ordinary music.
 fn words_layer(text: &str) -> Layer {
-    let commands = parse_words(text)
+    let commands: HashMap<String, Arc<dyn Command>> = parse_words(text)
         .chain(EXTRA_COMMANDS.iter().map(|name| (*name).to_string()))
         .map(|name| {
             let command = Arc::new(Variable::new(name.clone())) as Arc<dyn Command>;
             (name, command)
         })
         .collect();
-    Layer::new(commands)
+    Layer::new(WORDS_ORIGIN, commands)
 }
+
+/// What hover calls the words layer: the name of the file it is read from, and
+/// as good a summary of what it knows as any — a name and nothing else.
+const WORDS_ORIGIN: &str = "lilypond-words";
 
 /// Whether `name` looks like a context reference, i.e. its first character is an
 /// uppercase letter.
@@ -303,6 +341,7 @@ mod tests {
         Arc::new(crate::command::definition::layer(
             scheme::read(&crate::document::parse(&src, None), &src),
             Arc::from(src.as_str()),
+            Arc::from("test.ly"),
         ))
     }
 
@@ -324,6 +363,23 @@ mod tests {
         assert!(layer.get("score").is_some());
         assert!(layer.get("Staff").is_none());
         assert!(layer.get("NoteHead").is_none());
+    }
+
+    #[test]
+    fn the_words_layer_is_named_for_the_file_it_read() {
+        let layer = words_layer("\\\\relative\n");
+        assert_eq!(layer.origin().as_ref(), "lilypond-words");
+    }
+
+    #[test]
+    fn a_lookup_says_which_layer_answered() {
+        // Two layers define `dup`; the one that wins is the one hover names.
+        let scope = words("").for_document(&[layer_defining("dup", 1)]);
+        let known = scope.get("dup").expect("dup");
+        assert!(Arc::ptr_eq(
+            known.layer,
+            scope.layers().nth(1).expect("file")
+        ));
     }
 
     #[test]
@@ -355,7 +411,7 @@ mod tests {
     #[test]
     fn get_resolves_a_reserved_command() {
         let scope = Scope::builtins_only();
-        let repeat = scope.get("repeat").expect("repeat is reserved");
+        let repeat = scope.get("repeat").expect("repeat is reserved").command;
         assert_eq!(repeat.name(), "repeat");
         assert_eq!(repeat.signature().len(), 3);
     }
@@ -367,7 +423,14 @@ mod tests {
         // read as ordinary music.
         let scope = words("\\\\break\n").for_document(&[]);
         assert!(scope.is_known("break"));
-        assert!(scope.get("break").expect("break").signature().is_empty());
+        assert!(
+            scope
+                .get("break")
+                .expect("break")
+                .command
+                .signature()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -380,7 +443,15 @@ mod tests {
     fn a_file_layer_defines_a_command_the_base_never_heard_of() {
         let scope = words("").for_document(&[layer_defining("myFunc", 1)]);
         assert!(scope.is_known("myFunc"));
-        assert_eq!(scope.get("myFunc").expect("myFunc").signature().len(), 1);
+        assert_eq!(
+            scope
+                .get("myFunc")
+                .expect("myFunc")
+                .command
+                .signature()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -390,9 +461,12 @@ mod tests {
         let near = layer_defining("dup", 1);
         let far = layer_defining("dup", 2);
         let scope = Scope::EMPTY.for_document(&[Arc::clone(&near), Arc::clone(&far)]);
-        assert_eq!(scope.get("dup").expect("dup").signature().len(), 1);
+        assert_eq!(scope.get("dup").expect("dup").command.signature().len(), 1);
         let reversed = Scope::EMPTY.for_document(&[far, near]);
-        assert_eq!(reversed.get("dup").expect("dup").signature().len(), 2);
+        assert_eq!(
+            reversed.get("dup").expect("dup").command.signature().len(),
+            2
+        );
     }
 
     #[test]
@@ -401,7 +475,15 @@ mod tests {
         // never reaches name lookup, so an assignment of that name can't
         // shadow it and ours must still win.
         let scope = Scope::builtins().for_document(&[layer_defining("repeat", 1)]);
-        assert_eq!(scope.get("repeat").expect("repeat").signature().len(), 3);
+        assert_eq!(
+            scope
+                .get("repeat")
+                .expect("repeat")
+                .command
+                .signature()
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -411,7 +493,10 @@ mod tests {
         // shadow it — and reporting our curated one-string signature for the
         // user's own two-argument `\clef` would be a lie.
         let scope = Scope::builtins().for_document(&[layer_defining("clef", 2)]);
-        assert_eq!(scope.get("clef").expect("clef").signature().len(), 2);
+        assert_eq!(
+            scope.get("clef").expect("clef").command.signature().len(),
+            2
+        );
     }
 
     #[test]
@@ -422,7 +507,7 @@ mod tests {
         let plain = Scope::EMPTY.for_document(&[]).fingerprint();
         assert_eq!(
             Scope::EMPTY
-                .for_document(&[Arc::new(Layer::new(HashMap::new()))])
+                .for_document(&[Arc::new(Layer::new("empty", HashMap::new()))])
                 .fingerprint(),
             plain,
             "an empty layer is no layer, however the scope was built"

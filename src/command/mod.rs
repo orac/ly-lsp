@@ -480,6 +480,11 @@ pub struct CommandCall {
     /// here so a caller that already has a `CommandCall` never needs a second
     /// name lookup to ask it anything.
     pub cmd: Arc<dyn Command>,
+    /// Where the layer that resolved the name says its knowledge came from —
+    /// see [`Layer::origin`](crate::vocabulary::Layer::origin). Copied out of
+    /// the layer rather than holding the layer itself, because this is all a
+    /// call ever wants of it.
+    pub origin: Arc<str>,
 }
 
 impl std::fmt::Debug for CommandCall {
@@ -602,7 +607,8 @@ pub fn parse(
         return None;
     }
     let name = src[keyword_node.start_byte()..keyword_node.end_byte()].strip_prefix('\\')?;
-    let cmd = scope.get(name)?.clone();
+    let known = scope.get(name)?;
+    let (cmd, origin) = (Arc::clone(known.command), Arc::clone(known.layer.origin()));
 
     let keyword = node_span(keyword_node);
     let mut reader = ArgReader::new(children, start + 1, src, language);
@@ -615,6 +621,7 @@ pub fn parse(
             span: Span::new(keyword.start, end),
             args,
             cmd,
+            origin,
         },
         reader.position(),
     ))
@@ -1118,6 +1125,11 @@ static CURATED_ROWS: &[Row] = {
     ]
 };
 
+/// What hover calls the hand-written layers: this is our own knowledge of
+/// LilyPond rather than anything read out of the user's files or install, and
+/// saying so is the honest answer to "where does this come from?".
+const OURS: &str = "built-in";
+
 /// Builds a [`Layer`] from a row table, keyed by name without the leading
 /// backslash. `bespoke` supplies the handful that can't be a plain row: each
 /// wraps a [`StaticCommand`](static_command::StaticCommand) and overrides the
@@ -1144,7 +1156,7 @@ fn table(rows: &[Row], bespoke: Vec<(&str, Arc<dyn Command>)>) -> Layer {
         table.insert(name.to_string(), command);
     }
 
-    Layer::new(table)
+    Layer::new(OURS, table)
 }
 
 /// LilyPond's reserved words, which its grammar recognises before any name

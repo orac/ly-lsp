@@ -64,6 +64,10 @@ struct Analysis {
     includes: Vec<Include>,
 }
 
+/// What a document with no file behind it calls itself, matching the scheme
+/// LSP gives such a buffer's URI.
+const UNTITLED: &str = "untitled";
+
 /// An analysed document. Holds the source text and its parse tree (so edits
 /// can be reparsed incrementally), a line index for position conversion, and
 /// the symbols found within.
@@ -75,6 +79,13 @@ pub struct Document {
     ///
     /// [`Variable`]: crate::command::variable::Variable
     text: Arc<str>,
+    /// What to call the file this document is, when hover says where a command
+    /// it defines came from — see
+    /// [`Layer::origin`](crate::vocabulary::Layer::origin). A name rather than
+    /// a URI: a document knows nothing else of where it lives, and the graph
+    /// that opened it is where a URI belongs. Kept here as well as in the layer
+    /// so that an edit, which rebuilds the layer, keeps the name.
+    origin: Arc<str>,
     tree: Tree,
     line_index: LineIndex,
     /// Every definition, in source order — the positional view of
@@ -96,9 +107,21 @@ pub struct Document {
 }
 
 impl Document {
+    /// A document with no file behind it, which is what LSP calls an
+    /// `untitled:` buffer and what a test builds. It still defines commands,
+    /// and hover still has to say where they came from, so it borrows the one
+    /// word the editor would use for it.
     pub fn new(text: String) -> Self {
+        Self::named(UNTITLED, text)
+    }
+
+    /// A document that came from somewhere: `origin` is the name to show for
+    /// the commands it defines, and is the file's name rather than its whole
+    /// path — hover wants the short answer, and the long one is a click away
+    /// through go-to-definition.
+    pub fn named(origin: impl Into<Arc<str>>, text: String) -> Self {
         let tree = parse(&text, None);
-        Self::from_parts(Arc::from(text), tree)
+        Self::from_parts(Arc::from(text), origin.into(), tree)
     }
 
     /// Builds the derived state (line index, symbols, definitions and note
@@ -110,7 +133,7 @@ impl Document {
     /// graph can say what else this document can see. A file that includes
     /// nothing (or nothing that defines a command) is therefore analysed here
     /// and never again.
-    fn from_parts(text: Arc<str>, tree: Tree) -> Self {
+    fn from_parts(text: Arc<str>, origin: Arc<str>, tree: Tree) -> Self {
         let line_index = LineIndex::new(&text);
         let analysis = extract(&tree, &text);
         let bindings = merge_bindings(&tree, &text, &analysis.definitions);
@@ -122,11 +145,16 @@ impl Document {
             })
             .collect();
 
-        let commands_defined = Arc::new(definition::layer(bindings, Arc::clone(&text)));
+        let commands_defined = Arc::new(definition::layer(
+            bindings,
+            Arc::clone(&text),
+            Arc::clone(&origin),
+        ));
         let scope = own_scope(&commands_defined);
         let notes = note_analyser::analyse(&tree, &text, &scope);
         Self {
             text,
+            origin,
             tree,
             line_index,
             definitions,
@@ -169,7 +197,8 @@ impl Document {
     /// without one replaces the whole document.
     pub fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {
         let Some(range) = change.range else {
-            *self = Document::new(change.text);
+            let tree = parse(&change.text, None);
+            *self = Self::from_parts(Arc::from(change.text), Arc::clone(&self.origin), tree);
             return;
         };
 
@@ -195,7 +224,7 @@ impl Document {
         });
 
         let tree = parse(&text, Some(&self.tree));
-        *self = Self::from_parts(text, tree);
+        *self = Self::from_parts(text, Arc::clone(&self.origin), tree);
     }
 
     /// The document's source text.

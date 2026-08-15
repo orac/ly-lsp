@@ -66,7 +66,14 @@ impl Binding {
 /// `source` is the text those bindings were read from — a layer belongs to one
 /// file, so there is exactly one. Shared, not copied: every [`Variable`] holds
 /// it, and reads its own value out of it only if hover ever asks.
-pub fn layer(bindings: impl IntoIterator<Item = Binding>, source: Arc<str>) -> Layer {
+///
+/// `origin` is what to call that file when hover says where a command came
+/// from — see [`Layer::origin`].
+pub fn layer(
+    bindings: impl IntoIterator<Item = Binding>,
+    source: Arc<str>,
+    origin: Arc<str>,
+) -> Layer {
     let mut commands: HashMap<String, Arc<dyn Command>> = HashMap::new();
     for Binding {
         name,
@@ -89,7 +96,7 @@ pub fn layer(bindings: impl IntoIterator<Item = Binding>, source: Arc<str>) -> L
             }),
         );
     }
-    Layer::new(commands)
+    Layer::new(origin, commands)
 }
 
 /// A command as one file defines it: what `\name` does, where the name was
@@ -162,7 +169,7 @@ mod tests {
     /// A layer of bindings that point at no source, which suits every test
     /// here: they ask what a layer resolves to, never what a value looks like.
     fn layer(bindings: impl IntoIterator<Item = Binding>) -> Layer {
-        super::layer(bindings, Arc::from(""))
+        super::layer(bindings, Arc::from(""), Arc::from("test.ly"))
     }
 
     #[test]
