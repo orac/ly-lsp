@@ -22,7 +22,9 @@ use tower_lsp::lsp_types::{
     SignatureHelp, SignatureInformation, TextEdit,
 };
 
-use crate::command::{ArgKind, CallSite, Candidate, Command, CompletionContext, Param};
+use crate::command::{
+    ArgKind, CallSite, Candidate, Command, CompletionContext, Param, signature_label,
+};
 use crate::document::Document;
 use crate::line_struct::Span;
 use crate::vocabulary::Scope;
@@ -172,10 +174,12 @@ fn command_names(scope: &Scope, range: Range) -> Vec<CompletionItem> {
                     CompletionItemKind::FUNCTION
                 }),
                 detail: Some(known.layer.origin().to_string()),
-                documentation: Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: describe(name, known.command.as_ref()),
-                })),
+                documentation: describe(known.command.as_ref()).map(|value| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value,
+                    })
+                }),
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                     range,
                     new_text: text,
@@ -187,31 +191,25 @@ fn command_names(scope: &Scope, range: Range) -> Vec<CompletionItem> {
 }
 
 /// Hover documentation for the command word at `position`, if the cursor sits
-/// on one: where the command came from, its signature, and its documentation
-/// where there is any — curated prose for a built-in, a summary of the value
-/// for a variable. `None` when the cursor is elsewhere in a call's header or
+/// on one: where the command came from, what it is — a signature for most
+/// commands, a summary of the value for a variable — and its documentation
+/// where there is any. `None` when the cursor is elsewhere in a call's header or
 /// body — hovering an argument value isn't wired up here, only the command word
-/// itself — and `None` for a command with neither parameters nor documentation:
-/// a popup reading just `\foo` over the `\foo` you are already looking at is
-/// worse than nothing.
+/// itself — and `None` for a command with neither
+/// [`synopsis`](Command::synopsis) nor documentation: a popup reading just
+/// `\foo` over the `\foo` you are already looking at is worse than nothing.
 pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
     let (offset, site) = call_at(doc, position)?;
     if !site.call.keyword.contains(offset) {
         return None;
     }
     let cmd = &site.call.cmd;
-    if cmd.signature().is_empty() && cmd.documentation().is_none() {
-        return None;
-    }
+    let described = describe(cmd.as_ref())?;
 
-    // Italic and above the signature: where a command comes from is a question
+    // Italic and above the synopsis: where a command comes from is a question
     // about it rather than part of what it says, so it reads as an attribution
     // rather than as code.
-    let markdown = format!(
-        "*{}*\n\n{}",
-        site.call.origin,
-        describe(&site.call.name, cmd.as_ref())
-    );
+    let markdown = format!("*{}*\n\n{described}", site.call.origin);
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -222,35 +220,22 @@ pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
     })
 }
 
-/// What a command *is*, as Markdown: its signature, and its documentation
-/// where there is any. Shared by [`hover`], which puts the command's origin
-/// above it, and by the name completions, which show it in the detail pane
-/// beside the list.
-fn describe(name: &str, cmd: &dyn Command) -> String {
-    let mut markdown = format!("```\n{}\n```", signature_label(name, cmd.signature()));
-    if let Some(documentation) = cmd.documentation() {
-        markdown.push_str("\n\n");
-        markdown.push_str(&documentation.markdown);
-    }
-    markdown
-}
-
-/// Renders a command's signature as `\name param [optional]`, the label
-/// shared by signature help and hover — an optional [`Param`] shown in
-/// brackets, as LilyPond's own manual does.
-fn signature_label(name: &str, params: &[Param]) -> String {
-    let mut label = format!("\\{name}");
-    for param in params {
-        label.push(' ');
-        if param.optional {
-            label.push('[');
-            label.push_str(&param.name);
-            label.push(']');
-        } else {
-            label.push_str(&param.name);
+/// What a command *is*, as Markdown: its [`synopsis`](Command::synopsis), and
+/// its documentation where there is any, ruled off from each other so the prose
+/// doesn't read as a continuation of the code. Shared by [`hover`], which puts
+/// the command's origin above it, and by the name completions, which show it in
+/// the detail pane beside the list. `None` for a command that has neither, which
+/// nothing should be showing a popup for.
+fn describe(cmd: &dyn Command) -> Option<String> {
+    let synopsis = cmd.synopsis();
+    let documentation = cmd.documentation().map(|doc| doc.markdown.clone());
+    match (synopsis, documentation) {
+        (Some(synopsis), Some(documentation)) => {
+            Some(format!("{synopsis}\n\n---\n\n{documentation}"))
         }
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     }
-    label
 }
 
 fn parameter_information(param: &Param) -> ParameterInformation {
@@ -472,6 +457,13 @@ mod tests {
     }
 
     #[test]
+    fn hover_rules_the_documentation_off_from_the_synopsis() {
+        // Prose immediately under a code fence reads as a continuation of it.
+        let (doc, pos) = doc_at("\\rela|tive c' { c }");
+        assert!(markup_of(&doc, pos).contains("\n---\n"));
+    }
+
+    #[test]
     fn hover_over_a_variable_shows_what_it_is_bound_to() {
         // A zero-argument command has no signature worth reading, so the value
         // is the whole point of the popup; what it looks like is
@@ -482,6 +474,15 @@ mod tests {
             panic!("expected markup content");
         };
         assert!(markup.value.contains("foo = { c }"), "{}", markup.value);
+    }
+
+    #[test]
+    fn hover_over_a_variable_shows_the_value_and_nothing_else() {
+        // On pain of a popup whose first line is the `\foo` being hovered: a
+        // variable's synopsis replaces the signature rather than joining it.
+        let (doc, pos) = doc_at("foo = { c }\n\\f|oo\n");
+        let markup = markup_of(&doc, pos);
+        assert!(!markup.contains("\\foo"), "{markup}");
     }
 
     #[test]

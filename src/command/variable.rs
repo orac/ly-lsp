@@ -7,7 +7,7 @@ use tree_sitter::Node;
 
 use crate::line_struct::Span;
 
-use super::{Command, Documentation, Param};
+use super::{Command, Param, code_block};
 
 /// A value of no more than this many lines is shown in full on hover; a longer
 /// one is reduced to its outline.
@@ -21,17 +21,16 @@ const LINES_SHOWN_IN_FULL: usize = 5;
 /// value itself is never copied at parse time: the variable keeps the whole
 /// file's text behind an `Arc` — the same allocation the document already has,
 /// shared, not a slice of it duplicated per definition — and renders the
-/// summary only when [`documentation`](Command::documentation) is called, which
-/// for the overwhelming majority of definitions is never. That answer is then
-/// cached, because the trait hands out a reference; the cache dies with the
-/// `Variable`, which an edit rebuilds anyway.
+/// summary only when [`synopsis`](Command::synopsis) is called. That answer is
+/// then cached, since a completion list asks it of every variable in scope at
+/// once; the cache dies with the `Variable`, which an edit rebuilds anyway.
 ///
 /// A name known only as a name — a `lilypond-words` entry, an install binding
-/// whose file the layer doesn't keep — carries no value and documents nothing.
+/// whose file the layer doesn't keep — carries no value and says nothing.
 pub struct Variable {
     name: String,
     value: Option<Value>,
-    documentation: OnceLock<Option<Documentation>>,
+    synopsis: OnceLock<Option<String>>,
 }
 
 /// Where a variable's value is written: the text of the file that binds it, and
@@ -47,7 +46,7 @@ impl Variable {
         Self {
             name: name.into(),
             value: None,
-            documentation: OnceLock::new(),
+            synopsis: OnceLock::new(),
         }
     }
 
@@ -69,27 +68,27 @@ impl Command for Variable {
         &[]
     }
 
-    fn documentation(&self) -> Option<&Documentation> {
+    /// What `\foo` stands for, rather than the empty signature every variable
+    /// shares: `\foo` over the `\foo` under the cursor says nothing at all.
+    fn synopsis(&self) -> Option<String> {
         let value = self.value.as_ref()?;
-        self.documentation
+        self.synopsis
             .get_or_init(|| summarise(&self.name, value))
-            .as_ref()
+            .clone()
     }
 }
 
 /// Renders `name = value` for hover: the value in full where it is short enough
 /// to read at a glance, otherwise its outline. `None` when the value is both
 /// long and shapeless, where an outline would say nothing the name doesn't.
-fn summarise(name: &str, value: &Value) -> Option<Documentation> {
+fn summarise(name: &str, value: &Value) -> Option<String> {
     let text = value.source.get(value.span.start..value.span.end)?;
     let shown = if text.lines().count() <= LINES_SHOWN_IN_FULL {
         text.to_string()
     } else {
         outline(text)?
     };
-    Some(Documentation {
-        markdown: format!("```lilypond\n{name} = {shown}\n```"),
-    })
+    Some(code_block(&format!("{name} = {shown}")))
 }
 
 /// A one-line sketch of `text`: everything but the contents of its blocks,
@@ -231,9 +230,9 @@ mod tests {
     fn shown(src: &str, name: &str) -> Option<String> {
         let document = Document::new(src.to_string());
         let command = document.commands_defined().get(name).expect("bound");
-        let markdown = command.documentation()?.markdown.clone();
         Some(
-            markdown
+            command
+                .synopsis()?
                 .trim_start_matches("```lilypond\n")
                 .trim_end_matches("\n```")
                 .to_string(),
@@ -324,6 +323,6 @@ mod tests {
         // The word list and the install layer bind names without keeping the
         // text they were read from; hover falls silent rather than guessing.
         let variable = Variable::new("break");
-        assert!(variable.documentation().is_none());
+        assert!(variable.synopsis().is_none());
     }
 }

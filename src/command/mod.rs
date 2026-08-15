@@ -123,6 +123,21 @@ pub trait Command: Send + Sync {
         ambient
     }
 
+    /// What this command *is*, as a block of Markdown: the headline of its
+    /// hover, above whatever [`documentation`](Command::documentation) adds.
+    ///
+    /// The default is the signature, which is what there is to say about a
+    /// command that takes arguments. Override where the shape of the thing
+    /// itself is the interesting part: a [`Variable`](variable::Variable) shows
+    /// what it is bound to, a zero-argument signature being nothing but the
+    /// name the reader is already looking at. `None` where there is neither —
+    /// a name we know from a word list and no more — and hover then falls
+    /// silent unless the documentation carries it.
+    fn synopsis(&self) -> Option<String> {
+        let params = self.signature();
+        (!params.is_empty()).then(|| code_block(&signature_label(self.name(), params)))
+    }
+
     /// Hover documentation, already rendered to Markdown. `None` for a command
     /// we recognise but can say nothing about — most of the hand-written
     /// rows, which say nothing beyond their signature.
@@ -366,6 +381,30 @@ pub fn default_parse(signature: &[Param], args: &mut ArgReader) -> Vec<Arg> {
         }
     }
     out
+}
+
+/// Renders a command's signature as `\name param [optional]`, the label shared
+/// by signature help and the default [`synopsis`](Command::synopsis) — an
+/// optional [`Param`] shown in brackets, as LilyPond's own manual does.
+pub fn signature_label(name: &str, params: &[Param]) -> String {
+    let mut label = format!("\\{name}");
+    for param in params {
+        label.push(' ');
+        if param.optional {
+            label.push('[');
+            label.push_str(&param.name);
+            label.push(']');
+        } else {
+            label.push_str(&param.name);
+        }
+    }
+    label
+}
+
+/// `code`, fenced for Markdown, for a [`synopsis`](Command::synopsis) to
+/// return.
+pub fn code_block(code: &str) -> String {
+    format!("```lilypond\n{code}\n```")
 }
 
 /// Every place `command`'s file binds its name, in source order.

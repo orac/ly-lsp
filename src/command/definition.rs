@@ -140,6 +140,10 @@ impl Command for Definition {
         self.command.music_context(call, ambient)
     }
 
+    fn synopsis(&self) -> Option<String> {
+        self.command.synopsis()
+    }
+
     fn documentation(&self) -> Option<&Documentation> {
         self.command.documentation()
     }
