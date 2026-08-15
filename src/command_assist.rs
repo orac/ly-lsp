@@ -86,13 +86,12 @@ pub fn completions(doc: &Document, position: Position) -> Vec<CompletionItem> {
 }
 
 /// Hover documentation for the command word at `position`, if the cursor sits
-/// on one: its signature, plus its curated prose where there is any. `None`
-/// when the cursor is elsewhere in a call's header or body — hovering an
-/// argument value isn't wired up here, only the command word itself — and
-/// `None` for a command with neither parameters nor prose, which is every
-/// reference to a plain variable: a popup reading just `\foo` over the `\foo`
-/// you are already looking at is worse than nothing. Rendering a variable's
-/// *value* would earn one, and is the obvious next thing here.
+/// on one: its signature, plus its documentation where there is any — curated
+/// prose for a built-in, a summary of the value for a variable. `None` when the
+/// cursor is elsewhere in a call's header or body — hovering an argument value
+/// isn't wired up here, only the command word itself — and `None` for a command
+/// with neither parameters nor documentation: a popup reading just `\foo` over
+/// the `\foo` you are already looking at is worse than nothing.
 pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
     let (offset, site) = call_at(doc, position)?;
     if !site.call.keyword.contains(offset) {
@@ -245,11 +244,24 @@ mod tests {
     }
 
     #[test]
-    fn hover_stays_quiet_over_a_plain_variable() {
-        // `\foo` resolves to a zero-argument command with nothing to say about
-        // itself. A popup rendering just `\foo` over the `\foo` under the
-        // cursor is worse than no popup at all.
+    fn hover_over_a_variable_shows_what_it_is_bound_to() {
+        // A zero-argument command has no signature worth reading, so the value
+        // is the whole point of the popup; what it looks like is
+        // [`Variable`](crate::command::variable::Variable)'s business.
         let (doc, pos) = doc_at("foo = { c }\n\\f|oo\n");
+        let hover = hover(&doc, pos).expect("hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markup content");
+        };
+        assert!(markup.value.contains("foo = { c }"), "{}", markup.value);
+    }
+
+    #[test]
+    fn hover_stays_quiet_over_a_name_with_nothing_behind_it() {
+        // `\break` is known from the word list alone: no parameters, no prose,
+        // no value to show. A popup rendering just `\break` over the `\break`
+        // under the cursor is worse than no popup at all.
+        let (doc, pos) = doc_at("{ c \\bre|ak }");
         assert!(hover(&doc, pos).is_none());
     }
 

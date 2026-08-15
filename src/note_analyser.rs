@@ -924,6 +924,7 @@ mod tests {
         // the analyser's.
         let defined = std::sync::Arc::new(crate::command::definition::layer(
             crate::command::scheme::read(&tree, src),
+            std::sync::Arc::from(src),
         ));
         analyse(&tree, src, &Scope::builtins().for_document(&[defined]))
     }

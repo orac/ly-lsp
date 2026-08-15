@@ -41,8 +41,10 @@ fn main() {
     // The file's own music functions count, so a `\myFunc { … }` in it is read
     // as a call with a music argument rather than a bare word and a block.
     // What it *includes* doesn't: this tool reads one file, with no graph.
-    let scope =
-        Scope::builtins().for_document(&[Arc::new(definition::layer(scheme::read(&tree, &src)))]);
+    let scope = Scope::builtins().for_document(&[Arc::new(definition::layer(
+        scheme::read(&tree, &src),
+        Arc::from(src.as_str()),
+    ))]);
     let analysis = analyse(&tree, &src, &scope);
 
     for event in analysis.events.iter() {

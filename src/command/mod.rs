@@ -37,6 +37,7 @@ mod repeat;
 pub mod scheme;
 mod static_command;
 mod tempo;
+pub mod variable;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -62,7 +63,7 @@ use static_command::{curated, static_command};
 /// [`fixed::FixedCommand`] and [`tempo::TempoCommand`] are the three whose
 /// behaviour genuinely differs. From the user's own files,
 /// [`SchemeCommand`](scheme::SchemeCommand) is instantiated once per
-/// `define-…-function` and [`Variable`](definition::Variable) once per
+/// `define-…-function` and [`Variable`](variable::Variable) once per
 /// everything else bound.
 ///
 /// One impl decorates rather than answers: `definition::Definition` wraps any

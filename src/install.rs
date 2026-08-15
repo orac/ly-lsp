@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::command::Command;
-use crate::command::definition::Variable;
+use crate::command::variable::Variable;
 use crate::document;
 use crate::vocabulary::Layer;
 

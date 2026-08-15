@@ -22,7 +22,7 @@ use std::cmp::Reverse;
 use tower_lsp::lsp_types::{CodeActionKind, Range, TextEdit};
 use tree_sitter::Node;
 
-use crate::document::Document;
+use crate::document::{Document, assignment_value, value_span};
 use crate::line_struct::Span;
 use crate::notes::{Duration, Event};
 
@@ -181,30 +181,11 @@ fn definitions(document: &Document) -> Vec<Definition> {
             .map(str::to_string)
             .unwrap_or_default();
 
-        // Skip the `=` to find the RHS nodes. The flat grammar makes the RHS a
-        // run of siblings rather than one node, so bound it at the first
-        // complete music expression: consume up to and including the first
-        // block (the value of `{ … }`, `\chordmode { … }`, `\relative c' { … }`,
-        // …), stopping early at the next top-level assignment. A bare-command
-        // value with no block (`foo = \bar`) runs to that next statement.
-        let mut j = i + 1;
-        if children.get(j).map(Node::kind) == Some("punctuation") {
-            j += 1;
-        }
-        let rhs_first = j;
-        while j < children.len() && children[j].kind() != "assignment_lhs" {
-            let kind = children[j].kind();
-            j += 1;
-            if kind == "expression_block" || kind == "parallel_music" {
-                break;
-            }
-        }
-        let rhs_nodes = &children[rhs_first..j];
-
-        if let Some(def) = build_definition(name, lhs, rhs_nodes, src) {
+        let value = assignment_value(&children, i);
+        if let Some(def) = build_definition(name, lhs, &children[value.clone()], src) {
             defs.push(def);
         }
-        i = j;
+        i = value.end.max(i + 1);
     }
     defs
 }
@@ -212,16 +193,7 @@ fn definitions(document: &Document) -> Vec<Definition> {
 /// Assembles a [`Definition`] from its left-hand side and right-hand side nodes,
 /// or `None` if the right-hand side is empty.
 fn build_definition(name: String, lhs: Node, rhs_nodes: &[Node], src: &str) -> Option<Definition> {
-    let first = rhs_nodes.first()?;
-    let last = rhs_nodes.last()?;
-
-    // The RHS text, trimmed (the nodes already exclude leading/trailing space,
-    // but be defensive).
-    let raw = &src[first.start_byte()..last.end_byte()];
-    let lead = raw.len() - raw.trim_start().len();
-    let trail = raw.len() - raw.trim_end().len();
-    let rhs = Span::new(first.start_byte() + lead, last.end_byte() - trail);
-
+    let rhs = value_span(rhs_nodes, src)?;
     let shape = rhs_shape(rhs_nodes, src);
     let lhs_region = Span::new(lhs.start_byte(), rhs.start);
     let delete = delete_span(lhs.start_byte(), rhs.end, src);

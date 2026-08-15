@@ -39,7 +39,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::command::{self, Command, definition::Variable};
+use crate::command::{self, Command, variable::Variable};
 
 /// Commands that are valid but absent from `lilypond-words`, so we supply them
 /// ourselves. `discant` is defined in Scheme by
@@ -300,10 +300,10 @@ mod tests {
             .join(" ");
         let predicates = vec!["ly:music?"; arity].join(" ");
         let src = format!("{name} = #(define-music-function ({args}) ({predicates}) #{{ #}})\n");
-        Arc::new(crate::command::definition::layer(scheme::read(
-            &crate::document::parse(&src, None),
-            &src,
-        )))
+        Arc::new(crate::command::definition::layer(
+            scheme::read(&crate::document::parse(&src, None), &src),
+            Arc::from(src.as_str()),
+        ))
     }
 
     /// A base holding only the given words, as a workspace with no install

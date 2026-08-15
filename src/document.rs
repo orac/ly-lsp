@@ -25,7 +25,7 @@
 //!   included. That is what keeps the LilyPond and Scheme readers from becoming
 //!   mutually recursive; see [`command::scheme`]'s module docs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use streaming_iterator::StreamingIterator;
@@ -69,7 +69,12 @@ struct Analysis {
 /// the symbols found within.
 #[derive(Debug)]
 pub struct Document {
-    text: String,
+    /// Shared rather than owned outright, so that every [`Variable`] this file
+    /// binds can hold the text its value is written in without copying a byte
+    /// of it. An edit builds a new one; nothing mutates it in place.
+    ///
+    /// [`Variable`]: crate::command::variable::Variable
+    text: Arc<str>,
     tree: Tree,
     line_index: LineIndex,
     /// Every definition, in source order — the positional view of
@@ -93,7 +98,7 @@ pub struct Document {
 impl Document {
     pub fn new(text: String) -> Self {
         let tree = parse(&text, None);
-        Self::from_parts(text, tree)
+        Self::from_parts(Arc::from(text), tree)
     }
 
     /// Builds the derived state (line index, symbols, definitions and note
@@ -105,7 +110,7 @@ impl Document {
     /// graph can say what else this document can see. A file that includes
     /// nothing (or nothing that defines a command) is therefore analysed here
     /// and never again.
-    fn from_parts(text: String, tree: Tree) -> Self {
+    fn from_parts(text: Arc<str>, tree: Tree) -> Self {
         let line_index = LineIndex::new(&text);
         let analysis = extract(&tree, &text);
         let bindings = merge_bindings(&tree, &text, &analysis.definitions);
@@ -117,7 +122,7 @@ impl Document {
             })
             .collect();
 
-        let commands_defined = Arc::new(definition::layer(bindings));
+        let commands_defined = Arc::new(definition::layer(bindings, Arc::clone(&text)));
         let scope = own_scope(&commands_defined);
         let notes = note_analyser::analyse(&tree, &text, &scope);
         Self {
@@ -176,10 +181,9 @@ impl Document {
         let start_position = point_at(&self.text, start_byte);
         let old_end_position = point_at(&self.text, old_end_byte);
 
-        self.text
-            .replace_range(start_byte..old_end_byte, &change.text);
+        let text = splice(&self.text, start_byte, old_end_byte, &change.text);
         let new_end_byte = start_byte + change.text.len();
-        let new_end_position = point_at(&self.text, new_end_byte);
+        let new_end_position = point_at(&text, new_end_byte);
 
         self.tree.edit(&InputEdit {
             start_byte,
@@ -190,8 +194,8 @@ impl Document {
             new_end_position,
         });
 
-        let tree = parse(&self.text, Some(&self.tree));
-        *self = Self::from_parts(std::mem::take(&mut self.text), tree);
+        let tree = parse(&text, Some(&self.tree));
+        *self = Self::from_parts(text, tree);
     }
 
     /// The document's source text.
@@ -550,14 +554,82 @@ fn symbol_query() -> &'static Query {
 fn merge_bindings(tree: &Tree, src: &str, assignments: &[Symbol]) -> Vec<Binding> {
     let mut bindings = command::scheme::read(tree, src);
     let bound: HashSet<usize> = bindings.iter().map(|binding| binding.span.start).collect();
+    let values = assignment_values(tree, src);
     bindings.extend(
         assignments
             .iter()
             .filter(|symbol| !bound.contains(&symbol.span.start))
-            .map(|symbol| Binding::variable(symbol.name.clone(), symbol.span)),
+            .map(|symbol| {
+                Binding::variable(
+                    symbol.name.clone(),
+                    symbol.span,
+                    values.get(&symbol.span.start).copied(),
+                )
+            }),
     );
     bindings.sort_by_key(|binding| binding.span.start);
     bindings
+}
+
+/// Where each top-level assignment's value is written, keyed by the start of
+/// the name it binds — the offset the [`SYMBOL_QUERY`] capture and the
+/// `assignment_lhs` share, being the same place in the file.
+fn assignment_values(tree: &Tree, src: &str) -> HashMap<usize, Span> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let children: Vec<Node> = root.children(&mut cursor).collect();
+
+    let mut values = HashMap::new();
+    let mut i = 0;
+    while i < children.len() {
+        if children[i].kind() != "assignment_lhs" {
+            i += 1;
+            continue;
+        }
+        let value = assignment_value(&children, i);
+        if let Some(span) = value_span(&children[value.clone()], src) {
+            values.insert(children[i].start_byte(), span);
+        }
+        i = value.end.max(i + 1);
+    }
+    values
+}
+
+/// The run of siblings making up the value of the assignment whose left-hand
+/// side is `children[lhs]`, as a range into `children`.
+///
+/// The grammar is flat: `foo = \relative c' { … }` is not one node but a row of
+/// them, with nothing marking where the value ends. So bound it at the first
+/// complete music expression — consume up to and including the first block —
+/// stopping early at the next top-level assignment, which a value can never
+/// reach past. A value with no block at all (`foo = \bar`, `foo = #5`) runs to
+/// that next assignment, or to the end of the file.
+pub(crate) fn assignment_value(children: &[Node], lhs: usize) -> std::ops::Range<usize> {
+    let mut i = lhs + 1;
+    if children.get(i).map(Node::kind) == Some("punctuation") {
+        i += 1;
+    }
+    let start = i;
+    while i < children.len() && children[i].kind() != "assignment_lhs" {
+        let kind = children[i].kind();
+        i += 1;
+        if kind == "expression_block" || kind == "parallel_music" {
+            break;
+        }
+    }
+    start..i
+}
+
+/// The trimmed extent of a run of nodes; `None` for an empty run, which is what
+/// an assignment with nothing after its `=` leaves.
+pub(crate) fn value_span(nodes: &[Node], src: &str) -> Option<Span> {
+    let start = nodes.first()?.start_byte();
+    let end = nodes.last()?.end_byte();
+    // Node boundaries exclude surrounding space already; trim defensively.
+    let raw = &src[start..end];
+    let lead = raw.len() - raw.trim_start().len();
+    let trail = raw.len() - raw.trim_end().len();
+    Some(Span::new(start + lead, end - trail))
 }
 
 /// Parses `src` fresh and reads everything it binds, from both readers, in
@@ -659,6 +731,18 @@ fn include_after(keyword: Node, src: &str) -> Option<Include> {
 
 /// Computes the tree-sitter [`Point`] (row, byte-column) for a byte offset into
 /// `text`. Unlike LSP positions, tree-sitter columns are counted in bytes.
+/// `text` with `start..end` replaced by `replacement`, as a fresh shared
+/// string. Builds a new allocation rather than editing in place because the old
+/// one is shared with the [`Layer`] built from it — and an in-place
+/// `replace_range` would move the same bytes anyway.
+fn splice(text: &str, start: usize, end: usize, replacement: &str) -> Arc<str> {
+    let mut spliced = String::with_capacity(text.len() - (end - start) + replacement.len());
+    spliced.push_str(&text[..start]);
+    spliced.push_str(replacement);
+    spliced.push_str(&text[end..]);
+    Arc::from(spliced)
+}
+
 fn point_at(text: &str, byte: usize) -> Point {
     let before = &text[..byte];
     let row = before.bytes().filter(|&b| b == b'\n').count();

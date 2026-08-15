@@ -219,6 +219,9 @@ fn binding(node: Node, src: &str, command: Option<Arc<dyn Command>>) -> Binding 
     Binding {
         name: text(node, src).to_string(),
         span: Span::new(node.start_byte(), node.end_byte()),
+        // A Scheme value is not a LilyPond expression, and nothing renders one
+        // on hover, so there is no span worth carrying here.
+        value: None,
         command,
     }
 }
@@ -675,7 +678,7 @@ mod tests {
     /// The layer `src`'s Scheme alone makes — the document merges the
     /// assignment query's bindings in too, which these tests don't exercise.
     fn layer(src: &str) -> Layer {
-        definition::layer(bindings(src))
+        definition::layer(bindings(src), Arc::from(src))
     }
 
     /// The names `src` binds from inside Scheme, with the text each span

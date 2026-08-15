@@ -12,9 +12,8 @@
 //! Both readers — [`SYMBOL_QUERY`](crate::document::SYMBOL_QUERY) for the
 //! LilyPond assignment, [`scheme`](super::scheme) for what `#( … )` binds —
 //! produce [`Binding`]s, which [`layer`] turns into that table. A binding whose
-//! value says nothing about its arguments becomes a [`Variable`]; that is the
-//! only reason `Variable` lives here rather than in a file of its own, alongside
-//! the other [`Command`] impls.
+//! value says nothing about its arguments becomes a
+//! [`Variable`](super::variable::Variable).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +21,7 @@ use std::sync::Arc;
 use crate::line_struct::Span;
 use crate::vocabulary::Layer;
 
+use super::variable::Variable;
 use super::{
     Arg, ArgReader, Candidate, CheckContext, Command, CommandCall, Documentation, MusicContext,
     Param,
@@ -35,17 +35,23 @@ pub struct Binding {
     /// rewrites. Not the whole definition: a `\foo` reference is replaced by
     /// `\newFoo`, and the name on the left of `foo = { … }` by `newFoo`.
     pub span: Span,
+    /// Where the value is written, for a [`Variable`] to summarise on hover.
+    /// `None` where the reader can't point at one — a Scheme binding form, or
+    /// an assignment with nothing after its `=`.
+    pub value: Option<Span>,
     /// What `\name` calls, where the definition says what arguments it takes.
     /// `None` for a name bound to a plain value, which becomes a [`Variable`].
     pub command: Option<Arc<dyn Command>>,
 }
 
 impl Binding {
-    /// A name bound to something with no signature of its own.
-    pub fn variable(name: impl Into<String>, span: Span) -> Self {
+    /// A name bound to something with no signature of its own, written at
+    /// `value` where the reader could tell.
+    pub fn variable(name: impl Into<String>, span: Span, value: Option<Span>) -> Self {
         Self {
             name: name.into(),
             span,
+            value,
             command: None,
         }
     }
@@ -56,15 +62,23 @@ impl Binding {
 /// `bindings` must be in source order: a name bound twice keeps the *last*
 /// binding, which is the one LilyPond itself resolves to, with the one it
 /// replaced hanging off it (see [`Command::redefines`]).
-pub fn layer(bindings: impl IntoIterator<Item = Binding>) -> Layer {
+///
+/// `source` is the text those bindings were read from — a layer belongs to one
+/// file, so there is exactly one. Shared, not copied: every [`Variable`] holds
+/// it, and reads its own value out of it only if hover ever asks.
+pub fn layer(bindings: impl IntoIterator<Item = Binding>, source: Arc<str>) -> Layer {
     let mut commands: HashMap<String, Arc<dyn Command>> = HashMap::new();
     for Binding {
         name,
         span,
+        value,
         command,
     } in bindings
     {
-        let command = command.unwrap_or_else(|| Arc::new(Variable::new(name.clone())));
+        let command = command.unwrap_or_else(|| match value {
+            Some(value) => Arc::new(Variable::bound_to(name.clone(), Arc::clone(&source), value)),
+            None => Arc::new(Variable::new(name.clone())),
+        });
         let redefines = commands.remove(&name);
         commands.insert(
             name,
@@ -136,39 +150,19 @@ impl Command for Definition {
     }
 }
 
-/// What a name is bound to when nothing says what arguments it takes: `\foo`
-/// substitutes its value and consumes nothing.
-///
-/// The value itself is not read at all. Hover could one day render it, which is
-/// the main thing [`Command::documentation`] is left unimplemented against
-/// here.
-pub struct Variable {
-    name: String,
-}
-
-impl Variable {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
-    }
-}
-
-impl Command for Variable {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn signature(&self) -> &[Param] {
-        &[]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::command::definition_spans;
 
     fn binding(name: &str, at: usize) -> Binding {
-        Binding::variable(name, Span::new(at, at + name.len()))
+        Binding::variable(name, Span::new(at, at + name.len()), None)
+    }
+
+    /// A layer of bindings that point at no source, which suits every test
+    /// here: they ask what a layer resolves to, never what a value looks like.
+    fn layer(bindings: impl IntoIterator<Item = Binding>) -> Layer {
+        super::layer(bindings, Arc::from(""))
     }
 
     #[test]
