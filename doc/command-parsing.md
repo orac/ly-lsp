@@ -41,7 +41,7 @@ Code actions are deliberately not a method there. `code_action` already owns an 
 
 ### The table
 
-The symbol table is [`vocabulary.rs`](../src/vocabulary.rs), which answers both "is `\foo` a command?" and "…and what does it do?". Reusing one registry for both avoids a second name for the same thing; `is_known` is a thin wrapper over lookup plus the CamelCase context-reference rule.
+The symbol table is [`vocabulary.rs`](../src/vocabulary.rs), which answers both "is `\foo` a command?" and "…and what does it do?". Reusing one registry for both avoids a second name for the same thing; `is_known` is a lookup against the command namespace, then the context-type namespace, and only then the CamelCase context-reference rule — and that rule is itself a fallback, used only when the scope's context-type namespace is empty everywhere in scope (a failed install), not a rule about what a well-typed context reference looks like. See `Scope::is_known`'s own rustdoc for the reasoning, and [`contexts.md`](contexts.md) for the context-type namespace itself.
 
 Each source of knowledge is a `Layer`, and what a document sees is a `Scope`: a stack of them, top down —
 
@@ -53,7 +53,7 @@ Each source of knowledge is a `Layer`, and what a document sees is a `Scope`: a 
 | the install | what LilyPond itself defines |
 | the words list | names with nothing behind them |
 
-**Precedence is the order of the stack.** `Scope::get` is a search from the top, and returns the command and which layer it came from; `Scope::is_known` is that plus the CamelCase rule (a rule about the *shape* of a name, which no map of names can hold). Every scope is assembled by `Scope::for_document`, so that function is the single place the order is stated.
+**Precedence is the order of the stack.** `Scope::get` is a search from the top, and returns the command and which layer it came from; `Scope::get_context_type` does the same for context types. `Scope::is_known` tries both, and falls back to the CamelCase rule (a rule about the *shape* of a name, which no map of names can hold) only when nothing in scope declares a context type at all. Every scope is assembled by `Scope::for_document`, so that function is the single place the order is stated.
 
 **The hand-written table is two layers because it answers two questions.** `\repeat`, `\set` and the mode switches are reserved words in LilyPond's own grammar and cannot be shadowed by declarations in files. `\clef`, `\key`, `\relative` etc. are ordinary `define-music-function`s in `ly/music-functions-init.ly`; we keep curated signatures for them because ours are better than what the reader recovers (`\relative` and `\fixed` most of all, whose octave-reference behaviour no signature expresses), but LilyPond's own lookup lets a file shadow them, so they sit *below* the file layers.
 
@@ -85,7 +85,7 @@ Note that `command::Commands` is a different thing with a confusingly close name
 
 ## How the note analyser uses it
 
-`Analyser::handle_command` does two jobs, and the table does both for it: skipping over a command's arguments so they aren't misread as notes is `parse_args`, and deciding what mode and region the command's body is read in is `music_context`. So it is five steps:
+`Analyser::handle_command` does two jobs, and the table does both for it: skipping over a command's arguments so they aren't misread as notes is `parse_args`, and deciding what mode and region the command's body is read in is `music_context`. It handles a `named_context` node — `\new Staff`, `\context Voice = "vocals"`, a single node the grammar folds the keyword and its context type into (see "The design" above) — the same way as a bare `escaped_word`: `command::parse` unwraps the shape before `handle_command` ever sees it, so the same table and the same steps below serve both. So it is five steps:
 
 1. Look the `escaped_word` up in the document's `Scope`.
 2. `parse_args` to build the `CommandCall` — this consumes the reference pitch, the clef name, the property path, the repeat kind.
@@ -93,7 +93,7 @@ Note that `command::Commands` is a different thing with a confusingly close name
 4. Walk each `Arg::Music` in that context.
 5. Return `ArgReader::position()` as the next index.
 
-The mode and region logic lives in the impls, not in a `match` on command name: `Relative` returns `MusicContext::Relative(pitch)` from its own parsed `Arg::Pitch`; `ChordMode` returns `Chord`; `LyricMode`, `Markup`, `Header`, `Paper`, `Layout`, `Midi`, `With` return `NonNote`. The analyser knows no command names at all.
+The mode and region logic lives in each impl of Command, with no centralised logic in the analyser.
 
 Two behaviours the tests pin down, and which any new layer must preserve:
 
@@ -152,7 +152,7 @@ LilyPond bootstraps itself by parsing `ly/declarations-init.ly` once per session
 | `paper-defaults-init.ly` | paper block defaults |
 | `context-mods-init.ly` | `\with`-block helpers |
 
-That is the closure in `\include` order, with one deliberate omission: **`engraver-init.ly`**, 50 KB of `\context { … }` blocks inside a `\layout`, whose bindings are engraver and context defaults rather than commands. The symbol query only captures *top-level* assignments, so parsing it would yield almost nothing for its cost.
+That is the closure in `\include` order, with one omission: **`engraver-init.ly`**, 50 KB of `\context { … }` blocks inside a `\layout`, whose bindings are engraver and context defaults rather than commands. The symbol query only captures *top-level* assignments, so parsing it for *commands* would yield almost nothing for its cost — that reasoning still stands, and this table stays as the list of files read for commands. But a `\context { \name … }` block is exactly where a context type is declared, so the file is read after all, for that: [`install::load`](../src/install.rs) has a second file list, `CONTEXT_FILES`, read by a second pass that feeds [`context::read`](../src/context.rs) instead of the command readers. `performer-init.ly` joins it there — LilyPond declares every context type twice, once as an engraver context (with its `\description`) and once as a performer context, and the two are merged. Neither file contributes anything to the table above; both are absent from it for the same reason as ever. See [`contexts.md`](contexts.md) for the context-type namespace this feeds.
 
 Everything else under `ly/` is deliberately out too, because:
 
@@ -161,7 +161,7 @@ Everything else under `ly/` is deliberately out too, because:
 - `predefined-{guitar,mandolin,ukulele}-fretboards.ly` are 24–47 KB of generated chord-shape data yielding a handful of names.
 - `articulate.ly`, `bagpipe.ly`, `gregorian.ly`, `satb.ly`, the `*-tkit.ly` templates and friends are optional features the user `\include`s explicitly — and when they do, the *workspace* layer reads them, as it does any other include. They belong to that layer, not this one.
 
-Writing the closure out rather than following the `\include`s is the point: it lets the list be trimmed (`engraver-init.ly`) and audited, and it keeps install loading out of the include-resolution machinery, which is built around a document graph these files are not in. The staleness that a fixed list risks is answered by a test: **every file in the list must exist in every install the tests find**, so a version that renames or drops one fails loudly instead of quietly losing a few hundred commands.
+Writing the closure out rather than following the `\include`s is the point: it lets the command list be trimmed (`engraver-init.ly` and `performer-init.ly`, read for context types alone via `CONTEXT_FILES` instead) and audited, and it keeps install loading out of the include-resolution machinery, which is built around a document graph these files are not in. The staleness that a fixed list risks is answered by a test: **every file in either list must exist in every install the tests find**, so a version that renames or drops one fails loudly instead of quietly losing commands or context types.
 
 ### Finding the install
 
@@ -173,7 +173,8 @@ A new module, `src/install.rs`, owns the file list and the loading:
 
 - For each file in order: read it, parse it, take the bindings the two readers between them produce — the same merge `Document` does, which wants extracting from `document.rs` as a `pub(crate)` function so `install.rs` can call it without building a whole `Document` (and without running note analysis over 88 KB of definitions for nothing).
 - Fold every file's bindings into **one** `HashMap`, in file order, last binding winning — which is LilyPond's own resolution order, since it parses these files in the same sequence.
-- Build a single `Layer` from that map, and stack it into the workspace base (`vocabulary::workspace_base`).
+- Separately, `CONTEXT_FILES` is read the same way but through `context::read`, into a second `HashMap` of context types, merging `engraver-init.ly`'s and `performer-init.ly`'s two declarations of each name field by field (see "Which files" above and [`contexts.md`](contexts.md)). A context type's own name is also inserted into the command `HashMap`, as a zero-argument `Variable`, wherever a file-read command hasn't already claimed it.
+- Build a single `Layer` from the command map, with the context-type map as its second namespace, and stack it into the workspace base (`vocabulary::workspace_base`).
 
 One detail the merge must get right:
 
@@ -183,33 +184,33 @@ One detail the merge must get right:
 
 Synchronously, when the words file is loaded at `initialize`. An earlier sketch called for asynchronous indexing and an on-disk cache keyed on an install fingerprint; that is complexity to buy only once measurement asks for it, and measurement doesn't. If it ever does — a much larger install, a slower machine — the answers in order are: read fewer files; move it to a background task that swaps the layer in when ready (the fingerprint machinery already re-analyses documents when a layer changes, so nothing else has to know); and only then a disk cache.
 
-Measured (via `examples/install_timing.rs`, release build): LilyPond 2.24.3 on Windows, `~31ms` for `vocabulary::workspace_base` end to end, yielding an install layer of `525` commands. Comfortably synchronous.
+Measured (via `examples/install_timing.rs`, release build): LilyPond 2.24.3 on Windows, `46ms` for `vocabulary::workspace_base` end to end, yielding an install layer of `607` entries; LilyPond 2.26.0, `50ms` and `645`. (`Layer::len()` now counts all three namespaces a layer can hold, so these are entries, not commands — of the 607, the extra over the previous count are context types, not new commands.) Comfortably synchronous.
 
 
 ## Later
 
 - **Markup commands**, the ~173 `define-markup-command`s in `scm/lily/define-markup-commands.scm` plus a few smaller files. Worth having — they are what a user is typing when they are inside `\markup` — but they need a reading path this design doesn't have: a `.scm` file is a sequence of top-level Scheme forms with no LilyPond around them, so the LilyPond grammar can't be pointed at one as it stands. Wrapping the file in `#(begin … )` and teaching `scheme.rs` to descend through a `begin` is the cheap route. The definition form's own shape is friendly: `(define-markup-command (bold layout props arg) (markup?) …)` puts the name first in the argument list, and the right-alignment rule already in place drops `layout` and `props` for free.
-- **Go-to-definition into the install**, which needs a definition that carries a file as well as a span.
+- **Go-to-definition into the install**, which needs a definition that carries a file as well as a span. Blocks context types the same way it blocks commands: an install-layer `ContextType` carries a `name_span` but no file either, so `\new Staff` can't navigate into `engraver-init.ly` any more than `\appoggiatura` can navigate into `music-functions-init.ly`. See [`contexts.md`](contexts.md).
 - **Hover rendering a variable's value**, which is what `command_assist::hover` currently declines to do.
 - **Documentation from the published manual**, to put a section of the Notation Reference behind a command that has no docstring, or a fuller answer behind one that has. It can't come from the install, which ships no documentation at all, so it needs a fetch-and-cache of its own: [`manual-hover.md`](manual-hover.md).
 
 ### What the words file still knows that we don't
 
-`lilypond-words` lists 870 command names for 2.24.3; the install layer defines 525, of which 392 of the words file's names are missing. Not a goal to close — a name with no signature costs nothing, and the words layer answers `is_known` perfectly well — but the day the words file becomes an irritation rather than a convenience, this is the bill, measured against 2.24.3:
+`lilypond-words` lists 870 command names for 2.24.3, and no context types — it strips bare (non-backslash) entries, which is where a context type would show up. So it compares fairly only against the install layer's *command* namespace, not its 607-entry total: that namespace holds 566 names (525 read from the files table above, plus one per context type for the bare-name reference `\Staff` needs, wherever a file-read command hasn't already claimed it), and 392 of the words file's 870 are missing from it — the same figure as before this change, since none of the words file's names are context types to begin with. Not a goal to close — a name with no signature costs nothing, and the words layer answers `is_known` perfectly well — but the day the words file becomes an irritation rather than a convenience, this is the bill, measured against 2.24.3:
 
 | Group | Count | Why it's missing |
 |---|---|---|
 | `define-markup-command`s in `scm/` | ~162 | The deferred item above — `\bold`, `\hspace`, `\wordwrap`, `\with-color`, `\fret-diagram-terse` |
 | Context and grob property names | 153 | `barNumberFormatter`, `clefGlyph`, `stringTunings`: arguments to `\set` and `\override`, not commands at all. The words file can't tell the two apart, and lists them with the same doubled backslash; we never wanted them |
 | Definitions in `ly/` files outside the fixed list | 20 | `gregorian.ly`'s ancient notation (`virga`, `flexa`, `divisioMaior`) and its like: files a user `\include`s explicitly, at which point the *workspace* layer reads them. They belong to that layer |
-| Reserved words | ~40 | `\repeat`, `\new`, `\context`, `\header`, `\book`, `\markup`, `\tempo`, `\unset`, `\version` — the hand-written keyword layer, some of which have `builtin` entries already and the rest of which never will |
+| Reserved words | ~40 | `\repeat`, `\header`, `\book`, `\markup`, `\tempo`, `\unset`, `\version` — the hand-written keyword layer. `\new`, `\context`, `\change` and `\lyricsto` now have `builtin` entries; most of the rest never will |
 | Paper and layout variables | ~10 | `mm`, `cm`, `pt`, `indent`, `unit`, the `toc*Markup` family — bound *inside* a `\layout` or `\paper` block, so not the top-level assignments `SYMBOL_QUERY` matches |
-| Odds and ends | ~7 | `A`, `B`, `C`, harvested by LilyPond's own words generator out of a docstring's example and accepted by us anyway as context references; and `f`, written `"f" = #(make-dynamic-script "f")` because a bare `f` would collide with the pitch |
+| Odds and ends | ~7 | `A`, `B`, `C`, harvested by LilyPond's own words generator out of a docstring's example. They used to be accepted as context references by the CamelCase rule; now that the rule is only a fallback, they are accepted because the words file itself lists them — `parse_words` strips the `\\` from `\\A` and binds `A` like any other word — which is the row this table is about. And `f`, written `"f" = #(make-dynamic-script "f")` because a bare `f` would collide with the pitch |
 
 Two of those rows are the only ones that point at a gap in the *reader* rather than at a deliberate exclusion:
 
 - **String-keyed assignments** are not read at all. `"f" = …`, and the punctuation articulations `"~"`, `"("` and `"\\<"` in `declarations-init.ly`, put a string where `SYMBOL_QUERY` wants a `symbol`. Only `\f` is a name a user types with a backslash, so the practical cost is one dynamic.
-- **Bindings inside a `\layout` or `\paper` block** are invisible for the same reason the top-level-only query is what makes skipping `engraver-init.ly` cheap: reaching into those blocks here would mean reaching into them everywhere, and everywhere includes 50 KB of engraver defaults. `\mm` and friends are real commands users write, so this is a genuine miss, but not one to fix by loosening the query.
+- **Bindings inside a `\layout` or `\paper` block** are invisible for the same reason the top-level-only query keeps reading `engraver-init.ly` for commands cheap even now that it's read for context types: reaching into those blocks here would mean reaching into them everywhere, and everywhere includes 50 KB of engraver defaults. `\mm` and friends are real commands users write, so this is a genuine miss, but not one to fix by loosening the query.
 
 ## Constraints to respect
 

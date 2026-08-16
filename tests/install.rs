@@ -8,8 +8,18 @@ use common::require_installs;
 use ly_lsp::command;
 use ly_lsp::document_graph::DocumentGraph;
 use ly_lsp::install;
+use ly_lsp::note_analyser::analyse;
+use ly_lsp::notes::EventKind;
 use ly_lsp::vocabulary;
 use tower_lsp::lsp_types::{Position, Url};
+
+fn tree(src: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_lilypond::LANGUAGE_LILYPOND.into())
+        .expect("load grammar");
+    parser.parse(src, None).expect("parse")
+}
 
 /// The fixed file list is only staleness-proof if a version that renames or
 /// drops one of these files fails a test loudly, rather than quietly losing
@@ -18,7 +28,10 @@ use tower_lsp::lsp_types::{Position, Url};
 fn every_listed_file_exists_in_every_install() {
     for lily in require_installs() {
         let ly_dir = lily.share_dir().join("ly");
-        for file in install::file_names() {
+        for file in install::file_names()
+            .iter()
+            .chain(install::context_file_names())
+        {
             assert!(
                 ly_dir.join(file).is_file(),
                 "LilyPond {}: expected {} to exist under {}",
@@ -62,7 +75,7 @@ fn the_layer_defines_the_documented_handful() {
             let command = scope
                 .get(name)
                 .unwrap_or_else(|| panic!("LilyPond {}: \\{name} should resolve", lily.version))
-                .command;
+                .value;
             assert!(
                 command.signature().is_empty(),
                 "LilyPond {}: \\{name} should take no arguments, got {:?}",
@@ -88,7 +101,7 @@ fn a_documented_music_function_carries_its_docstring_and_signature() {
         let absolute = scope
             .get("absolute")
             .unwrap_or_else(|| panic!("LilyPond {}: \\absolute should resolve", lily.version))
-            .command;
+            .value;
         assert_eq!(
             absolute
                 .signature()
@@ -108,16 +121,18 @@ fn a_documented_music_function_carries_its_docstring_and_signature() {
 }
 
 /// Not an exact figure — versions differ, and pinning one would fail for no
-/// reason a version bump — but several hundred names across seventeen files
-/// is the whole point of this layer, so a count anywhere near zero means the
-/// reading broke.
+/// reason a version bump — but several hundred commands and context types
+/// across nineteen files is the whole point of this layer, so a count
+/// anywhere near zero means the reading broke. `Layer::len` counts both
+/// namespaces together (see its doc-comment), which is what "entries" means
+/// here rather than "commands".
 #[test]
 fn the_install_layer_clears_a_sensible_lower_bound() {
     for lily in require_installs() {
         let layer = install::load(&lily.share_dir().join("ly"));
         assert!(
             layer.len() >= 300,
-            "LilyPond {}: only {} commands in the install layer, expected several hundred",
+            "LilyPond {}: only {} entries in the install layer, expected several hundred",
             lily.version,
             layer.len()
         );
@@ -197,5 +212,236 @@ fn the_hand_written_layers_split_on_what_the_install_defines() {
                 lily.version
             );
         }
+    }
+}
+
+/// We should find these contexts in every install. If not, something went wrong.
+#[test]
+fn install_declares_common_contexts() {
+    for lily in require_installs() {
+        let layer = install::load(&lily.share_dir().join("ly"));
+        for name in [
+            "Staff",
+            "Voice",
+            "PianoStaff",
+            "Lyrics",
+            "ChordNames",
+            "StaffGroup",
+        ] {
+            assert!(
+                layer.get_context_type(name).is_some(),
+                "LilyPond {}: context type `{name}` should be declared by the install",
+                lily.version
+            );
+        }
+    }
+}
+
+/// The critical case the merge exists for: `Staff` is declared once in
+/// `engraver-init.ly`, with a `\description`, and again in
+/// `performer-init.ly`, without one. `load` must not let the second,
+/// description-less declaration blank the first out.
+#[test]
+fn staff_keeps_its_description_through_the_engraver_performer_merge() {
+    for lily in require_installs() {
+        let layer = install::load(&lily.share_dir().join("ly"));
+        let staff = layer
+            .get_context_type("Staff")
+            .unwrap_or_else(|| panic!("LilyPond {}: Staff should be declared", lily.version));
+        let description = staff.description.as_deref().unwrap_or_else(|| {
+            panic!(
+                "LilyPond {}: Staff should keep its description through the merge",
+                lily.version
+            )
+        });
+        assert!(
+            description.starts_with("Handles clefs, bar lines, keys, accidentals"),
+            "LilyPond {}: unexpected Staff description: {description:?}",
+            lily.version
+        );
+    }
+}
+
+/// Each context type binds its own name as a command too, so `\context {
+/// \Staff … }` resolves `\Staff` to something real rather than a name the
+/// scope has merely heard of.
+#[test]
+fn a_context_types_name_resolves_as_a_command() {
+    for lily in require_installs() {
+        let base = vocabulary::workspace_base(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: words file didn't load: {err}", lily.version)
+        });
+        let scope = base.for_document(&[]);
+        assert!(
+            scope.get("Staff").is_some(),
+            "LilyPond {}: \\Staff should resolve as a command",
+            lily.version
+        );
+    }
+}
+
+/// With context types loaded, the CamelCase shape rule is no longer a
+/// blanket pass: a plausible typo of a real context name must be flagged.
+#[test]
+fn is_known_rejects_a_typo_when_context_types_are_loaded() {
+    for lily in require_installs() {
+        let base = vocabulary::workspace_base(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: words file didn't load: {err}", lily.version)
+        });
+        let scope = base.for_document(&[]);
+        assert!(
+            !scope.is_known("Vioce"),
+            "LilyPond {}: `Vioce` is a typo of `Voice`, and should not be known",
+            lily.version
+        );
+        assert!(
+            scope.is_known("Voice"),
+            "LilyPond {}: `Voice` itself should still be known",
+            lily.version
+        );
+    }
+}
+
+/// `\new`/`\context`'s reading of their body depends on the type named —
+/// checked here against a real installation's own `ContextType` data, not
+/// the hand-maintained root-name fallback `NewContextCommand::music_context`
+/// falls back to with no install loaded (see `command::tests` for that
+/// fallback, which needs no install at all). `Staff` isn't itself one of the
+/// hand-written non-note roots and carries no alias to one either, so this
+/// also pins that an ordinary context type still reads its body as note
+/// music once real `ContextType` data is behind the lookup.
+#[test]
+fn new_lyrics_reads_its_body_as_non_note_against_a_real_install() {
+    for lily in require_installs() {
+        let base = vocabulary::workspace_base(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: words file didn't load: {err}", lily.version)
+        });
+        let scope = base.for_document(&[]);
+
+        let src = "<< \\new Staff { c } \\new Lyrics { la } >>";
+        let analysis = analyse(&tree(src), src, &scope);
+        assert!(
+            analysis.problems.is_empty(),
+            "LilyPond {}: expected no problems in {src:?}, got {:?}",
+            lily.version,
+            analysis.problems
+        );
+        let pitches: Vec<(u8, i32)> = analysis
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Note { pitch, .. } => Some((pitch.note_name, pitch.octave)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pitches,
+            vec![(0, -1)],
+            "LilyPond {}: only the Staff's `c` should be read as a note; `la` inside \\new \
+             Lyrics should be non-note and not read at all",
+            lily.version
+        );
+    }
+}
+
+/// The degraded path: with no install loaded — `Scope::builtins_only`, the
+/// scope with no words layer and no install layer either — the CamelCase
+/// shape rule must still accept `\Staff`, because the alternative is
+/// flagging every context reference in every score whenever the install
+/// can't be read.
+#[test]
+fn is_known_still_accepts_camel_case_without_an_install() {
+    let scope = vocabulary::Scope::builtins_only();
+    assert!(
+        scope.is_known("Staff"),
+        "with no context types loaded, a CamelCase name should still be accepted"
+    );
+    assert!(
+        scope.is_known("Vioce"),
+        "the fallback can't tell a typo from a real name — that's the price of degrading safely"
+    );
+}
+
+/// `\new`/`\context` completion, end to end through the `DocumentGraph`, on
+/// the context types a real installation actually declares: a plausible one
+/// (`Staff`) is offered, with its `\description` as the item's documentation,
+/// and `InternalGregorianStaff` — real in every install these tests find,
+/// from 2.24 onward (see `command::is_internal_context_type`'s doc for how
+/// that was checked) — is not, even though `\InternalGregorianStaff` is still
+/// a resolvable reference (the aliases real Gregorian/Mensural context types
+/// build on it through).
+#[test]
+fn new_offers_real_context_types_and_excludes_internal_ones() {
+    for lily in require_installs() {
+        let ws = DocumentGraph::new();
+        ws.load_vocabulary(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: vocabulary didn't load: {err}", lily.version)
+        });
+        let uri = Url::parse("untitled:score.ly").unwrap();
+        // A bare `\new` with nothing typed after it: the text-level fallback
+        // `command_assist::context_argument_completions` exists for, since
+        // tree-sitter recovers this as an `ERROR` node rather than a
+        // `named_context` (see that function's doc).
+        ws.open(uri.clone(), "{ \\new  }\n".to_string());
+
+        let items = ws.completions(&uri, Position::new(0, 7));
+        let staff = items
+            .iter()
+            .find(|item| item.label == "Staff")
+            .unwrap_or_else(|| panic!("LilyPond {}: Staff should be offered", lily.version));
+        assert!(
+            staff
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Handles clefs")),
+            "LilyPond {}: Staff's documentation should be its \\description, got {:?}",
+            lily.version,
+            staff.detail
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.label == "InternalGregorianStaff"),
+            "LilyPond {}: InternalGregorianStaff must not be offered, got {:?}",
+            lily.version,
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+
+        let base = vocabulary::workspace_base(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: words file didn't load: {err}", lily.version)
+        });
+        let scope = base.for_document(&[]);
+        assert!(
+            scope.get_context_type("InternalGregorianStaff").is_some(),
+            "LilyPond {}: InternalGregorianStaff must still be known, just not offered",
+            lily.version
+        );
+    }
+}
+
+/// Context instance names, end to end: a `\new Voice = "vocals"` written
+/// earlier in the same score is offered — quoted, per the insertion
+/// convention `ArgKind::ContextName`'s doc settles on — at a `\lyricsto` with
+/// nothing typed after it yet.
+#[test]
+fn lyricsto_offers_a_context_instance_name_from_earlier_in_the_score() {
+    for lily in require_installs() {
+        let ws = DocumentGraph::new();
+        ws.load_vocabulary(&lily.share_dir()).unwrap_or_else(|err| {
+            panic!("LilyPond {}: vocabulary didn't load: {err}", lily.version)
+        });
+        let uri = Url::parse("untitled:score.ly").unwrap();
+        let src = "{ \\new Voice = \"vocals\" { c } \\lyricsto  { la } }\n";
+        ws.open(uri.clone(), src.to_string());
+
+        let offset = src.find("\\lyricsto ").unwrap() + "\\lyricsto ".len();
+        let position = Position::new(0, offset as u32);
+        let items = ws.completions(&uri, position);
+        assert!(
+            items.iter().any(|item| item.label == "\"vocals\""),
+            "LilyPond {}: \"vocals\" should be offered at \\lyricsto, got {:?}",
+            lily.version,
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
     }
 }

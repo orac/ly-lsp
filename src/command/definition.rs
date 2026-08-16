@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::line_struct::Span;
-use crate::vocabulary::Layer;
+use crate::vocabulary::{Layer, Scope};
 
 use super::variable::Variable;
 use super::{
@@ -136,8 +136,13 @@ impl Command for Definition {
         self.command.parse_args(args)
     }
 
-    fn music_context(&self, call: &CommandCall, ambient: MusicContext) -> MusicContext {
-        self.command.music_context(call, ambient)
+    fn music_context(
+        &self,
+        call: &CommandCall,
+        ambient: MusicContext,
+        scope: &Scope,
+    ) -> MusicContext {
+        self.command.music_context(call, ambient, scope)
     }
 
     fn synopsis(&self) -> Option<String> {

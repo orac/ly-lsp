@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::command::{self, Command, variable::Variable};
+use crate::context::{ContextInstance, ContextType};
 
 /// Commands that are valid but absent from `lilypond-words`, so we supply them
 /// ourselves. `discant` is defined in Scheme by
@@ -55,7 +56,53 @@ const EXTRA_COMMANDS: &[&str] = &["discant"];
 /// hence what re-analyses the documents that include it.
 static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(0);
 
-/// One source of command definitions.
+/// A name-keyed map, factored out because a [`Layer`] holds one of these per
+/// *namespace* it recognises: commands, [`ContextType`]s, and
+/// [`ContextInstance`] names (the `"vocals"` of `\new Voice = "vocals"`).
+/// Lookup, emptiness and iteration read exactly the same regardless of what's
+/// inside, so that logic is written once rather than once per namespace.
+struct Table<T> {
+    entries: HashMap<String, T>,
+}
+
+impl<T> Table<T> {
+    fn new(entries: HashMap<String, T>) -> Self {
+        Self { entries }
+    }
+
+    fn empty() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&T> {
+        self.entries.get(name)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// Every entry, with the name it's keyed under, in no particular order.
+    fn iter(&self) -> impl Iterator<Item = (&str, &T)> {
+        self.entries
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+    }
+}
+
+/// One source of definitions: commands, the [`ContextType`]s a file's
+/// `\context { … }` blocks declare, and the [`ContextInstance`] names its
+/// `\new`/`\context` calls create.
 ///
 /// Layers are immutable once built. A file whose definitions change gets a
 /// whole new `Layer`, with a new [`id`](Self::id), rather than being mutated
@@ -64,18 +111,44 @@ static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(0);
 pub struct Layer {
     id: u64,
     origin: Arc<str>,
-    commands: HashMap<String, Arc<dyn Command>>,
+    commands: Table<Arc<dyn Command>>,
+    context_types: Table<ContextType>,
+    context_instances: Table<ContextInstance>,
 }
 
 impl Layer {
     /// `origin` is what to call the source these commands came from: a file
     /// name, `lilypond-2.24.3`, `lilypond-words`. See [`origin`](Self::origin).
+    ///
+    /// Commands only, no context types or instances — most call sites have
+    /// nothing else to give. [`with_context_types`](Self::with_context_types)
+    /// and [`with_context_instances`](Self::with_context_instances) add the
+    /// other two namespaces where a caller has them.
     pub fn new(origin: impl Into<Arc<str>>, commands: HashMap<String, Arc<dyn Command>>) -> Self {
         Self {
             id: NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed),
             origin: origin.into(),
-            commands,
+            commands: Table::new(commands),
+            context_types: Table::empty(),
+            context_instances: Table::empty(),
         }
+    }
+
+    /// Add `context_types` to `self`
+    #[must_use]
+    pub fn with_context_types(mut self, context_types: HashMap<String, ContextType>) -> Self {
+        self.context_types = Table::new(context_types);
+        self
+    }
+
+    /// Add `context_instances` to `self`
+    #[must_use]
+    pub fn with_context_instances(
+        mut self,
+        context_instances: HashMap<String, ContextInstance>,
+    ) -> Self {
+        self.context_instances = Table::new(context_instances);
+        self
     }
 
     /// Where this layer's knowledge came from, to be shown to the reader —
@@ -95,31 +168,68 @@ impl Layer {
         self.commands.get(name)
     }
 
+    /// The context type this layer declares under `name`, if any.
+    pub fn get_context_type(&self, name: &str) -> Option<&ContextType> {
+        self.context_types.get(name)
+    }
+
+    /// The context instance this layer's `\new`/`\context` calls create under
+    /// `name`, if any.
+    pub fn get_context_instance(&self, name: &str) -> Option<&ContextInstance> {
+        self.context_instances.get(name)
+    }
+
+    /// Whether this layer declares any context type at all. What
+    /// [`Scope::has_context_types`] folds down the stack, once, at the point
+    /// each layer is pushed — see there for why per-lookup isn't good enough.
+    fn has_context_types(&self) -> bool {
+        !self.context_types.is_empty()
+    }
+
     /// This layer's identity, unique among all layers ever built. See
     /// [`NEXT_LAYER_ID`].
     pub fn id(&self) -> u64 {
         self.id
     }
 
+    /// Whether this layer defines nothing at all, in *any* of its
+    /// namespaces. A layer that declares only a context type or instance —
+    /// no commands — must still count as non-empty here:
+    /// [`Scope::for_document`] skips empty layers and [`Scope::fingerprint`]
+    /// hashes only non-empty ones, so an empty verdict would make the
+    /// declaration invisible to every scope and never re-analysed on edit.
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
+            && self.context_types.is_empty()
+            && self.context_instances.is_empty()
     }
 
+    /// How many entries this layer holds, across all three namespaces.
     pub fn len(&self) -> usize {
-        self.commands.len()
+        self.commands.len() + self.context_types.len() + self.context_instances.len()
     }
 
-    /// Every name this layer defines, in no particular order.
+    /// Every command name this layer defines, in no particular order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.commands.keys().map(String::as_str)
+        self.commands.names()
     }
 
     /// Every command this layer defines, with the name it answers to, in no
     /// particular order.
     pub fn commands(&self) -> impl Iterator<Item = (&str, &Arc<dyn Command>)> {
-        self.commands
-            .iter()
-            .map(|(name, command)| (name.as_str(), command))
+        self.commands.iter()
+    }
+
+    /// Every context type this layer declares, with the name it answers to,
+    /// in no particular order.
+    pub fn context_types(&self) -> impl Iterator<Item = (&str, &ContextType)> {
+        self.context_types.iter()
+    }
+
+    /// Every context instance this layer's `\new`/`\context` calls create,
+    /// with the name it answers to, in no particular order.
+    pub fn context_instances(&self) -> impl Iterator<Item = (&str, &ContextInstance)> {
+        self.context_instances.iter()
     }
 }
 
@@ -135,18 +245,23 @@ impl std::fmt::Debug for Layer {
             .field("id", &self.id)
             .field("origin", &self.origin)
             .field("commands", &self.commands.len())
+            .field("context_types", &self.context_types.len())
+            .field("context_instances", &self.context_instances.len())
             .finish()
     }
 }
 
-/// What a [`Scope`] knows about a name: the [`Command`] it resolves to, and the
-/// [`Layer`] that answered for it.
+/// What a [`Scope`] knows about a name: the value it resolves to — a command,
+/// a [`ContextType`] or a [`ContextInstance`] — and the [`Layer`] that
+/// answered for it.
 ///
-/// The layer travels with the command because the command can't say which one
-/// holds it — the same `Arc<dyn Command>` may sit in several — and where a name
-/// was found is part of the answer to "what is `\foo`?"; see [`Layer::origin`].
-pub struct Known<'a> {
-    pub command: &'a Arc<dyn Command>,
+/// Generic over the value so one type serves every namespace a `Scope` can
+/// look a name up in, rather than a `Known`-alike per namespace. The layer
+/// travels with the value because the value can't say which one holds it —
+/// the same `Arc<dyn Command>` may sit in several — and where a name was
+/// found is part of the answer to "what is `\foo`?"; see [`Layer::origin`].
+pub struct Known<'a, T> {
+    pub value: &'a T,
     pub layer: &'a Arc<Layer>,
 }
 
@@ -166,6 +281,11 @@ pub struct Scope {
 struct Cell {
     layer: Arc<Layer>,
     under: Scope,
+    /// Whether this layer or anything under it declares a context type.
+    /// Folded in once, here, when the cell is built — see
+    /// [`Scope::has_context_types`] for why that beats asking on every
+    /// [`is_known`](Scope::is_known) call.
+    has_context_types: bool,
 }
 
 impl Scope {
@@ -177,10 +297,12 @@ impl Scope {
     /// pushed by *extending* the environment it encloses.
     #[must_use]
     pub fn extended_with(&self, layer: Arc<Layer>) -> Self {
+        let has_context_types = layer.has_context_types() || self.has_context_types();
         Self {
             top: Some(Arc::new(Cell {
                 layer,
                 under: self.clone(),
+                has_context_types,
             })),
         }
     }
@@ -224,15 +346,65 @@ impl Scope {
             .map(|cell| &cell.layer)
     }
 
-    /// What `\name` refers to: the nearest layer that has a command for it
-    /// wins.
-    pub fn get(&self, name: &str) -> Option<Known<'_>> {
+    /// The nearest layer that answers `lookup` for a name, paired with the
+    /// layer that answered — the shared machinery behind [`get`](Self::get)
+    /// and [`get_context_type`](Self::get_context_type), so a third namespace
+    /// won't need a third copy of "walk the layers, stop at the first hit".
+    fn resolve<'a, T>(
+        &'a self,
+        lookup: impl Fn(&'a Layer) -> Option<&'a T>,
+    ) -> Option<Known<'a, T>> {
         self.layers().find_map(|layer| {
             Some(Known {
-                command: layer.get(name)?,
+                value: lookup(layer)?,
                 layer,
             })
         })
+    }
+
+    /// What `\name` refers to: the nearest layer that has a command for it
+    /// wins.
+    pub fn get(&self, name: &str) -> Option<Known<'_, Arc<dyn Command>>> {
+        self.resolve(|layer| layer.get(name))
+    }
+
+    /// What `Name` refers to: the nearest layer that declares a context type
+    /// for it wins, the same shadowing rule [`get`](Self::get) follows for
+    /// commands.
+    pub fn get_context_type(&self, name: &str) -> Option<Known<'_, ContextType>> {
+        self.resolve(|layer| layer.get_context_type(name))
+    }
+
+    /// What a `\change`, `\lyricsto` or bare `"name"` reference means: the
+    /// nearest layer whose `\new`/`\context` calls create an instance called
+    /// `name` wins, the same shadowing rule [`get`](Self::get) follows for
+    /// commands. See [`ContextInstance`] for the file-scoped approximation
+    /// this rests on.
+    pub fn get_context_instance(&self, name: &str) -> Option<Known<'_, ContextInstance>> {
+        self.resolve(|layer| layer.get_context_instance(name))
+    }
+
+    /// The shared machinery behind [`visible`](Self::visible) and
+    /// [`visible_context_types`](Self::visible_context_types): every entry
+    /// `entries` reads off a layer, for every layer, keeping only the first —
+    /// nearest — one seen for each name.
+    fn visible_via<'a, T, I>(
+        &'a self,
+        entries: impl Fn(&'a Layer) -> I,
+    ) -> Vec<(&'a str, Known<'a, T>)>
+    where
+        I: Iterator<Item = (&'a str, &'a T)>,
+    {
+        let mut seen = HashSet::new();
+        let mut visible = Vec::new();
+        for layer in self.layers() {
+            for (name, value) in entries(layer) {
+                if seen.insert(name) {
+                    visible.push((name, Known { value, layer }));
+                }
+            }
+        }
+        visible
     }
 
     /// Everything this scope can resolve, with the name each command answers
@@ -244,30 +416,58 @@ impl Scope {
     /// A `Vec` rather than an iterator because remembering which names have
     /// already been answered for takes state the caller has no use for, and
     /// the caller wants the whole lot anyway.
-    pub fn visible(&self) -> Vec<(&str, Known<'_>)> {
-        let mut seen = HashSet::new();
-        let mut visible = Vec::new();
-        for layer in self.layers() {
-            for (name, command) in layer.commands() {
-                if seen.insert(name) {
-                    visible.push((name, Known { command, layer }));
-                }
-            }
-        }
-        visible
+    pub fn visible(&self) -> Vec<(&str, Known<'_, Arc<dyn Command>>)> {
+        self.visible_via(Layer::commands)
     }
 
-    /// Whether `\name` is a command we recognise at all. `name` is the command
-    /// without its leading backslash.
+    /// Every context type this scope can resolve, with the name it answers
+    /// to — the [`visible`](Self::visible) of the context-type namespace, for
+    /// its own completion list, with the same de-duplication.
+    pub fn visible_context_types(&self) -> Vec<(&str, Known<'_, ContextType>)> {
+        self.visible_via(Layer::context_types)
+    }
+
+    /// Every context instance this scope can resolve, with the name it
+    /// answers to — the [`visible`](Self::visible) of the context-instance
+    /// namespace, for its own completion list, with the same
+    /// de-duplication.
+    pub fn visible_context_instances(&self) -> Vec<(&str, Known<'_, ContextInstance>)> {
+        self.visible_via(Layer::context_instances)
+    }
+
+    /// Whether this scope's layers — install, workspace, or both — declare
+    /// any [`ContextType`] at all.
     ///
-    /// CamelCase names are accepted unconditionally: by LilyPond convention a
-    /// `\Foo` with an uppercase initial is a context reference (a built-in like
-    /// `\Staff` or a user-defined context), which the words file doesn't carry
-    /// as a command. That stays a rule rather than a layer because it is one
-    /// about the *shape* of a name — no map can hold the infinitely many
-    /// `\Foo`s. The price is that a mistyped context name goes unflagged.
+    /// Computed once per layer, when it's pushed by
+    /// [`extended_with`](Self::extended_with), and folded down the stack from
+    /// there, so asking is reading one `bool` off the top [`Cell`] rather than
+    /// walking every layer. That matters because [`is_known`](Self::is_known)
+    /// asks it once per reference in a document.
+    fn has_context_types(&self) -> bool {
+        self.top.as_ref().is_some_and(|cell| cell.has_context_types)
+    }
+
+    /// Whether `\name` is a command or context type we recognise at all.
+    /// `name` is written without its leading backslash.
+    ///
+    /// A real hit in either namespace always counts. Failing that, a
+    /// CamelCase name — by LilyPond convention, `\Foo` with an uppercase
+    /// initial is a context reference — is accepted too, but *only* as a
+    /// **fallback for a scope that knows no context types whatsoever**. This
+    /// is not a rule about what a well-typed context reference looks like;
+    /// it exists because the install can fail to load (no share directory
+    /// passed, an unreadable directory, a version layout this reader doesn't
+    /// recognise), and when it does, the context-type namespace is empty
+    /// everywhere in scope. Refusing every CamelCase name at that point would
+    /// flag `\Staff` in every score a workspace opens, which is a worse
+    /// outcome than the fallback's actual price: a genuinely mistyped
+    /// `\Vioce` goes unflagged only while the scope has no real context types
+    /// to check it against. Once any layer supplies even one, the fallback
+    /// stops applying and a typo like `\Vioce` is rejected on its own merits.
     pub fn is_known(&self, name: &str) -> bool {
-        is_context_reference(name) || self.get(name).is_some()
+        self.get(name).is_some()
+            || self.get_context_type(name).is_some()
+            || (!self.has_context_types() && is_context_reference(name))
     }
 
     /// A value identifying which layers this scope stacks, so an analysis can
@@ -357,6 +557,7 @@ fn parse_words(text: &str) -> impl Iterator<Item = String> {
 mod tests {
     use super::*;
     use crate::command::scheme;
+    use crate::line_struct::Span;
 
     /// A layer defining one command of the given name, taking `arity`
     /// arguments, read from a real definition so the test exercises the same
@@ -373,6 +574,48 @@ mod tests {
             Arc::from(src.as_str()),
             Arc::from("test.ly"),
         ))
+    }
+
+    /// A `ContextType` with nothing but a name — enough for the lookup and
+    /// shadowing tests, which don't care about aliases, descriptions or
+    /// spans.
+    fn context_type(name: &str) -> ContextType {
+        ContextType {
+            name: name.to_string(),
+            aliases: Vec::new(),
+            description: None,
+            name_span: Span::new(0, 0),
+            block_span: Span::new(0, 0),
+        }
+    }
+
+    /// A layer holding only the given context type, no commands at all — the
+    /// shape a `\layout { \context { \name Foo } }` with nothing else in the
+    /// file produces.
+    fn layer_declaring(name: &str) -> Arc<Layer> {
+        let mut context_types = HashMap::new();
+        context_types.insert(name.to_string(), context_type(name));
+        Arc::new(Layer::new("test.ly", HashMap::new()).with_context_types(context_types))
+    }
+
+    /// A `ContextInstance` with nothing but a name — enough for the lookup
+    /// and shadowing tests below, which don't care about the type it was
+    /// created as or its span.
+    fn context_instance(name: &str) -> ContextInstance {
+        ContextInstance {
+            name: name.to_string(),
+            type_name: None,
+            span: Span::new(0, 0),
+        }
+    }
+
+    /// A layer holding only the given context instance, no commands at all —
+    /// the shape a bare `\new Voice = "vocals" { … }` with nothing else in
+    /// the file produces.
+    fn layer_creating(name: &str) -> Arc<Layer> {
+        let mut context_instances = HashMap::new();
+        context_instances.insert(name.to_string(), context_instance(name));
+        Arc::new(Layer::new("test.ly", HashMap::new()).with_context_instances(context_instances))
     }
 
     /// A base holding only the given words, as a workspace with no install
@@ -441,7 +684,7 @@ mod tests {
     #[test]
     fn get_resolves_a_reserved_command() {
         let scope = Scope::builtins_only();
-        let repeat = scope.get("repeat").expect("repeat is reserved").command;
+        let repeat = scope.get("repeat").expect("repeat is reserved").value;
         assert_eq!(repeat.name(), "repeat");
         assert_eq!(repeat.signature().len(), 3);
     }
@@ -457,7 +700,7 @@ mod tests {
             scope
                 .get("break")
                 .expect("break")
-                .command
+                .value
                 .signature()
                 .is_empty()
         );
@@ -474,12 +717,7 @@ mod tests {
         let scope = words("").for_document(&[layer_defining("myFunc", 1)]);
         assert!(scope.is_known("myFunc"));
         assert_eq!(
-            scope
-                .get("myFunc")
-                .expect("myFunc")
-                .command
-                .signature()
-                .len(),
+            scope.get("myFunc").expect("myFunc").value.signature().len(),
             1
         );
     }
@@ -497,7 +735,7 @@ mod tests {
             .filter(|(name, _)| *name == "dup")
             .collect();
         assert_eq!(dups.len(), 1);
-        assert_eq!(dups[0].1.command.signature().len(), 1);
+        assert_eq!(dups[0].1.value.signature().len(), 1);
     }
 
     #[test]
@@ -507,12 +745,9 @@ mod tests {
         let near = layer_defining("dup", 1);
         let far = layer_defining("dup", 2);
         let scope = Scope::EMPTY.for_document(&[Arc::clone(&near), Arc::clone(&far)]);
-        assert_eq!(scope.get("dup").expect("dup").command.signature().len(), 1);
+        assert_eq!(scope.get("dup").expect("dup").value.signature().len(), 1);
         let reversed = Scope::EMPTY.for_document(&[far, near]);
-        assert_eq!(
-            reversed.get("dup").expect("dup").command.signature().len(),
-            2
-        );
+        assert_eq!(reversed.get("dup").expect("dup").value.signature().len(), 2);
     }
 
     #[test]
@@ -522,12 +757,7 @@ mod tests {
         // shadow it and ours must still win.
         let scope = Scope::builtins().for_document(&[layer_defining("repeat", 1)]);
         assert_eq!(
-            scope
-                .get("repeat")
-                .expect("repeat")
-                .command
-                .signature()
-                .len(),
+            scope.get("repeat").expect("repeat").value.signature().len(),
             3
         );
     }
@@ -539,10 +769,7 @@ mod tests {
         // shadow it — and reporting our curated one-string signature for the
         // user's own two-argument `\clef` would be a lie.
         let scope = Scope::builtins().for_document(&[layer_defining("clef", 2)]);
-        assert_eq!(
-            scope.get("clef").expect("clef").command.signature().len(),
-            2
-        );
+        assert_eq!(scope.get("clef").expect("clef").value.signature().len(), 2);
     }
 
     #[test]
@@ -600,5 +827,133 @@ mod tests {
         for (from_base, from_scope) in base.layers().zip(scope.layers().skip(2)) {
             assert!(Arc::ptr_eq(from_base, from_scope));
         }
+    }
+
+    #[test]
+    fn a_context_type_resolves_through_a_scope() {
+        let scope = Scope::EMPTY.for_document(&[layer_declaring("Staff")]);
+        let known = scope.get_context_type("Staff").expect("Staff");
+        assert_eq!(known.value.name, "Staff");
+    }
+
+    #[test]
+    fn a_nearer_layer_shadows_a_further_ones_context_type() {
+        // Same shadowing rule as `get` for commands: two files declare
+        // `MyStaff` differently (told apart here just by which one answers),
+        // and the nearer — the document's own, or the nearest include — wins.
+        let near = layer_declaring("MyStaff");
+        let far = layer_declaring("MyStaff");
+        let scope = Scope::EMPTY.for_document(&[Arc::clone(&near), Arc::clone(&far)]);
+        let known = scope.get_context_type("MyStaff").expect("MyStaff");
+        assert!(Arc::ptr_eq(known.layer, &near));
+    }
+
+    #[test]
+    fn visible_context_types_deduplicates_a_shadowed_name() {
+        let near = layer_declaring("MyStaff");
+        let far = layer_declaring("MyStaff");
+        let scope = Scope::EMPTY.for_document(&[near, far]);
+        let matches: Vec<_> = scope
+            .visible_context_types()
+            .into_iter()
+            .filter(|(name, _)| *name == "MyStaff")
+            .collect();
+        assert_eq!(matches.len(), 1, "a shadowed context type is offered once");
+    }
+
+    #[test]
+    fn a_layer_with_only_a_context_type_reports_non_empty() {
+        // Load-bearing: `for_document` skips empty layers and `fingerprint`
+        // hashes only non-empty ones, so a layer with a context type but no
+        // commands must not be mistaken for one with nothing at all — or its
+        // declaration silently vanishes from every scope that stacks it and
+        // is never re-analysed on edit.
+        let layer = layer_declaring("Staff");
+        assert!(!layer.is_empty());
+        assert_eq!(layer.len(), 1);
+
+        // And it must actually survive `for_document`, not just claim to be
+        // non-empty in isolation.
+        let scope = Scope::EMPTY.for_document(&[Arc::clone(&layer)]);
+        assert!(
+            scope.layers().any(|l| Arc::ptr_eq(l, &layer)),
+            "a context-type-only layer must not be skipped as if it were empty"
+        );
+    }
+
+    #[test]
+    fn two_scopes_differing_only_by_a_context_type_only_layer_fingerprint_differently() {
+        let plain = Scope::EMPTY.for_document(&[]).fingerprint();
+        let with_context_type = Scope::EMPTY
+            .for_document(&[layer_declaring("Staff")])
+            .fingerprint();
+        assert_ne!(
+            plain, with_context_type,
+            "a layer declaring only a context type must still change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn a_context_instance_resolves_through_a_scope() {
+        let scope = Scope::EMPTY.for_document(&[layer_creating("vocals")]);
+        let known = scope.get_context_instance("vocals").expect("vocals");
+        assert_eq!(known.value.name, "vocals");
+    }
+
+    #[test]
+    fn a_nearer_layer_shadows_a_further_ones_context_instance() {
+        // Same shadowing rule as `get` for commands and `get_context_type`
+        // for context types: the nearer — the document's own, or the
+        // nearest include — wins.
+        let near = layer_creating("vocals");
+        let far = layer_creating("vocals");
+        let scope = Scope::EMPTY.for_document(&[Arc::clone(&near), Arc::clone(&far)]);
+        let known = scope.get_context_instance("vocals").expect("vocals");
+        assert!(Arc::ptr_eq(known.layer, &near));
+    }
+
+    #[test]
+    fn visible_context_instances_deduplicates_a_shadowed_name() {
+        let near = layer_creating("vocals");
+        let far = layer_creating("vocals");
+        let scope = Scope::EMPTY.for_document(&[near, far]);
+        let matches: Vec<_> = scope
+            .visible_context_instances()
+            .into_iter()
+            .filter(|(name, _)| *name == "vocals")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "a shadowed context instance is offered once"
+        );
+    }
+
+    #[test]
+    fn a_layer_with_only_a_context_instance_reports_non_empty() {
+        // Load-bearing for the same reason as the context-type case above:
+        // an instance-only layer must not vanish from every scope that
+        // stacks it.
+        let layer = layer_creating("vocals");
+        assert!(!layer.is_empty());
+        assert_eq!(layer.len(), 1);
+
+        let scope = Scope::EMPTY.for_document(&[Arc::clone(&layer)]);
+        assert!(
+            scope.layers().any(|l| Arc::ptr_eq(l, &layer)),
+            "a context-instance-only layer must not be skipped as if it were empty"
+        );
+    }
+
+    #[test]
+    fn two_scopes_differing_only_by_a_context_instance_only_layer_fingerprint_differently() {
+        let plain = Scope::EMPTY.for_document(&[]).fingerprint();
+        let with_context_instance = Scope::EMPTY
+            .for_document(&[layer_creating("vocals")])
+            .fingerprint();
+        assert_ne!(
+            plain, with_context_instance,
+            "a layer creating only a context instance must still change the fingerprint"
+        );
     }
 }

@@ -35,7 +35,8 @@ use tower_lsp::lsp_types::{
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Query, QueryCursor, Tree};
 
 use crate::command::definition::{self, Binding};
-use crate::command::{self, Commands};
+use crate::command::{self, Arg, Commands};
+use crate::context;
 use crate::line_struct::{LineIndex, Span};
 use crate::note_analyser;
 use crate::notes::{Events, NoteAnalysis, Problem};
@@ -95,7 +96,8 @@ pub struct Document {
     references: Vec<Symbol>,
     includes: Vec<Include>,
     /// What *this file* defines, ready to be stacked into the [`Scope`] of
-    /// every document that can see it. Read once here, when the document is
+    /// every document that can see it — commands, and the context types its
+    /// `\context { … }` blocks declare. Read once here, when the document is
     /// built, which is what stops an include shared by a dozen scores being
     /// read a dozen times.
     commands_defined: Arc<Layer>,
@@ -149,11 +151,20 @@ impl Document {
             })
             .collect();
 
-        let commands_defined = Arc::new(definition::layer(
-            bindings,
-            Arc::clone(&text),
-            Arc::clone(&origin),
-        ));
+        let context_types = context::read(&tree, &text)
+            .into_iter()
+            .map(|context_type| (context_type.name.clone(), context_type))
+            .collect();
+        let context_instances = context::read_instances(&tree, &text)
+            .into_iter()
+            .map(|instance| (instance.name.clone(), instance))
+            .collect();
+
+        let commands_defined = Arc::new(
+            definition::layer(bindings, Arc::clone(&text), Arc::clone(&origin))
+                .with_context_types(context_types)
+                .with_context_instances(context_instances),
+        );
         let scope = own_scope(&commands_defined);
         let notes = note_analyser::analyse(&tree, &text, &scope);
         Self {
@@ -489,6 +500,52 @@ impl Document {
             .map(|s| s.name.as_str())
     }
 
+    /// The `Arg::ContextType` or `Arg::ContextName` argument the cursor sits in
+    /// at `position`, if there is one.
+    ///
+    /// Neither a context type (`Staff` in `\new Staff`) nor an instance name
+    /// (`"vocals"` in `\lyricsto "vocals"`) is a `reference`
+    /// [`Symbol`](Symbol) [`symbol_at`](Self::symbol_at) would find: both
+    /// parse as a bare `symbol`/`string` node, meaningful only through the
+    /// argument position `\new`'s (or `\lyricsto`'s, `\change`'s) signature
+    /// gives it — go-to-definition and semantic tokens both need this same
+    /// "is the cursor on one of these two argument kinds" lookup.
+    ///
+    /// Reuses [`Commands::call_site_at`], the same "which call, which
+    /// argument position" lookup `command_assist::call_at` uses for
+    /// signature help, completion and hover, rather than inventing a third
+    /// way of finding the cursor inside a command's arguments. Its index can
+    /// point one past the last argument actually parsed, for a call still
+    /// being typed — the `span().contains` check is what tells that apart
+    /// from the cursor really landing inside this one.
+    fn context_arg_at(&self, position: Position) -> Option<&Arg> {
+        let offset = self.line_index.offset_at(position)?;
+        let site = self.commands().call_site_at(offset, self.text())?;
+        let arg = site.call.args.get(site.index)?;
+        (arg.span().contains(offset)
+            && matches!(arg, Arg::ContextType { .. } | Arg::ContextName { .. }))
+        .then_some(arg)
+    }
+
+    /// The name of the context type (`Staff` in `\new Staff`) under
+    /// `position`, if the cursor is on one.
+    pub(crate) fn context_type_at(&self, position: Position) -> Option<&str> {
+        match self.context_arg_at(position)? {
+            Arg::ContextType { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The name of the context instance (`"vocals"` in `\lyricsto "vocals"`,
+    /// or the `"x"` a `\new`/`\context` names) under `position`, if the
+    /// cursor is on one.
+    pub(crate) fn context_name_at(&self, position: Position) -> Option<&str> {
+        match self.context_arg_at(position)? {
+            Arg::ContextName { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
     /// Definitions matching `name`, as LSP ranges, in source order.
     ///
     /// Asked of the layer rather than of [`definitions`](Self::definitions),
@@ -544,6 +601,51 @@ impl Document {
             None => spans.last(),
         };
         in_effect.map(|span| self.line_index.range_of(*span))
+    }
+
+    /// Where this file declares the context type `name` (`\context { \name
+    /// Foo … }`'s `\name` span), if it declares one at all.
+    ///
+    /// Unlike [`definition_in_effect`](Self::definition_in_effect), there is
+    /// no *in effect at a position* to resolve: a [`ContextType`] carries no
+    /// [`redefines`](command::Command::redefines) chain the way a command
+    /// binding does, so a file that writes `\name Foo` twice is read the
+    /// same way [`ContextInstance`] already is for a repeated instance name
+    /// (see its doc) — the layer keeps only the last one, and that is the
+    /// one landed on however the cursor got here.
+    ///
+    /// Also `None` for a type declared only by the LilyPond install: this
+    /// only ever looks at *this document's* own layer, which is the file it
+    /// can point a [`Location`] at. An install-layer [`ContextType`] carries
+    /// a `name_span` but no file
+    /// (see `doc/command-parsing.md`, "Go-to-definition into the install"),
+    /// so navigating to a built-in type like `Staff` degrades to no result
+    /// here rather than a wrong one — the same known gap that document
+    /// already records, not a new one.
+    ///
+    /// [`ContextType`]: crate::context::ContextType
+    /// [`ContextInstance`]: crate::context::ContextInstance
+    /// [`Location`]: tower_lsp::lsp_types::Location
+    pub fn context_type_declaration(&self, name: &str) -> Option<Range> {
+        self.commands_defined
+            .get_context_type(name)
+            .map(|context_type| self.line_index.range_of(context_type.name_span))
+    }
+
+    /// Where this file creates the context instance `name` (the `"vocals"`
+    /// of a `\new Voice = "vocals"`/`\context Voice = "vocals"`), if it
+    /// creates one at all.
+    ///
+    /// The [`ContextInstance`] counterpart of
+    /// [`context_type_declaration`](Self::context_type_declaration) — same
+    /// "only this file's own layer, no install" limitation, and no
+    /// redefinition chain to resolve a cursor position against either.
+    ///
+    /// [`ContextInstance`]: crate::context::ContextInstance
+    pub fn context_instance_creation(&self, name: &str) -> Option<Range> {
+        self.commands_defined
+            .get_context_instance(name)
+            .map(|instance| self.line_index.range_of(instance.span))
     }
 
     pub fn reference_ranges(&self, name: &str) -> Vec<Range> {
@@ -1293,6 +1395,117 @@ mod tests {
         assert_eq!(my_func.signature().len(), 1);
         let replaced = my_func.redefines().expect("the plain variable it replaced");
         assert!(replaced.signature().is_empty());
+    }
+
+    #[test]
+    fn a_document_exposes_a_context_type_its_own_layout_block_declares() {
+        // Step 2 wires `context::read` into `from_parts`, so a file's own
+        // `\context { \name … }` declaration lands in the same layer as its
+        // commands, not just in a reader nobody calls yet.
+        let src = "\\score { { c } \\layout { \\context { \\name MyStaff } } }";
+        let doc = Document::new(src.to_string());
+        let declared = doc
+            .commands_defined()
+            .get_context_type("MyStaff")
+            .expect("MyStaff");
+        assert_eq!(declared.name, "MyStaff");
+    }
+
+    #[test]
+    fn a_document_exposes_a_context_instance_its_own_music_creates() {
+        // Step 5's counterpart of the context-type test above: `context::
+        // read_instances` is wired into `from_parts` the same way.
+        let src = "{ \\new Voice = \"vocals\" { c } }";
+        let doc = Document::new(src.to_string());
+        let created = doc
+            .commands_defined()
+            .get_context_instance("vocals")
+            .expect("vocals");
+        assert_eq!(created.name, "vocals");
+        assert_eq!(created.type_name.as_deref(), Some("Voice"));
+    }
+
+    #[test]
+    fn rebinding_a_context_instance_name_keeps_the_last() {
+        // LilyPond takes the last binding of a name wherever it can be
+        // rebound at all; a file that creates two same-named instances (a
+        // score reusing a common voice name across movements, say) is read
+        // the same way `commands_defined` already does for commands.
+        let src = "{ \\new Staff = \"x\" { c } \\new Voice = \"x\" { c } }";
+        let doc = Document::new(src.to_string());
+        let bound = doc.commands_defined().get_context_instance("x").expect("x");
+        assert_eq!(bound.type_name.as_deref(), Some("Voice"));
+    }
+
+    #[test]
+    fn context_type_at_finds_the_name_in_a_new() {
+        let src = "{ \\new Staff { c } }";
+        let doc = Document::new(src.to_string());
+        // Cursor inside `Staff` (the `t`).
+        let pos = doc.line_index().position_at(src.find("Staff").unwrap() + 1);
+        assert_eq!(doc.context_type_at(pos), Some("Staff"));
+        assert_eq!(doc.context_name_at(pos), None);
+    }
+
+    #[test]
+    fn context_name_at_finds_a_quoted_instance_name() {
+        let src = "{ \\lyricsto \"vocals\" { la } }";
+        let doc = Document::new(src.to_string());
+        // Cursor inside `vocals`.
+        let pos = doc
+            .line_index()
+            .position_at(src.find("vocals").unwrap() + 1);
+        assert_eq!(doc.context_name_at(pos), Some("vocals"));
+        assert_eq!(doc.context_type_at(pos), None);
+    }
+
+    #[test]
+    fn context_type_and_name_at_are_none_elsewhere() {
+        let src = "{ \\new Staff = \"x\" { c } }";
+        let doc = Document::new(src.to_string());
+        // On a note, well away from either argument.
+        let pos = doc.line_index().position_at(src.find('c').unwrap());
+        assert_eq!(doc.context_type_at(pos), None);
+        assert_eq!(doc.context_name_at(pos), None);
+    }
+
+    #[test]
+    fn context_type_declaration_locates_the_name_span() {
+        let src = "\\layout { \\context { \\name MyStaff } }";
+        let doc = Document::new(src.to_string());
+        let range = doc
+            .context_type_declaration("MyStaff")
+            .expect("MyStaff is declared");
+        let start = doc.line_index().offset_at(range.start).unwrap();
+        let end = doc.line_index().offset_at(range.end).unwrap();
+        assert_eq!(&src[start..end], "MyStaff");
+    }
+
+    #[test]
+    fn context_type_declaration_is_none_for_an_undeclared_name() {
+        // `Staff` here is only ever referred to, never declared with `\name`
+        // — the shape a built-in type looks like from a file that never
+        // declares its own context types at all.
+        let doc = Document::new("{ \\new Staff { c } }".to_string());
+        assert!(doc.context_type_declaration("Staff").is_none());
+    }
+
+    #[test]
+    fn context_instance_creation_locates_the_name_span() {
+        let src = "{ \\new Voice = \"vocals\" { c } }";
+        let doc = Document::new(src.to_string());
+        let range = doc
+            .context_instance_creation("vocals")
+            .expect("vocals is created");
+        let start = doc.line_index().offset_at(range.start).unwrap();
+        let end = doc.line_index().offset_at(range.end).unwrap();
+        assert_eq!(&src[start..end], "vocals");
+    }
+
+    #[test]
+    fn context_instance_creation_is_none_for_an_uncreated_name() {
+        let doc = Document::new("{ \\lyricsto \"vocals\" { la } }".to_string());
+        assert!(doc.context_instance_creation("vocals").is_none());
     }
 
     #[test]

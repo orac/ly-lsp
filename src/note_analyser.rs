@@ -180,8 +180,6 @@ impl<'a> Analyser<'a> {
     fn walk(&mut self, parent: Node, mut mode: Mode, region: Region) {
         let mut cursor = parent.walk();
         let children: Vec<Node> = parent.children(&mut cursor).collect();
-        // The region a `\new`/`\context` set for the bare block that follows it.
-        let mut pending: Option<Region> = None;
         // Whether the last child read was a music event, so a following bare
         // integer is a bare duration repeating its pitch rather than a command's
         // numeric argument (the `1` of `\volta 1`, the `2` of `\repeat … 2`).
@@ -191,9 +189,11 @@ impl<'a> Analyser<'a> {
             let child = children[i];
             match child.kind() {
                 "expression_block" | "parallel_music" => {
-                    // A bare block inherits the surrounding mode and region, unless a preceding `\new`/`\context` set a region for it.
-                    let block_region = pending.take().unwrap_or_else(|| region.nested_block());
-                    self.walk(child, mode, block_region);
+                    // A bare block inherits the surrounding mode and region.
+                    // A `\new`/`\context` block is never bare here — it and
+                    // its music argument are consumed together by
+                    // `handle_command`'s own `named_context` arm below.
+                    self.walk(child, mode, region.nested_block());
                     after_event = false;
                     i += 1;
                 }
@@ -217,19 +217,18 @@ impl<'a> Analyser<'a> {
                     i = self.read_chord_mode_event(&children, i);
                     after_event = false;
                 }
-                "escaped_word" => {
+                // `\new`/`\context` is a `named_context` node rather than a bare
+                // `escaped_word` (the grammar folds the keyword and its context
+                // type together — see `command::parse`), but both resolve
+                // through the same table and the same five steps
+                // `handle_command` describes: `command::parse` unwraps the
+                // shape, and `NewContextCommand::music_context` decides
+                // `NonNote` vs inherited from the type named, in place of the
+                // hand-coded `is_non_note_context` check this arm used to make
+                // itself.
+                "escaped_word" | "named_context" => {
                     i = self.handle_command(&children, i, mode, region);
-                    pending = None;
                     after_event = false;
-                }
-                // `\new Staff` etc.: the context type decides whether the block that follows is read as note music. `\new Lyrics`/`ChordNames` and friends are not.
-                "named_context" => {
-                    pending = Some(match self.context_type(child) {
-                        Some(kind) if is_non_note_context(kind) => Region::NonNote,
-                        _ => region.nested_block(),
-                    });
-                    after_event = false;
-                    i += 1;
                 }
                 // A bar check between events doesn't break the run, so a bare
                 // duration may still follow it (`c4 | 4`).
@@ -242,16 +241,10 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// The context type named by a `named_context` node (`Staff` in `\new Staff`), if it has one.
-    fn context_type(&self, node: Node) -> Option<&'a str> {
-        let mut cursor = node.walk();
-        node.children(&mut cursor)
-            .find(|n| n.kind() == "symbol")
-            .map(|n| self.text(n))
-    }
-
-    /// Handles an `escaped_word` command at `children[start]`, and returns the
-    /// next index to read.
+    /// Handles a command at `children[start]` — either an `escaped_word`
+    /// (`\repeat`, `\clef`, …) or a `named_context` (`\new Staff`, `\context
+    /// Voice = "vocals"`, both a single node the grammar folds the keyword
+    /// and its context type into) — and returns the next index to read.
     ///
     /// This is the five steps `doc/command-parsing.md`'s "How the note
     /// analyser uses it" section describes, replacing what used to be a
@@ -264,6 +257,10 @@ impl<'a> Analyser<'a> {
     /// in [`walk`](Self::walk) that called us then reaches the following
     /// block itself, through its own `expression_block` arm, exactly as it
     /// does today for `\break`, `\bar`, and everything else with no signature.
+    /// (`named_context` always resolves — `\new`/`\context` are reserved
+    /// words — but the fallback is exactly as correct for it as for an
+    /// unrecognised `escaped_word`, since either shape occupies one slot in
+    /// `children` regardless of how [`command::parse`] reads what follows it.)
     fn handle_command(
         &mut self,
         children: &[Node],
@@ -289,7 +286,7 @@ impl<'a> Analyser<'a> {
         }
 
         let ambient = ambient_context(mode, region);
-        let context = call.cmd.music_context(&call, ambient);
+        let context = call.cmd.music_context(&call, ambient, self.scope);
         let (body_mode, body_region) = mode_and_region(context, mode);
         let music_spans: Vec<Span> = call
             .args
@@ -891,21 +888,6 @@ fn under_error(span: Span, errors: &[Span]) -> bool {
     errors
         .iter()
         .any(|error| error.start <= span.start && span.end <= error.end)
-}
-
-/// Whether a `\new`/`\context` context type holds something other than note music, so its bare block should not be read as notes.
-fn is_non_note_context(context: &str) -> bool {
-    matches!(
-        context,
-        "Lyrics"
-            | "NullVoice"
-            | "ChordNames"
-            | "FretBoards"
-            | "FiguredBass"
-            | "Dynamics"
-            | "DrumStaff"
-            | "DrumVoice"
-    )
 }
 
 #[cfg(test)]

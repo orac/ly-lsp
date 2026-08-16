@@ -2,9 +2,10 @@
 
 use super::static_command::{StaticCommand, static_command};
 use super::{
-    ArgKind, Candidate, Command, CompletionContext, Documentation, MusicContext, Param,
-    static_command::curated,
+    ArgKind, Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext,
+    Param, static_command::curated,
 };
+use crate::vocabulary::Scope;
 
 static VERSION_PARAMS: &[Param] = &[Param::required("version", ArgKind::String)];
 
@@ -32,6 +33,21 @@ impl Command for VersionCommand {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.base.documentation()
+    }
+
+    // `\version`'s base is `MusicContext::Inherit`, for which the trait's
+    // default (return `ambient` unchanged) and this forward already agree —
+    // but relying on that default is what let `\lyricsto` regress silently
+    // when its own base turned out to be `NonNote` (`super::lyricsto`).
+    // Forwarded explicitly so this wrapper can't drift the same way if
+    // `\version`'s context ever stops being `Inherit`.
+    fn music_context(
+        &self,
+        call: &CommandCall,
+        ambient: MusicContext,
+        scope: &Scope,
+    ) -> MusicContext {
+        self.base.music_context(call, ambient, scope)
     }
 
     fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {

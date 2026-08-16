@@ -3,6 +3,7 @@
 use super::{
     Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext, Param,
 };
+use crate::vocabulary::Scope;
 
 /// A command whose only job is to consume a fixed signature and, if it
 /// establishes one, set a fixed [`MusicContext`] for its body — every
@@ -43,7 +44,12 @@ impl Command for StaticCommand {
         self.params
     }
 
-    fn music_context(&self, _call: &CommandCall, ambient: MusicContext) -> MusicContext {
+    fn music_context(
+        &self,
+        _call: &CommandCall,
+        ambient: MusicContext,
+        _scope: &Scope,
+    ) -> MusicContext {
         match self.context {
             MusicContext::Inherit => ambient,
             fixed => fixed,

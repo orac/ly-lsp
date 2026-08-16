@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::command::Command;
 use crate::command::variable::Variable;
+use crate::context::{self, ContextType};
 use crate::document;
 use crate::vocabulary::Layer;
 
@@ -27,11 +28,8 @@ use crate::vocabulary::Layer;
 /// from `scm/lily/lily.scm`) pulls in, in that order — the definitions any
 /// user file can reach without including anything itself.
 ///
-/// `engraver-init.ly` is deliberately absent: it is `\context { … }` blocks
-/// inside a `\layout`, context and engraver defaults rather than commands,
-/// and the symbol query only captures top-level assignments, so parsing it
-/// would cost 50 KB for almost nothing. Everything else under `ly/` is out
-/// too; see doc/command-parsing.md for why.
+/// `engraver-init.ly` and `performer-init.ly` appear in [`CONTEXT_FILES`] instead of
+/// *this* list: they contain no top-level assignments at all, but are read for their context declarations.
 const FILES: &[&str] = &[
     "declarations-init.ly",
     "music-functions-init.ly",
@@ -52,11 +50,32 @@ const FILES: &[&str] = &[
     "context-mods-init.ly",
 ];
 
-/// The file names [`load`] reads, in the order it reads them. Exposed so a
-/// test can check every one exists in every installation the tests find,
-/// without duplicating the list.
+/// The files [`load`] reads for [`ContextType`]s rather than commands:
+/// `Staff`, `Voice`, `PianoStaff` and every other context type a score can
+/// write `\new` or `\context` against.
+///
+/// LilyPond declares every context type *twice*. `engraver-init.ly` declares
+/// it as an engraver context, `\description` and all; `performer-init.ly`
+/// declares the same name again as a performer context, with everything
+/// but the description repeated. [`load`] doesn't let the second occurrence
+/// replace the first outright — that would discard every description, since
+/// none of the performer copies carry one — it merges the two field by
+/// field; see [`merge_context_type`].
+const CONTEXT_FILES: &[&str] = &["engraver-init.ly", "performer-init.ly"];
+
+/// The file names [`load`] reads for commands, in the order it reads them.
+/// Exposed so a test can check every one exists in every installation the
+/// tests find, without duplicating the list.
 pub fn file_names() -> &'static [&'static str] {
     FILES
+}
+
+/// The file names [`load`] reads for context types, in the order it reads
+/// them. The counterpart of [`file_names`] for [`CONTEXT_FILES`], for the
+/// same reason: so a test can assert every one exists in every installation
+/// without a second copy of the list to fall out of step.
+pub fn context_file_names() -> &'static [&'static str] {
+    CONTEXT_FILES
 }
 
 /// Builds the install [`Layer`] by reading [`FILES`] out of `ly_dir`, in
@@ -82,6 +101,12 @@ pub fn file_names() -> &'static [&'static str] {
 /// [`Variable`] where it found only a name — and
 /// navigating into the install stays a "Later" item in the doc, waiting on a
 /// decorator that carries a file alongside its span.
+/// Also builds the [`ContextType`] namespace from [`CONTEXT_FILES`], merging
+/// LilyPond's engraver and performer declarations of each type into one, and
+/// binds every context type's name as a command too — a [`Variable`], since
+/// `\context { \Staff … }` relies on `\Staff` being a real reference to the
+/// `Staff` context definition, exactly as an ordinary zero-argument name
+/// would be.
 pub fn load(ly_dir: &Path) -> Layer {
     let mut commands: HashMap<String, Arc<dyn Command>> = HashMap::new();
     for file in FILES {
@@ -95,7 +120,65 @@ pub fn load(ly_dir: &Path) -> Layer {
             commands.insert(binding.name, command);
         }
     }
-    Layer::new(origin(ly_dir), commands)
+
+    let mut context_types: HashMap<String, ContextType> = HashMap::new();
+    for file in CONTEXT_FILES {
+        let Ok(text) = std::fs::read_to_string(ly_dir.join(file)) else {
+            continue;
+        };
+        let tree = document::parse(&text, None);
+        for found in context::read(&tree, &text) {
+            match context_types.remove(&found.name) {
+                Some(engraver) => {
+                    let name = found.name.clone();
+                    context_types.insert(name, merge_context_type(engraver, found));
+                }
+                None => {
+                    context_types.insert(found.name.clone(), found);
+                }
+            }
+        }
+    }
+
+    // A context type's own name is a command too: `\Staff` substitutes the
+    // `Staff` context definition, just as any other bare name does. A file's
+    // own commands win where one happens to collide, on the same "nearer
+    // binding wins" principle as everything else `insert`s into this map —
+    // though no real name has been observed to collide.
+    for name in context_types.keys() {
+        commands
+            .entry(name.clone())
+            .or_insert_with(|| Arc::new(Variable::new(name.clone())) as Arc<dyn Command>);
+    }
+
+    Layer::new(origin(ly_dir), commands).with_context_types(context_types)
+}
+
+/// Folds `performer`'s declaration of a context type into `engraver`'s,
+/// field by field, rather than letting one replace the other outright.
+///
+/// Named for which file each argument is expected to have come from, since
+/// that's what motivates the asymmetry — `engraver-init.ly` carries the
+/// `\description`, `performer-init.ly` never does — but the merge itself
+/// doesn't assume it: whichever side actually has a description wins, and
+/// aliases are the union of both, in `engraver`'s order with any new ones
+/// `performer` adds appended. The name and both spans are `engraver`'s,
+/// since only one of the two can be kept and there's no reason to prefer the
+/// second file's over the first's.
+fn merge_context_type(engraver: ContextType, performer: ContextType) -> ContextType {
+    let mut aliases = engraver.aliases;
+    for alias in performer.aliases {
+        if !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+    }
+    ContextType {
+        name: engraver.name,
+        aliases,
+        description: engraver.description.or(performer.description),
+        name_span: engraver.name_span,
+        block_span: engraver.block_span,
+    }
 }
 
 /// The version an installation is of, read from the name of its

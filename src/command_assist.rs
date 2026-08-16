@@ -72,7 +72,7 @@ pub fn signature_help(doc: &Document, position: Position) -> Option<SignatureHel
     })
 }
 
-/// What can be written at `position`, which is one of two quite different
+/// What can be written at `position`, which is one of three quite different
 /// questions depending on where the cursor is.
 ///
 /// The narrower answer comes first: at an argument position whose parameter
@@ -80,10 +80,15 @@ pub fn signature_help(doc: &Document, position: Position) -> Option<SignatureHel
 /// `\key c \|` still offers the nine modes rather than burying them in every
 /// command in the language.
 ///
-/// Failing that, a cursor inside a `\word` is naming a command, and the answer
-/// is every command the document's [`Scope`] can resolve — the user's own
-/// definitions, their LilyPond's, and the bare names from its word list — each
-/// labelled with where it came from.
+/// Failing that — including at a bare `\new`/`\context`/`\lyricsto`/`\change`
+/// with nothing typed after it, which parses too poorly for the first route
+/// to find at all — [`context_argument_completions`] tries the same
+/// parameter-0 candidates by reading the keyword straight out of the text.
+///
+/// Failing that too, a cursor inside a `\word` is naming a command, and the
+/// answer is every command the document's [`Scope`] can resolve — the user's
+/// own definitions, their LilyPond's, and the bare names from its word list —
+/// each labelled with where it came from.
 ///
 /// Everywhere else, nothing: an open-ended parameter (a pitch, a music block,
 /// most strings) is better left alone than guessed at.
@@ -100,10 +105,82 @@ pub fn completions(
     let Some(offset) = doc.line_index().offset_at(position) else {
         return Vec::new();
     };
+
+    let unparsed = context_argument_completions(doc, offset, ctx);
+    if !unparsed.is_empty() {
+        return unparsed;
+    }
+
     match word_being_typed(doc.text(), offset) {
         Some(typed) => command_names(doc.scope(), doc.line_index().range_of(typed)),
         None => Vec::new(),
     }
+}
+
+/// The fallback [`argument_completions`] can't reach: a bare `\new` or
+/// `\context` with nothing typed after it yet.
+///
+/// `dump_tree` on `\new ` shows why — tree-sitter's error recovery leaves it
+/// wrapped in an `ERROR` node rather than the `named_context` shape
+/// [`Commands::call_site_at`](crate::command::Commands::call_site_at) needs,
+/// and `note_analyser::Analyser::walk` never descends into an `ERROR` node at
+/// all (it only recurses into `expression_block`/`parallel_music`), so no
+/// [`CommandCall`](crate::command::CommandCall) is ever built for this
+/// position — `call_at` finds nothing, exactly the situation
+/// [`word_being_typed`]'s own doc describes for a half-typed `\word`, except
+/// here there is no partial word for that scan to find either, since a
+/// context type carries no backslash. `\context` on its own doesn't hit this
+/// hole — LilyPond's grammar recovers it as a plain `escaped_word`, which
+/// `argument_completions` already handles — nor do `\lyricsto`/`\change`,
+/// checked the same way with `dump_tree`. All four are still read for here,
+/// small as the extra cost is, as a guard against a future grammar change
+/// moving the hole: whichever of them precedes the cursor, with nothing but
+/// whitespace in between, resolves the same [`Command`] the tree path would
+/// have found, and asks it for parameter 0's candidates exactly as
+/// [`argument_completions`] does — so a context type's or instance's
+/// candidates and documentation come from one place, not two.
+fn context_argument_completions(
+    doc: &Document,
+    offset: usize,
+    ctx: &CompletionContext,
+) -> Vec<CompletionItem> {
+    let Some(keyword) = keyword_awaiting_its_first_argument(doc.text(), offset) else {
+        return Vec::new();
+    };
+    let Some(known) = doc.scope().get(keyword) else {
+        return Vec::new();
+    };
+    let Some(param) = known.value.signature().first() else {
+        return Vec::new();
+    };
+    known
+        .value
+        .completions(0, ctx)
+        .iter()
+        .map(|candidate| completion_item(param, candidate))
+        .collect()
+}
+
+/// The name (without its backslash) of `\new`, `\context`, `\lyricsto` or
+/// `\change` immediately before `offset`, with nothing but whitespace between
+/// the keyword and the cursor — see [`context_argument_completions`] for why
+/// these four are checked here at all.
+fn keyword_awaiting_its_first_argument(src: &str, offset: usize) -> Option<&'static str> {
+    const KEYWORDS: &[&str] = &["\\new", "\\context", "\\lyricsto", "\\change"];
+    let before = src
+        .get(..offset)?
+        .trim_end_matches(|c: char| c.is_ascii_whitespace());
+    KEYWORDS.iter().find_map(|&keyword| {
+        let rest = before.strip_suffix(keyword)?;
+        // A real word boundary before the backslash — `\newer` mustn't match
+        // `\new` — the same care `word_being_typed` takes reading the other
+        // direction.
+        let boundary = rest
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '\\'));
+        boundary.then_some(&keyword[1..])
+    })
 }
 
 /// The values the command at `position` accepts at the argument the cursor is
@@ -168,13 +245,13 @@ fn command_names(scope: &Scope, range: Range) -> Vec<CompletionItem> {
                 // A LilyPond command is a binding like any other: one that
                 // takes arguments is a music function, one that doesn't is a
                 // variable holding music.
-                kind: Some(if known.command.signature().is_empty() {
+                kind: Some(if known.value.signature().is_empty() {
                     CompletionItemKind::VARIABLE
                 } else {
                     CompletionItemKind::FUNCTION
                 }),
                 detail: Some(known.layer.origin().to_string()),
-                documentation: describe(known.command.as_ref()).map(|value| {
+                documentation: describe(known.value.as_ref()).map(|value| {
                     Documentation::MarkupContent(MarkupContent {
                         kind: MarkupKind::Markdown,
                         value,
@@ -253,7 +330,11 @@ fn parameter_information(param: &Param) -> ParameterInformation {
 fn completion_item(param: &Param, candidate: &Candidate) -> CompletionItem {
     let text = match param.kind {
         ArgKind::Word => format!("\\{}", candidate.label),
-        ArgKind::String => format!("\"{}\"", candidate.label),
+        // A context instance name is quoted on insertion even though a bare
+        // symbol parses identically (`\new Voice = vocals` is as valid as
+        // `\new Voice = "vocals"`) — see the rationale on `ArgKind::ContextName`
+        // itself for why quoted is the one to write.
+        ArgKind::String | ArgKind::ContextName => format!("\"{}\"", candidate.label),
         _ => candidate.label.to_string(),
     };
     CompletionItem {
@@ -319,9 +400,13 @@ mod tests {
     /// A workspace with no installation behind it, which is what every test
     /// here but [`the_version_argument_completes_to_the_installed_version`]
     /// wants: it makes no difference to any completion but `\version`'s.
-    fn no_install() -> CompletionContext<'static> {
+    /// Takes `doc` because [`CompletionContext::scope`] must be the scope the
+    /// completion is actually being asked about — [`Document::scope`] is
+    /// `pub(crate)`, so this reaches it exactly as `document_graph.rs` does.
+    fn no_install(doc: &Document) -> CompletionContext<'_> {
         CompletionContext {
             lilypond_version: None,
+            scope: doc.scope(),
         }
     }
 
@@ -337,7 +422,7 @@ mod tests {
     fn completions_offers_repeat_kinds() {
         let (doc, pos) = doc_at("\\repeat |");
         assert_eq!(
-            labels_at(&doc, pos, &no_install()),
+            labels_at(&doc, pos, &no_install(&doc)),
             vec!["volta", "unfold", "percent", "tremolo", "segno"]
         );
     }
@@ -345,7 +430,7 @@ mod tests {
     #[test]
     fn completions_prefixes_a_backslash_for_word_arguments() {
         let (doc, pos) = doc_at("\\key c |");
-        let labels = labels_at(&doc, pos, &no_install());
+        let labels = labels_at(&doc, pos, &no_install(&doc));
         assert!(labels.iter().any(|label| label == "\\major"));
         assert!(labels.iter().any(|label| label == "\\minor"));
     }
@@ -356,7 +441,7 @@ mod tests {
         // principle — but this one can only be a mode, and every command in
         // the language would bury the nine that fit.
         let (doc, pos) = doc_at("\\key c \\m|");
-        let labels = labels_at(&doc, pos, &no_install());
+        let labels = labels_at(&doc, pos, &no_install(&doc));
         assert!(labels.iter().any(|label| label == "\\major"));
         assert!(!labels.iter().any(|label| label == "\\relative"));
     }
@@ -365,13 +450,13 @@ mod tests {
     fn completions_empty_for_an_open_ended_parameter() {
         // `\repeat`'s `count` (index 1) has no closed set of values.
         let (doc, pos) = doc_at("\\repeat volta 2|");
-        assert!(completions(&doc, pos, &no_install()).is_empty());
+        assert!(completions(&doc, pos, &no_install(&doc)).is_empty());
     }
 
     #[test]
     fn completions_empty_outside_a_call() {
         let (doc, pos) = doc_at("c d |e");
-        assert!(completions(&doc, pos, &no_install()).is_empty());
+        assert!(completions(&doc, pos, &no_install(&doc)).is_empty());
     }
 
     #[test]
@@ -380,7 +465,7 @@ mod tests {
         // signature from: the whole vocabulary is the answer, and the client
         // narrows it to what has been typed.
         let (doc, pos) = doc_at("{ \\rela| }");
-        let labels = labels_at(&doc, pos, &no_install());
+        let labels = labels_at(&doc, pos, &no_install(&doc));
         assert!(labels.iter().any(|label| label == "\\relative"));
         assert!(labels.iter().any(|label| label == "\\repeat"));
     }
@@ -389,7 +474,11 @@ mod tests {
     fn a_name_completion_says_where_the_command_came_from() {
         let (text, offset) = cursor("foo = { c }\n{ \\f| }\n");
         let doc = Document::named("song.ly", text);
-        let items = completions(&doc, doc.line_index().position_at(offset), &no_install());
+        let items = completions(
+            &doc,
+            doc.line_index().position_at(offset),
+            &no_install(&doc),
+        );
         let own = items.iter().find(|item| item.label == "\\foo").unwrap();
         assert_eq!(own.detail.as_deref(), Some("song.ly"));
         let built_in = items
@@ -404,7 +493,7 @@ mod tests {
         // On pain of `\\relative`: the range must reach back over the `\`,
         // which the editor's own idea of a word may well not include.
         let (doc, pos) = doc_at("{ \\rela| }");
-        let items = completions(&doc, pos, &no_install());
+        let items = completions(&doc, pos, &no_install(&doc));
         let item = items
             .iter()
             .find(|item| item.label == "\\relative")
@@ -424,6 +513,7 @@ mod tests {
         let (doc, pos) = doc_at("\\ver|sion \"2.24.3\"\n");
         let ctx = CompletionContext {
             lilypond_version: Some("2.24.3"),
+            scope: doc.scope(),
         };
         let labels = labels_at(&doc, pos, &ctx);
         assert!(labels.iter().any(|label| label == "\\version"));
@@ -435,6 +525,7 @@ mod tests {
         let (doc, pos) = doc_at("\\version |");
         let ctx = CompletionContext {
             lilypond_version: Some("2.24.3"),
+            scope: doc.scope(),
         };
         assert_eq!(labels_at(&doc, pos, &ctx), vec!["\"2.24.3\""]);
     }
@@ -442,7 +533,7 @@ mod tests {
     #[test]
     fn the_version_argument_offers_nothing_without_an_installation() {
         let (doc, pos) = doc_at("\\version |");
-        assert!(completions(&doc, pos, &no_install()).is_empty());
+        assert!(completions(&doc, pos, &no_install(&doc)).is_empty());
     }
 
     #[test]
@@ -526,5 +617,122 @@ mod tests {
     fn hover_none_outside_a_call() {
         let (doc, pos) = doc_at("c d |e");
         assert!(hover(&doc, pos).is_none());
+    }
+
+    /// A document that declares its own context type, the way a
+    /// `\layout { \context { … } }` block would — enough to exercise
+    /// `Scope::visible_context_types` without needing a real installation
+    /// behind it (`TESTING.md`: only the installation-*dependent* cases need
+    /// one, and which context types exist and what they're named isn't one of
+    /// those here).
+    fn doc_with_a_declared_context(src: &str) -> (Document, Position) {
+        doc_at(&format!(
+            "\\layout {{ \\context {{ \\name MyStaff \\description \"Custom staff.\" }} }}\n{src}"
+        ))
+    }
+
+    #[test]
+    fn new_with_nothing_typed_offers_the_documents_own_context_types() {
+        // The dead spot `dump_tree` found: tree-sitter wraps a bare `\new`
+        // with nothing after it in an `ERROR` node, so `argument_completions`
+        // has no parsed call to work from at all — this is
+        // `context_argument_completions`'s one job.
+        let (doc, pos) = doc_with_a_declared_context("{ \\new |}");
+        let items = completions(&doc, pos, &no_install(&doc));
+        let my_staff = items
+            .iter()
+            .find(|item| item.label == "MyStaff")
+            .expect("MyStaff should be offered");
+        assert_eq!(my_staff.detail.as_deref(), Some("Custom staff."));
+    }
+
+    #[test]
+    fn new_with_a_type_prefix_still_offers_matching_context_types() {
+        // Once even one character of the type is typed, tree-sitter recovers
+        // a real `named_context` node, so this goes through
+        // `argument_completions` — the ordinary tree-based path — rather than
+        // the text-level fallback the previous test exercises.
+        let (doc, pos) = doc_with_a_declared_context("{ \\new MyS| }");
+        let items = completions(&doc, pos, &no_install(&doc));
+        assert!(items.iter().any(|item| item.label == "MyStaff"));
+    }
+
+    #[test]
+    fn context_declares_no_type_offers_no_completions_deep_in_a_body() {
+        // Between two notes, with no argument position to complete — the
+        // same "nowhere to complete" case `completions_empty_outside_a_call`
+        // covers for an ordinary call, checked here for `\new`'s body too.
+        let (doc, pos) = doc_with_a_declared_context("{ \\new Staff { c |d } }");
+        assert!(completions(&doc, pos, &no_install(&doc)).is_empty());
+    }
+
+    #[test]
+    fn internal_context_types_are_excluded_from_the_offer_but_still_known() {
+        // `InternalGregorianStaff`/`InternalMensuralStaff` are real LilyPond
+        // context types (see `is_internal_context_type`'s doc for how that
+        // was checked against installed shares) that no score writes
+        // `\new`/`\context` against directly. A document can declare one
+        // itself — the shape of the exclusion doesn't depend on where the
+        // type came from — which is what lets this run without an
+        // installation.
+        let (doc, pos) = doc_at("\\layout { \\context { \\name InternalFoo } }\n{ \\new |}");
+        let items = completions(&doc, pos, &no_install(&doc));
+        assert!(
+            !items.iter().any(|item| item.label == "InternalFoo"),
+            "an Internal* type must not be offered: {items:?}"
+        );
+        assert!(
+            doc.scope().get_context_type("InternalFoo").is_some(),
+            "an Internal* type must still be known, on pain of a false undefined-reference"
+        );
+    }
+
+    #[test]
+    fn lyricsto_with_nothing_typed_offers_context_instance_names() {
+        let (doc, pos) = doc_at("{ \\new Voice = \"vocals\" { c } \\lyricsto |{ la } }");
+        let items = completions(&doc, pos, &no_install(&doc));
+        let vocals = items
+            .iter()
+            .find(|item| item.label == "\"vocals\"")
+            .expect("vocals should be offered, quoted");
+        assert_eq!(
+            vocals.detail.as_deref(),
+            Some("Voice"),
+            "the instance's documentation names the type it was created as"
+        );
+    }
+
+    #[test]
+    fn news_name_position_offers_context_instance_names_too() {
+        // `= "name"` is the same context-instance namespace `\lyricsto`
+        // reads, reached through the ordinary tree path (the flattened
+        // `named_context` shape `command::parse` documents) rather than the
+        // text-level fallback.
+        let (doc, pos) = doc_at("{ \\new Voice = \"vocals\" { c } } { \\new Staff = \"|\" }");
+        let items = completions(&doc, pos, &no_install(&doc));
+        assert!(items.iter().any(|item| item.label == "\"vocals\""));
+    }
+
+    #[test]
+    fn change_offers_context_types_not_instance_names_at_its_first_argument() {
+        // `\change type = name`: index 0 is a context type, unlike
+        // `\lyricsto`'s and `\new`'s `= "name"`, which name an instance.
+        let (doc, pos) = doc_with_a_declared_context("{ \\change |}");
+        let items = completions(&doc, pos, &no_install(&doc));
+        assert!(items.iter().any(|item| item.label == "MyStaff"));
+    }
+
+    #[test]
+    fn an_unrelated_bare_reserved_word_is_unaffected_by_the_context_fallback() {
+        // `keyword_awaiting_its_first_argument` only recognises
+        // `\new`/`\context`/`\lyricsto`/`\change`; a bare `\repeat` must keep
+        // going through the ordinary route rather than being swallowed by
+        // the new fallback.
+        let (doc, pos) = doc_at("\\repeat |");
+        let labels = labels_at(&doc, pos, &no_install(&doc));
+        assert_eq!(
+            labels,
+            vec!["volta", "unfold", "percent", "tremolo", "segno"]
+        );
     }
 }

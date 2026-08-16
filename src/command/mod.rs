@@ -18,9 +18,15 @@
 //! (`\clef`, `\key`, `\relative`, …), which a file *can* shadow. Most of
 //! both are plain rows of [`RESERVED_ROWS`] and [`CURATED_ROWS`], built as a
 //! [`StaticCommand`](static_command::StaticCommand); the handful with
-//! genuinely irregular behaviour — [`relative`], [`fixed`], [`tempo`] and
-//! [`repeat`] — each get their own file here, wrapping a `StaticCommand` and
-//! overriding the one method that makes them bespoke.
+//! genuinely irregular behaviour — [`relative`], [`fixed`], [`tempo`],
+//! [`repeat`], [`new_context`] (serving both `\new` and `\context`, whose
+//! body's [`MusicContext`] depends on the context type named in the call,
+//! not on a fixed row), [`change`] (whose context type sometimes, but not
+//! always, arrives wrapped in an `assignment_lhs` node) and [`lyricsto`]
+//! (whose voice-name parameter, like `new_context`'s and `change`'s context
+//! name, is completed by looking the document's [`Scope`] up rather than
+//! from a fixed table) — each get their own file here, wrapping a
+//! `StaticCommand` and overriding the one method that makes them bespoke.
 //! The other layer built so far is the user's own files. [`definition`] builds
 //! one [`Layer`] per file out of everything it binds — a definition being a
 //! command that takes no arguments unless something says otherwise — and the
@@ -30,8 +36,11 @@
 //! [`doc/command-parsing.md`](../../doc/command-parsing.md) for the fuller
 //! design, including the `install` layer still to come.
 
+mod change;
 pub mod definition;
 mod fixed;
+mod lyricsto;
+mod new_context;
 mod relative;
 mod repeat;
 pub mod scheme;
@@ -116,10 +125,19 @@ pub trait Command: Send + Sync {
     /// Takes the parsed call because the answer often depends on an argument:
     /// `\relative c'` reads its own reference pitch out of `call` and returns
     /// `MusicContext::Relative(pitch)`. Takes `ambient` because some contexts
-    /// inherit rather than replace it. The default, returning `ambient`
-    /// unchanged, is right for the overwhelming majority of commands, which
-    /// neither establish nor block a music context of their own.
-    fn music_context(&self, _call: &CommandCall, ambient: MusicContext) -> MusicContext {
+    /// inherit rather than replace it. Takes `scope` because deciding whether
+    /// a `\new`/`\context` body is note music depends on the named context
+    /// type's declaration — its aliases in particular — which lives in the
+    /// document's [`Scope`], not in anything the call itself carries. The
+    /// default, returning `ambient` unchanged and ignoring `scope`, is right
+    /// for the overwhelming majority of commands, which neither establish nor
+    /// block a music context of their own.
+    fn music_context(
+        &self,
+        _call: &CommandCall,
+        ambient: MusicContext,
+        _scope: &Scope,
+    ) -> MusicContext {
         ambient
     }
 
@@ -273,6 +291,30 @@ pub enum ArgKind {
     /// signature help can still show it. Consumes exactly one node, which is
     /// right often enough to beat refusing the whole signature.
     Unknown(Cow<'static, str>),
+    /// The context type named by `\new`/`\context` — `Staff` in `\new Staff`.
+    /// A `symbol`, same shape as [`BareWord`](ArgKind::BareWord), but kept as
+    /// its own kind because it names a different namespace (context types,
+    /// not commands): go-to-definition and semantic highlighting need to
+    /// treat it differently from an ordinary bare word, which
+    /// [`Arg::ContextType`] carries the name and span for.
+    ContextType,
+    /// A context *instance* name — `"vocals"` in `\new Voice = "vocals"`,
+    /// `\lyricsto "vocals"` or `\change Staff = "vocals"`. A quoted `string`
+    /// or a bare `symbol`, the same two shapes [`String`](ArgKind::String)
+    /// accepts, but kept as its own kind for the same reason
+    /// [`ContextType`](ArgKind::ContextType) is kept apart from
+    /// [`BareWord`](ArgKind::BareWord): it names the context-instance
+    /// namespace ([`ContextInstance`](crate::context::ContextInstance)),
+    /// which go-to-definition and semantic highlighting need to resolve
+    /// differently from an arbitrary string.
+    ///
+    /// Completion inserts a quoted value (`command_assist::completion_item`
+    /// treats this the same as [`String`](ArgKind::String)) even though a
+    /// bare symbol parses identically — every real example in LilyPond's own
+    /// manual quotes an instance name, and quoting is what tells a reader at
+    /// a glance that the word names an instance rather than a context type
+    /// (`Staff`, unquoted) or an ordinary bare word.
+    ContextName,
 }
 
 /// How music inside a command's body is to be read. Mirrors the analyser's
@@ -341,6 +383,33 @@ impl<'a> ArgReader<'a> {
     /// before they leap.
     pub fn peek(&self) -> Option<Node<'a>> {
         self.children.get(self.next).copied()
+    }
+
+    /// The source text of the next unconsumed node, for overrides that need
+    /// to recognise a fixed keyword before deciding how to consume it —
+    /// [`new_context`](super::new_context) checking whether an optional
+    /// `\with { … }` block follows a context type, the one case so far that
+    /// needs to look at more than a node's kind.
+    pub fn peek_text(&self) -> Option<&'a str> {
+        self.peek()
+            .map(|node| &self.src[node.start_byte()..node.end_byte()])
+    }
+
+    /// Consumes the next node whatever its kind, returning its span, or
+    /// `None` at the end of the stream. For a bespoke
+    /// [`parse_args`](Command::parse_args) that needs to step over a node
+    /// without asking [`ArgKind`]'s shape rules to make sense of it —
+    /// [`new_context`](super::new_context) uses this for the `\with`
+    /// keyword and its block, which must be consumed but must *not* become
+    /// an [`Arg::Music`] (the note analyser would then misread the `\with`
+    /// block's property settings as notes) or an [`Arg::Unknown`] read
+    /// through the ordinary [`ArgKind::Unknown`] path (which declines
+    /// music-shaped nodes on purpose — see the comment in
+    /// [`consume_arg`]).
+    pub fn skip_one(&mut self) -> Option<Span> {
+        let node = *self.children.get(self.next)?;
+        self.next += 1;
+        Some(node_span(node))
     }
 
     /// The index of the first unconsumed sibling — what [`parse`] returns to
@@ -465,6 +534,81 @@ impl Candidate {
     }
 }
 
+/// Whether `name` is one of LilyPond's `Internal*` context types —
+/// `InternalGregorianStaff` since 2.24, joined by `InternalMensuralStaff` in
+/// 2.26 (checked against real installs of both: `grep '\\name Internal'
+/// engraver-init.ly`). Each exists only as an intermediate base the real
+/// Gregorian/Mensural notation context types inherit from — `VaticanaStaff`,
+/// `MensuralStaff` and their kin `\InternalGregorianStaff`/
+/// `\InternalMensuralStaff` themselves rather than being written by a score —
+/// so no real `\new`/`\context` ever names one directly. Every match so far
+/// is `Internal`-prefixed, so a plain prefix test stands in for a
+/// hand-maintained name list a future LilyPond release could silently add
+/// to.
+///
+/// Used only to decide what completion *offers* — see
+/// [`context_type_candidates`]. [`Scope::get_context_type`] and
+/// [`Scope::is_known`] still resolve these names, so a user's own context
+/// type that inherits from one (as `VaticanaStaff` does) is never flagged as
+/// referencing something undefined.
+fn is_internal_context_type(name: &str) -> bool {
+    name.starts_with("Internal")
+}
+
+/// Every context type `scope` can see, worth offering after `\new`/`\context`
+/// — [`Scope::visible_context_types`], filtered to leave out
+/// [`is_internal_context_type`] names, and rendered as a [`Candidate`]:
+/// the type's own name, documented with its `\description` where it has one
+/// (already converted from Texinfo to Markdown by
+/// [`context::read`](crate::context::read)) or nothing where it doesn't — a
+/// user's own `\context { \name MyStaff }` need carry no `\description` to be
+/// offered.
+///
+/// Shared by [`new_context`] and [`change`], the two commands whose first
+/// parameter names a context type.
+fn context_type_candidates(scope: &Scope) -> Vec<Candidate> {
+    scope
+        .visible_context_types()
+        .into_iter()
+        .filter(|(name, _)| !is_internal_context_type(name))
+        .map(|(name, known)| Candidate {
+            label: Cow::Owned(name.to_string()),
+            documentation: known
+                .value
+                .description
+                .clone()
+                .map(Cow::Owned)
+                .unwrap_or(Cow::Borrowed("")),
+        })
+        .collect()
+}
+
+/// Every context instance name `scope` can see, worth offering at `\change`,
+/// `\lyricsto` and `\new`/`\context`'s `= "name"` position —
+/// [`Scope::visible_context_instances`], rendered as a [`Candidate`]: the
+/// instance's own name, documented with the context type it was created as
+/// where [`ContextInstance::type_name`](crate::context::ContextInstance::type_name)
+/// recorded one (`None` for a half-typed `\new = "vocals"` with no type
+/// written yet).
+///
+/// Shared by [`new_context`], [`change`] and [`lyricsto`], the three commands
+/// with a parameter in this namespace.
+fn context_instance_candidates(scope: &Scope) -> Vec<Candidate> {
+    scope
+        .visible_context_instances()
+        .into_iter()
+        .map(|(name, known)| Candidate {
+            label: Cow::Owned(name.to_string()),
+            documentation: known
+                .value
+                .type_name
+                .clone()
+                .map(Cow::Owned)
+                .unwrap_or(Cow::Borrowed("")),
+        })
+        .collect()
+}
+
 /// What a [`Command`] may consult when asked for completions: the knowledge
 /// that belongs to the workspace rather than to the command.
 ///
@@ -476,6 +620,16 @@ pub struct CompletionContext<'a> {
     /// (`2.24.3`), or `None` when the client named none — see
     /// [`install::version`](crate::install::version).
     pub lilypond_version: Option<&'a str>,
+    /// The document's own [`Scope`] — what [`new_context`] and [`change`]
+    /// read [`visible_context_types`](Scope::visible_context_types) and
+    /// [`visible_context_instances`](Scope::visible_context_instances) from
+    /// to compute their candidates, and what
+    /// [`command_assist`](crate::command_assist)'s text-level fallback
+    /// (for a `\new`/`\context` with nothing typed after it yet — see the
+    /// module doc there) looks a bare keyword up in. The caller must pass
+    /// the *same* document's scope this context is being built for: nothing
+    /// here checks that they match.
+    pub scope: &'a Scope,
 }
 
 /// What a command may consult while checking a call, and the means to report
@@ -641,6 +795,19 @@ pub enum Arg {
     Unknown {
         span: Span,
     },
+    /// An [`ArgKind::ContextType`] argument: the context type name a
+    /// `\new`/`\context` names, e.g. `Staff`.
+    ContextType {
+        span: Span,
+        name: String,
+    },
+    /// An [`ArgKind::ContextName`] argument: the context instance name a
+    /// `\new`/`\context` names, or that `\lyricsto`/`\change` refers to, e.g.
+    /// `vocals`.
+    ContextName {
+        span: Span,
+        name: String,
+    },
 }
 
 impl Arg {
@@ -654,20 +821,34 @@ impl Arg {
             | Arg::Word { span, .. }
             | Arg::String { span, .. }
             | Arg::PropertyPath { span, .. }
-            | Arg::Unknown { span } => *span,
+            | Arg::Unknown { span }
+            | Arg::ContextType { span, .. }
+            | Arg::ContextName { span, .. } => *span,
         }
     }
 }
 
-/// Parses the command at `children[start]` (an `escaped_word`) against the
-/// [`Command`] impl `scope` resolves it to, if it resolves to one, consuming
-/// as many of its arguments as are present. `language` is the note-name
-/// language active at this point in the source, needed to resolve a
-/// [`Pitch`](ArgKind::Pitch) argument the same way an ordinary note is
-/// resolved.
+/// Parses the command at `children[start]` against the [`Command`] impl
+/// `scope` resolves it to, if it resolves to one, consuming as many of its
+/// arguments as are present. `language` is the note-name language active at
+/// this point in the source, needed to resolve a [`Pitch`](ArgKind::Pitch)
+/// argument the same way an ordinary note is resolved.
+///
+/// `children[start]` is usually a bare `escaped_word` sibling (`\repeat`,
+/// `\clef`, …), but `\new`/`\context` is different: the grammar folds the
+/// keyword *and* its context type into one `named_context` node (`\new
+/// Staff`, or `\new Staff = "upper"`), while the music argument — and an
+/// optional `\with { … }` block — stay ordinary siblings *after* it, not
+/// children of it. So a `named_context` is unwrapped here: its own children
+/// (the type, and the optional `= "name"`) are read first, then the reader
+/// carries on into the siblings following `children[start]`, as if the two
+/// runs were one flat stream. [`new_context::NewContextCommand`] then sees
+/// exactly the shape [`default_parse`] expects everywhere else.
 ///
 /// Returns the structured call and the index of the first node after the
-/// arguments consumed. `None` when the word names no command `scope` has a
+/// arguments consumed — into the *original* `children`, regardless of which
+/// shape was matched, so the caller (`note_analyser`'s walk) never needs to
+/// know the difference. `None` when the word names no command `scope` has a
 /// signature for, leaving the caller to handle it as it did before (in
 /// `note_analyser`, that means the following block is read as an ordinary bare
 /// block).
@@ -678,16 +859,74 @@ pub fn parse(
     language: Language,
     scope: &Scope,
 ) -> Option<(CommandCall, usize)> {
-    let keyword_node = *children.get(start)?;
+    let node = *children.get(start)?;
+    match node.kind() {
+        "escaped_word" => parse_call(node, children, start + 1, src, language, scope, |pos| pos),
+        "named_context" => {
+            let mut cursor = node.walk();
+            let inner: Vec<Node> = node.children(&mut cursor).collect();
+            let keyword_node = *inner.first()?;
+            let inner_rest = &inner[1..];
+            let inner_len = inner_rest.len();
+            let flattened: Vec<Node> = inner_rest
+                .iter()
+                .copied()
+                .chain(children[start + 1..].iter().copied())
+                .collect();
+            // A position inside the flattened stream at or before `inner_len`
+            // never advanced past the `named_context` node's own children, so
+            // — from the outer walk's point of view, which sees the whole
+            // `named_context` as a single node at `start` — the next node to
+            // read is always `start + 1`, however much or little of the type
+            // and its `= "name"` was actually consumed. Only a position past
+            // `inner_len` has stepped into the real siblings (the `\with`
+            // block, the music), which map back by subtracting the same
+            // offset that was added to reach them.
+            parse_call(
+                keyword_node,
+                &flattened,
+                0,
+                src,
+                language,
+                scope,
+                move |pos| {
+                    if pos <= inner_len {
+                        start + 1
+                    } else {
+                        start + 1 + (pos - inner_len)
+                    }
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The shared second half of [`parse`]: resolves `keyword_node` in `scope`,
+/// builds an [`ArgReader`] over `children` starting at `start`, and parses
+/// its arguments. `map_next` translates the reader's final position — an
+/// index into `children` — back into an index into whatever `children` the
+/// caller actually owns, which for the plain `escaped_word` case is the
+/// identity function and for `named_context` is the arithmetic [`parse`]
+/// documents above.
+fn parse_call(
+    keyword_node: Node,
+    children: &[Node],
+    start: usize,
+    src: &str,
+    language: Language,
+    scope: &Scope,
+    map_next: impl Fn(usize) -> usize,
+) -> Option<(CommandCall, usize)> {
     if keyword_node.kind() != "escaped_word" {
         return None;
     }
     let name = src[keyword_node.start_byte()..keyword_node.end_byte()].strip_prefix('\\')?;
     let known = scope.get(name)?;
-    let (cmd, origin) = (Arc::clone(known.command), Arc::clone(known.layer.origin()));
+    let (cmd, origin) = (Arc::clone(known.value), Arc::clone(known.layer.origin()));
 
     let keyword = node_span(keyword_node);
-    let mut reader = ArgReader::new(children, start + 1, src, language);
+    let mut reader = ArgReader::new(children, start, src, language);
     let args = cmd.parse_args(&mut reader);
     let end = args.last().map_or(keyword.end, |arg| arg.span().end);
     Some((
@@ -699,7 +938,7 @@ pub fn parse(
             cmd,
             origin,
         },
-        reader.position(),
+        map_next(reader.position()),
     ))
 }
 
@@ -720,6 +959,11 @@ fn consume_arg(
             let span = node_span(node);
             let text = src[span.start..span.end].to_string();
             Some((Arg::BareWord { span, text }, i + 1))
+        }
+        ArgKind::ContextType if node.kind() == "symbol" => {
+            let span = node_span(node);
+            let name = src[span.start..span.end].to_string();
+            Some((Arg::ContextType { span, name }, i + 1))
         }
         ArgKind::Count if node.kind() == "unsigned_integer" => {
             let span = node_span(node);
@@ -744,6 +988,7 @@ fn consume_arg(
             Some((Arg::Word { span, text }, i + 1))
         }
         ArgKind::String => consume_string(children, i, src),
+        ArgKind::ContextName => consume_context_name(children, i, src),
         ArgKind::PropertyPath => consume_property_path(children, i, src),
         // `Unknown` must never claim a node `ArgKind::Music` would also claim.
         // It has no shape check of its own — that's the whole point of it —
@@ -924,6 +1169,29 @@ fn consume_string(children: &[Node], start: usize, src: &str) -> Option<(Arg, us
     }
 }
 
+/// Consumes a context instance name: a quoted string or a bare symbol
+/// standing in for one (`\new Voice = "vocals"`, `\new Voice = vocals`,
+/// `\lyricsto vocals`), exactly the two shapes [`consume_string`] reads for
+/// [`ArgKind::String`] — but producing [`Arg::ContextName`], since the value
+/// names the context-instance namespace rather than an arbitrary string.
+/// `None` if the node is neither.
+fn consume_context_name(children: &[Node], start: usize, src: &str) -> Option<(Arg, usize)> {
+    let node = *children.get(start)?;
+    match node.kind() {
+        "string" => {
+            let span = node_span(node);
+            let name = string_fragment(node, src).unwrap_or_default().to_string();
+            Some((Arg::ContextName { span, name }, start + 1))
+        }
+        "symbol" => {
+            let span = node_span(node);
+            let name = src[span.start..span.end].to_string();
+            Some((Arg::ContextName { span, name }, start + 1))
+        }
+        _ => None,
+    }
+}
+
 /// The text inside a `string` node's quotes, if it has a `string_fragment`.
 fn string_fragment<'a>(string_node: Node, src: &'a str) -> Option<&'a str> {
     let mut cursor = string_node.walk();
@@ -1003,10 +1271,6 @@ pub(crate) fn clamp_octave(octave: i32) -> i8 {
 }
 
 static MUSIC_ONLY_PARAMS: &[Param] = &[Param::required("music", ArgKind::Music)];
-static VOICE_AND_MUSIC_PARAMS: &[Param] = &[
-    Param::optional("voice", ArgKind::String),
-    Param::required("music", ArgKind::Music),
-];
 static CLEF_PARAMS: &[Param] = &[Param::required("name", ArgKind::String)];
 static PROPERTY_PARAMS: &[Param] = &[Param::required("property", ArgKind::PropertyPath)];
 static LANGUAGE_PARAMS: &[Param] = &[Param::required("language", ArgKind::String)];
@@ -1077,6 +1341,15 @@ const CLEF_DOC: &str =
 const KEY_DOC: &str = "Sets the key signature to `tonic` in `mode` (e.g. `\\major`)";
 const TRANSPOSE_DOC: &str = "Transposes `music` so that the pitch written as `from` sounds as \
      `to`, shifting every pitch in `music` by the same interval.";
+const NEW_DOC: &str = "Creates a fresh `type` context and interprets `music` in it, even if a \
+     context of the same type and name already exists. The optional `name` identifies this \
+     instance, for `\\lyricsto`, `\\change` and a later `\\context` to refer back to. May be \
+     followed by a `\\with { … }` block.";
+const CONTEXT_DOC: &str = "Finds the existing `type` context, optionally the one called `name`, \
+     in the enclosing music and interprets `music` in it, creating one only if none is found — unlike `\\new`, \
+     which always creates a fresh context. May be followed by a `\\with { … }` block. Inside a \
+     `\\layout` block, `\\context { … }` instead defines or modifies a context type rather than \
+     instantiating one.";
 
 /// One row of [`RESERVED_ROWS`] or [`CURATED_ROWS`]: a [`StaticCommand`](static_command::StaticCommand)'s
 /// data, keyed by one or more names, params, [`MusicContext`], curated doc (if
@@ -1122,7 +1395,6 @@ static RESERVED_ROWS: &[Row] = {
         Row(&["figuremode", "figures"], MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["lyricmode", "lyrics"],   MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["addlyrics"],             MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["lyricsto"],              VOICE_AND_MUSIC_PARAMS,  NonNote,  None,                  &[]),
         Row(&["markup"],                MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["markuplist"],            MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["header"],                MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
@@ -1203,6 +1475,13 @@ pub static RESERVED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
             ("repeat", Arc::new(repeat::command()) as Arc<dyn Command>),
             ("tempo", Arc::new(tempo::command())),
             ("version", Arc::new(version::command())),
+            ("new", Arc::new(new_context::command("new", NEW_DOC))),
+            (
+                "context",
+                Arc::new(new_context::command("context", CONTEXT_DOC)),
+            ),
+            ("change", Arc::new(change::command())),
+            ("lyricsto", Arc::new(lyricsto::command())),
         ],
     ))
 });
@@ -1363,13 +1642,17 @@ mod tests {
     }
 
     /// Parses the first command at the top level of `src`, in the default
-    /// (Dutch) note-name language.
+    /// (Dutch) note-name language. The command may be a bare `escaped_word`
+    /// or a `named_context` (`\new`/`\context`) — both are `children[start]`
+    /// shapes [`parse`] understands.
     fn call(src: &str) -> Option<CommandCall> {
         let tree = tree(src);
         let root = tree.root_node();
         let mut cursor = root.walk();
         let children: Vec<Node> = root.children(&mut cursor).collect();
-        let start = children.iter().position(|n| n.kind() == "escaped_word")?;
+        let start = children
+            .iter()
+            .position(|n| matches!(n.kind(), "escaped_word" | "named_context"))?;
         parse(
             &children,
             start,
@@ -1378,6 +1661,27 @@ mod tests {
             &Scope::builtins_only(),
         )
         .map(|(call, _)| call)
+    }
+
+    /// [`call`], but also returns the index [`parse`] hands back — the first
+    /// unconsumed sibling in the *original* `children` — for the index
+    /// arithmetic tests, which care where parsing stopped as much as what it
+    /// produced.
+    fn call_and_next(src: &str) -> Option<(CommandCall, usize)> {
+        let tree = tree(src);
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let children: Vec<Node> = root.children(&mut cursor).collect();
+        let start = children
+            .iter()
+            .position(|n| matches!(n.kind(), "escaped_word" | "named_context"))?;
+        parse(
+            &children,
+            start,
+            src,
+            Language::DEFAULT,
+            &Scope::builtins_only(),
+        )
     }
 
     #[test]
@@ -1596,7 +1900,7 @@ mod tests {
     #[test]
     fn lyricsto_reads_an_optional_voice_name_then_its_body() {
         let call = call("\\lyricsto \"v\" { la }").expect("a lyricsto call");
-        assert!(matches!(&call.args[0], Arg::String { text, .. } if text == "v"));
+        assert!(matches!(&call.args[0], Arg::ContextName { name, .. } if name == "v"));
         assert!(matches!(call.args[1], Arg::Music { .. }));
     }
 
@@ -1647,6 +1951,217 @@ mod tests {
     fn with_takes_one_music_block() {
         let call = call("\\with { }").expect("a with call");
         assert_eq!(call.args.len(), 1);
+    }
+
+    #[test]
+    fn new_and_context_docs_name_their_own_parameters() {
+        // Hover renders these constants directly under the `\new`/`\context`
+        // signature, so they earn their keep only if they actually talk
+        // about the parameters that signature will show: `type`, `name`
+        // (optional) and `music`. Guards the prose against silently
+        // drifting from whatever parameter names the later step gives it.
+        for doc in [NEW_DOC, CONTEXT_DOC] {
+            for param in ["`type`", "`name`", "`music`"] {
+                assert!(
+                    doc.contains(param),
+                    "expected {doc:?} to mention the parameter {param}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_and_context_hover_shows_curated_doc_and_signature() {
+        let scope = Scope::builtins_only();
+        for (name, doc) in [("new", NEW_DOC), ("context", CONTEXT_DOC)] {
+            let known = scope
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} should be reserved"));
+            let cmd = known.value;
+            let synopsis = cmd
+                .synopsis()
+                .unwrap_or_else(|| panic!("{name} should have a synopsis"));
+            assert!(
+                synopsis.contains(&format!("\\{name}")),
+                "{synopsis:?} should show the \\{name} signature"
+            );
+            let documentation = cmd
+                .documentation()
+                .unwrap_or_else(|| panic!("{name} should have documentation"));
+            assert_eq!(documentation.markdown, doc);
+        }
+    }
+
+    // The six shapes `\new`/`\context` are written in, all exercising
+    // `parse`'s `named_context` unwrapping — see `doc/command-parsing.md`
+    // and the comment on `parse` itself for why the grammar makes that
+    // necessary.
+
+    #[test]
+    fn new_reads_a_bare_context_type_and_body() {
+        let call = call("\\new Staff { c }").expect("a new call");
+        assert_eq!(call.name, "new");
+        assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Staff"));
+        assert!(matches!(call.args[1], Arg::Music { .. }));
+        assert_eq!(call.args.len(), 2);
+    }
+
+    #[test]
+    fn context_reads_a_bare_context_type_and_body() {
+        let call = call("\\context Staff { c }").expect("a context call");
+        assert_eq!(call.name, "context");
+        assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Staff"));
+        assert!(matches!(call.args[1], Arg::Music { .. }));
+        assert_eq!(call.args.len(), 2);
+    }
+
+    #[test]
+    fn new_reads_a_named_instance() {
+        let call = call("\\new Staff = \"upper\" { c }").expect("a new call");
+        assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Staff"));
+        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "upper"));
+        assert!(matches!(call.args[2], Arg::Music { .. }));
+        assert_eq!(call.args.len(), 3);
+    }
+
+    #[test]
+    fn new_reads_a_with_block_before_its_body() {
+        let src = "\\new Staff \\with { fontSize = #-2 } { c d e }";
+        let call = call(src).expect("a new call");
+        assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Staff"));
+        let Arg::Unknown { span } = &call.args[1] else {
+            panic!(
+                "expected the \\with block as an Unknown arg, got {:?}",
+                call.args[1]
+            );
+        };
+        assert_eq!(&src[span.start..span.end], "\\with { fontSize = #-2 }");
+        assert!(matches!(call.args[2], Arg::Music { .. }));
+        // And the real body — not the `\with` block — is what `body()` finds.
+        let body = call.body().expect("a body");
+        assert_eq!(&src[body.start..body.end], "{ c d e }");
+    }
+
+    #[test]
+    fn new_reads_a_named_instance_and_a_with_block() {
+        let src = "\\new Voice = \"vocals\" \\with { fontSize = #-2 } { c }";
+        let call = call(src).expect("a new call");
+        assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Voice"));
+        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "vocals"));
+        assert!(matches!(call.args[2], Arg::Unknown { .. }));
+        assert!(matches!(call.args[3], Arg::Music { .. }));
+        assert_eq!(call.args.len(), 4);
+    }
+
+    #[test]
+    fn context_reads_a_named_instance() {
+        let call = call("\\context Voice = \"vocals\" { c }").expect("a context call");
+        assert_eq!(call.name, "context");
+        assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Voice"));
+        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "vocals"));
+        assert!(matches!(call.args[2], Arg::Music { .. }));
+        assert_eq!(call.args.len(), 3);
+    }
+
+    // The index arithmetic `parse`'s `named_context` arm does to map a
+    // position in the flattened stream back to an index into the original
+    // `children` — the part of this step most likely to silently re-read or
+    // skip a whole music block if it's off by one.
+
+    #[test]
+    fn resumes_after_a_bare_context_type_and_body() {
+        // Everything the call consumes — the type, entirely inside the
+        // `named_context` node, and the body, a sibling after it — is
+        // read; the next index must land exactly on the following `\break`.
+        let src = "\\new Staff { c } \\break";
+        let (call, next) = call_and_next(src).expect("a new call");
+        assert_eq!(call.name, "new");
+        let tree = tree(src);
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let children: Vec<Node> = root.children(&mut cursor).collect();
+        assert_eq!(
+            &src[children[next].start_byte()..children[next].end_byte()],
+            "\\break",
+            "expected to resume right at the trailing \\break"
+        );
+    }
+
+    #[test]
+    fn resumes_right_after_a_bare_named_context_node_when_nothing_else_is_consumed() {
+        // A half-typed `\new Staff` with nothing else written: everything
+        // consumed sits *inside* the `named_context` node, so the next
+        // index must be `start + 1` — one past the whole `named_context`
+        // node — not some position that only makes sense inside it.
+        let src = "\\new Staff";
+        let (call, next) = call_and_next(src).expect("a partial new call");
+        assert_eq!(call.args.len(), 1);
+        assert_eq!(next, 1, "start + 1, one past the sole named_context node");
+    }
+
+    #[test]
+    fn resumes_after_a_with_block_and_body() {
+        let src = "\\new Staff \\with { fontSize = #-2 } { c } \\break";
+        let (call, next) = call_and_next(src).expect("a new call");
+        assert_eq!(call.args.len(), 3, "type, with block, music");
+        let tree = tree(src);
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let children: Vec<Node> = root.children(&mut cursor).collect();
+        assert_eq!(
+            &src[children[next].start_byte()..children[next].end_byte()],
+            "\\break",
+            "expected to resume right at the trailing \\break, past the \\with block"
+        );
+    }
+
+    // `\new`/`\context`'s `MusicContext`, which — unlike every plain `Row` —
+    // depends on the context type named in the call rather than being fixed
+    // by the command.
+
+    #[test]
+    fn new_lyrics_reads_as_non_note_music() {
+        // `Scope::builtins_only()` has no install layer and hence no real
+        // `ContextType` for `Lyrics`, so this exercises `is_non_note`'s
+        // fallback: the type name alone is checked against the hand-written
+        // root list.
+        let call = call("\\new Lyrics { la }").expect("a new call");
+        let context =
+            call.cmd
+                .music_context(&call, MusicContext::Absolute, &Scope::builtins_only());
+        assert_eq!(context, MusicContext::NonNote);
+    }
+
+    #[test]
+    fn new_staff_reads_as_ordinary_note_music() {
+        let call = call("\\new Staff { c }").expect("a new call");
+        let context =
+            call.cmd
+                .music_context(&call, MusicContext::Absolute, &Scope::builtins_only());
+        assert_eq!(context, MusicContext::Absolute);
+    }
+
+    #[test]
+    fn a_users_own_alias_of_lyrics_reads_as_non_note_too() {
+        // `\context { \name MyLyrics \alias Lyrics }` teaches the scope a
+        // context type this reader has never heard of by that name; it must
+        // still read as non-note by inheriting from its `\alias`, the same
+        // way a real `\new Lyrics` does.
+        let context_src = "\\layout { \\context { \\name MyLyrics \\alias Lyrics } }";
+        let context_types: HashMap<String, crate::context::ContextType> =
+            crate::context::read(&tree(context_src), context_src)
+                .into_iter()
+                .map(|c| (c.name.clone(), c))
+                .collect();
+        let layer =
+            Arc::new(Layer::new("test.ly", HashMap::new()).with_context_types(context_types));
+        let scope = Scope::builtins().for_document(&[layer]);
+
+        let call = call("\\new MyLyrics { la }").expect("a new call");
+        let context = call
+            .cmd
+            .music_context(&call, MusicContext::Absolute, &scope);
+        assert_eq!(context, MusicContext::NonNote);
     }
 
     #[test]

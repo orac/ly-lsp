@@ -6,6 +6,7 @@ use super::{
     REFERENCE_PITCH_PARAMS,
 };
 use crate::notes::Pitch;
+use crate::vocabulary::Scope;
 
 /// LilyPond's default `\relative` reference when none is written: middle C.
 const DEFAULT_RELATIVE_REFERENCE: Pitch = Pitch {
@@ -35,7 +36,12 @@ impl Command for RelativeCommand {
         self.base.signature()
     }
 
-    fn music_context(&self, call: &CommandCall, _ambient: MusicContext) -> MusicContext {
+    fn music_context(
+        &self,
+        call: &CommandCall,
+        _ambient: MusicContext,
+        _scope: &Scope,
+    ) -> MusicContext {
         let reference = call
             .args
             .iter()

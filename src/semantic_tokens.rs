@@ -1,19 +1,17 @@
 //! `textDocument/semanticTokens/full` support.
 //!
-//! The TextMate grammar highlights structurally, from token shape alone — it
-//! cannot tell that the `volta` in `\repeat volta 2` is meaningful, because
-//! that meaning comes from `\repeat`'s signature, not from anything `volta`
-//! looks like on its own (it's the same `symbol` node as an arbitrary bare
-//! word anywhere else). Semantic tokens fill exactly that gap: this module
-//! walks a document's already-parsed [`Commands`] and emits one token per
-//! argument whose meaning the grammar can't otherwise recover.
+//! The TextMate grammar highlights structurally, from token shape alone.
+//! In `\repeat volta 2` the `volta` is a `symbol` node like any bare word, but it should be treated differently.
+//! Semantic tokens fill that gap: this module walks a document's already-parsed [`Commands`] and emits one token per
+//! argument whose meaning the grammar alone can't recover.
 //!
-//! # What gets a token, and what doesn't
+//! # What gets a token
 //!
-//! Only [`Arg::BareWord`] and [`Arg::Word`] arguments are emitted, both as
-//! [`SemanticTokenType::KEYWORD`] — the two shapes doc/command-parsing.md
-//! calls out as the reason semantic highlighting is worth having at all. The
-//! other argument kinds were considered and left out:
+//! [`Arg::BareWord`] and [`Arg::Word`] →[`SemanticTokenType::KEYWORD`], as per the `\repeat volta` example above.
+//! [`Arg::ContextType`] → [`SemanticTokenType::TYPE`], e.g. `\new Staff`.
+//! [`Arg::ContextName`] → [`SemanticTokenType::VARIABLE`], e.g. `\new Staff = horns`.
+//! 
+//! # What doesn't get a token
 //!
 //! - [`Arg::String`]: a quoted `"bass"` is already a `string` node the
 //!   grammar highlights directly; the bare-symbol form (`\clef bass`) is the
@@ -25,18 +23,24 @@
 //! - [`Arg::PropertyPath`]: `Staff.instrumentName` is already structurally
 //!   distinct in the grammar (a dotted `property_expression`, not a bare
 //!   `symbol`), so a TextMate rule can target it without needing command
-//!   context in the first place. No gap to fill.
+//!   context in the first place.
 //! - [`Arg::Pitch`]: a reference pitch (`\relative c'`, the tonic of `\key c
 //!   \major`) is written with exactly the same syntax as a note in the music
-//!   body, and is already highlighted as one. Giving it a different semantic
-//!   type would be a regression, not an improvement.
+//!   body, and is already highlighted as one.
 //!
 //! # Encoding
 //!
 //! LSP semantic tokens are delta-encoded relative to the *previous* token
 //! (line and start character are both deltas, never absolute) and must be
 //! emitted in position order; see [`encode`]. Positions and lengths are UTF-16
-//! code units, via [`LineIndex`], not bytes.
+//! code units, via [`LineIndex`], not bytes. Emitting more than one token
+//! *type* means the spans of each kind can no longer be sorted separately and
+//! concatenated — a `\new Staff` inside a `\repeat volta 2` body, or the other
+//! way around, interleaves a [`TYPE`](SemanticTokenType::TYPE) token between
+//! two [`KEYWORD`](SemanticTokenType::KEYWORD) ones — so [`semantic_tokens_full`]
+//! tags every span with its token type up front and sorts the merged sequence
+//! once, and [`encode`] carries the type through per token instead of taking
+//! one type for the whole call.
 //!
 //! [`Commands`]: crate::command::Commands
 
@@ -52,7 +56,11 @@ use crate::line_struct::{LineIndex, Span};
 /// looks a type's index up by searching this slice rather than a
 /// hand-maintained constant, so adding a type here is the only change needed
 /// to keep emission and the legend in agreement.
-const TOKEN_TYPES: &[SemanticTokenType] = &[SemanticTokenType::KEYWORD];
+const TOKEN_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::KEYWORD,
+    SemanticTokenType::TYPE,
+    SemanticTokenType::VARIABLE,
+];
 
 /// No modifiers are used. Declared (empty) rather than omitted because some
 /// clients expect the array to be present on the wire even when unused.
@@ -83,40 +91,46 @@ fn token_type_index(ty: &SemanticTokenType) -> u32 {
 /// which argument kinds are covered.
 pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
     let keyword = token_type_index(&SemanticTokenType::KEYWORD);
-    let mut spans: Vec<Span> = doc
+    let context_type = token_type_index(&SemanticTokenType::TYPE);
+    let context_name = token_type_index(&SemanticTokenType::VARIABLE);
+
+    let mut tagged: Vec<(Span, u32)> = doc
         .commands()
         .iter()
         .flat_map(|call| &call.args)
         .filter_map(|arg| match arg {
-            Arg::BareWord { span, .. } | Arg::Word { span, .. } => Some(*span),
+            Arg::BareWord { span, .. } | Arg::Word { span, .. } => Some((*span, keyword)),
+            Arg::ContextType { span, .. } => Some((*span, context_type)),
+            Arg::ContextName { span, .. } => Some((*span, context_name)),
             _ => None,
         })
         .collect();
-    // A call's own bare-word/word arguments always precede any call nested in
-    // its body, so collecting in `Commands`' source order already yields
-    // increasing spans; sorting here is a cheap belt-and-braces guard against
-    // that invariant being wrong or changing under us, not load-bearing.
-    spans.sort_by_key(|span| span.start);
-    encode(doc.line_index(), &spans, keyword)
+    // This sort keeps a merge of
+    // several *kinds* — a `\new Staff` inside a `\repeat volta 2`, or the
+    // reverse — in the position order `encode` requires: nothing upstream
+    // interleaves the two kinds' spans for us.
+    tagged.sort_by_key(|(span, _)| span.start);
+    encode(doc.line_index(), &tagged)
 }
 
-/// Delta-encodes `spans`, already sorted by start position, as tokens of
-/// `token_type` with no modifiers. Each [`SemanticToken`] carries its
-/// position as a *delta* from the previous token: `delta_line` relative to
-/// the previous token's line, and `delta_start` relative to the previous
-/// token's start character on the same line, or from the start of the line
-/// otherwise. `lines` converts each span's byte offsets to UTF-16 positions,
-/// since that's what LSP counts in, not bytes.
-fn encode(lines: &LineIndex, spans: &[Span], token_type: u32) -> Vec<SemanticToken> {
-    let mut tokens = Vec::with_capacity(spans.len());
+/// Delta-encodes `tokens` — each a span paired with the semantic token type
+/// to emit for it, already sorted by span start — with no modifiers. Each
+/// [`SemanticToken`] carries its position as a *delta* from the previous
+/// token: `delta_line` relative to the previous token's line, and
+/// `delta_start` relative to the previous token's start character on the
+/// same line, or from the start of the line otherwise. `lines` converts each
+/// span's byte offsets to UTF-16 positions, since that's what LSP counts in,
+/// not bytes.
+fn encode(lines: &LineIndex, tokens: &[(Span, u32)]) -> Vec<SemanticToken> {
+    let mut out = Vec::with_capacity(tokens.len());
     let mut prev_line = 0u32;
     let mut prev_start = 0u32;
-    for span in spans {
+    for &(span, token_type) in tokens {
         let start = lines.position_at(span.start);
         let end = lines.position_at(span.end);
         debug_assert_eq!(
             start.line, end.line,
-            "a bare-word/word argument never spans multiple lines"
+            "a bare-word/word/context argument never spans multiple lines"
         );
         let delta_line = start.line - prev_line;
         let delta_start = if delta_line == 0 {
@@ -124,7 +138,7 @@ fn encode(lines: &LineIndex, spans: &[Span], token_type: u32) -> Vec<SemanticTok
         } else {
             start.character
         };
-        tokens.push(SemanticToken {
+        out.push(SemanticToken {
             delta_line,
             delta_start,
             length: end.character - start.character,
@@ -134,7 +148,7 @@ fn encode(lines: &LineIndex, spans: &[Span], token_type: u32) -> Vec<SemanticTok
         prev_line = start.line;
         prev_start = start.character;
     }
-    tokens
+    out
 }
 
 #[cfg(test)]
@@ -191,6 +205,71 @@ mod tests {
         assert!(tokens[1].delta_start > 0, "the two tokens must not collide");
     }
 
+    #[test]
+    fn emits_a_type_token_for_a_context_type() {
+        let doc = Document::new("{ \\new Staff { c } }".to_string());
+        let tokens = semantic_tokens_full(&doc);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].length, "Staff".encode_utf16().count() as u32);
+        assert_eq!(
+            tokens[0].token_type,
+            token_type_index(&SemanticTokenType::TYPE)
+        );
+    }
+
+    #[test]
+    fn emits_a_variable_token_for_a_context_name() {
+        let doc = Document::new("{ \\lyricsto \"vocals\" { la } }".to_string());
+        let tokens = semantic_tokens_full(&doc);
+        assert_eq!(tokens.len(), 1);
+        // Unlike `ContextType::name_span` and `ContextInstance::span` (read
+        // by `context.rs`, for a different purpose — see their docs),
+        // `Arg::ContextName`'s own span is the whole `string` node, quotes
+        // included: `consume_context_name` in `command/mod.rs` reads it that
+        // way, and this module tags exactly the span the `Arg` carries
+        // rather than trimming it to match.
+        assert_eq!(tokens[0].length, "\"vocals\"".encode_utf16().count() as u32);
+        assert_eq!(
+            tokens[0].token_type,
+            token_type_index(&SemanticTokenType::VARIABLE)
+        );
+    }
+
+    #[test]
+    fn interleaves_a_keyword_and_a_type_token_in_position_order_either_way_round() {
+        // The case the module docs call out: merging more than one token
+        // *kind* means the sort can no longer be done kind by kind — a
+        // `\new Staff` nested inside a `\repeat volta 2`'s body puts a TYPE
+        // token between the outer call's own two KEYWORD tokens (`volta`
+        // here, and none from `\new` itself, so just the one), and the
+        // reverse nesting puts a KEYWORD token after a TYPE one. Both
+        // directions are checked, since a merge bug could easily get one
+        // right and not the other.
+        for (src, kinds) in [
+            (
+                "\\repeat volta 2 { \\new Staff { c } }",
+                [SemanticTokenType::KEYWORD, SemanticTokenType::TYPE],
+            ),
+            (
+                "\\new Staff { \\repeat volta 2 { c } }",
+                [SemanticTokenType::TYPE, SemanticTokenType::KEYWORD],
+            ),
+        ] {
+            let doc = Document::new(src.to_string());
+            let tokens = semantic_tokens_full(&doc);
+            assert_eq!(tokens.len(), 2, "source: {src}");
+            let types: Vec<u32> = tokens.iter().map(|t| t.token_type).collect();
+            let expected: Vec<u32> = kinds.iter().map(token_type_index).collect();
+            assert_eq!(types, expected, "source: {src}");
+            // Position order: the second token's absolute position must
+            // follow the first's, which — both on one line here — delta_start
+            // being positive already proves.
+            assert_eq!(tokens[0].delta_line, 0);
+            assert_eq!(tokens[1].delta_line, 0);
+            assert!(tokens[1].delta_start > 0, "tokens out of order for {src}");
+        }
+    }
+
     mod proptests {
         use proptest::prelude::*;
 
@@ -198,14 +277,17 @@ mod tests {
 
         /// Snippets a generated document is assembled from by joining a random
         /// selection in a random order: command calls with bare-word/word
-        /// arguments (the two kinds `semantic_tokens_full` emits), plain music
-        /// with no calls at all, and a comment holding multi-byte characters
-        /// (an accented letter and a four-byte musical symbol) so the UTF-16
-        /// conversion is exercised, not just the ASCII case.
+        /// arguments and `\new`/`\lyricsto` calls with context type/name
+        /// arguments (the four kinds `semantic_tokens_full` emits), plain
+        /// music with no calls at all, and a comment holding multi-byte
+        /// characters (an accented letter and a four-byte musical symbol) so
+        /// the UTF-16 conversion is exercised, not just the ASCII case.
         const SNIPPETS: &[&str] = &[
             "\\repeat volta 2 { c }",
             "\\repeat unfold 3 { d }",
             "\\key g \\major",
+            "\\new Staff { c }",
+            "\\lyricsto \"vocals\" { la }",
             "c d e",
             "% café 𝄞",
         ];
@@ -276,7 +358,10 @@ mod tests {
                     .iter()
                     .flat_map(|call| &call.args)
                     .filter_map(|arg| match arg {
-                        Arg::BareWord { span, .. } | Arg::Word { span, .. } => Some(*span),
+                        Arg::BareWord { span, .. }
+                        | Arg::Word { span, .. }
+                        | Arg::ContextType { span, .. }
+                        | Arg::ContextName { span, .. } => Some(*span),
                         _ => None,
                     })
                     .collect();

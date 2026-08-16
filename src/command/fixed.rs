@@ -5,6 +5,7 @@ use super::{
     Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, Param,
     REFERENCE_PITCH_PARAMS, clamp_octave,
 };
+use crate::vocabulary::Scope;
 
 /// `\fixed reference { … }`. Like `\relative`, the body's context depends on
 /// the argument it parses itself: the reference pitch's octave becomes the
@@ -26,7 +27,12 @@ impl Command for FixedCommand {
         self.base.signature()
     }
 
-    fn music_context(&self, call: &CommandCall, _ambient: MusicContext) -> MusicContext {
+    fn music_context(
+        &self,
+        call: &CommandCall,
+        _ambient: MusicContext,
+        _scope: &Scope,
+    ) -> MusicContext {
         let offset = call
             .args
             .iter()

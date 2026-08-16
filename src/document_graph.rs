@@ -213,9 +213,15 @@ impl DocumentGraph {
 
     /// Resolves go-to-definition at `position` in document `uri`.
     ///
-    /// If the cursor is on an `\include` path, the target file is returned.
-    /// Otherwise the symbol under the cursor is resolved to its definition(s),
-    /// searching the document and everything it includes (transitively).
+    /// Tried in order: an `\include` path, under which the target file is
+    /// returned; a context type or instance name, navigated through
+    /// [`context_type_definitions`](Self::context_type_definitions) and
+    /// [`context_instance_definitions`](Self::context_instance_definitions);
+    /// and finally the ordinary symbol under the cursor, resolved to its
+    /// definition(s) by searching the document and everything it includes
+    /// (transitively). The first of the three that finds anything wins;
+    /// none can overlap with another, since each looks at a different shape
+    /// of node in the parse tree.
     pub fn goto_definition(&self, uri: &Url, position: Position) -> Vec<Location> {
         // Include-path navigation takes precedence.
         if let Some(Some(path)) =
@@ -224,6 +230,18 @@ impl DocumentGraph {
             return resolve_include(uri, &path, self.search_paths())
                 .map(|target| vec![Location::new(target, start_of_file())])
                 .unwrap_or_default();
+        }
+
+        if let Some(Some(name)) =
+            self.with_document(uri, |doc| doc.context_type_at(position).map(str::to_string))
+        {
+            return self.context_type_definitions(&name, uri);
+        }
+
+        if let Some(Some(name)) =
+            self.with_document(uri, |doc| doc.context_name_at(position).map(str::to_string))
+        {
+            return self.context_instance_definitions(&name, uri);
         }
 
         let Some((Some(name), at)) = self.with_document(uri, |doc| {
@@ -236,6 +254,58 @@ impl DocumentGraph {
         };
 
         self.definitions_in_effect(&name, uri, at)
+    }
+
+    /// One [`Location`] per file in `uri`'s include closure that declares a
+    /// context type called `name` — the context-type counterpart of
+    /// [`definitions_in_effect`](Self::definitions_in_effect), which
+    /// go-to-definition uses for the command namespace.
+    ///
+    /// Uses [`with_document_raw`](Self::with_document_raw) rather than
+    /// [`with_document`](Self::with_document): a `\context { \name … }`
+    /// declaration is read from a file's own parse tree alone
+    /// ([`Document::context_type_declaration`]), not from anything that
+    /// depends on the include graph, exactly like
+    /// [`Document::definition_ranges`] before it.
+    ///
+    /// There is no cursor position to resolve against, unlike
+    /// `definitions_in_effect`: a [`ContextType`](crate::context::ContextType)
+    /// carries no redefinition chain, so at most one location comes back per
+    /// file. Two files in the closure both declaring `name` is the same
+    /// "genuine ambiguity" `definitions_in_effect` leaves for the reader to
+    /// settle — both are offered, as before. A type known only from the
+    /// LilyPond install yields nothing here at all: install-layer context
+    /// types belong to no [`Document`] in this graph for
+    /// [`context_type_declaration`](Document::context_type_declaration) to
+    /// find, which is the documented gap `doc/command-parsing.md` already
+    /// records ("go-to-definition into the install") rather than a new one.
+    fn context_type_definitions(&self, name: &str, uri: &Url) -> Vec<Location> {
+        self.include_closure(uri)
+            .into_iter()
+            .filter_map(|file| {
+                let range = self
+                    .with_document_raw(&file, |doc| doc.context_type_declaration(name))
+                    .flatten()?;
+                Some(Location::new(file, range))
+            })
+            .collect()
+    }
+
+    /// One [`Location`] per file in `uri`'s include closure that creates a
+    /// context instance called `name` — the
+    /// [`ContextInstance`](crate::context::ContextInstance) counterpart of
+    /// [`context_type_definitions`](Self::context_type_definitions), reading
+    /// [`Document::context_instance_creation`] the same way.
+    fn context_instance_definitions(&self, name: &str, uri: &Url) -> Vec<Location> {
+        self.include_closure(uri)
+            .into_iter()
+            .filter_map(|file| {
+                let range = self
+                    .with_document_raw(&file, |doc| doc.context_instance_creation(name))
+                    .flatten()?;
+                Some(Location::new(file, range))
+            })
+            .collect()
     }
 
     /// The definition of `name` a reference at byte offset `at` in `uri`
@@ -392,10 +462,15 @@ impl DocumentGraph {
     /// argument, depending on where the cursor is. See
     /// [`command_assist::completions`](crate::command_assist::completions).
     pub fn completions(&self, uri: &Url, position: Position) -> Vec<CompletionItem> {
-        let ctx = CompletionContext {
-            lilypond_version: self.lilypond_version.get().map(String::as_str),
-        };
+        // Built inside the closure, not before it like other read-only
+        // fields would be: `CompletionContext::scope` must be this
+        // document's own scope, which only exists once `with_document` has
+        // refreshed it — see `Document::scope`.
         self.with_document(uri, |doc| {
+            let ctx = CompletionContext {
+                lilypond_version: self.lilypond_version.get().map(String::as_str),
+                scope: doc.scope(),
+            };
             crate::command_assist::completions(doc, position, &ctx)
         })
         .unwrap_or_default()
@@ -623,6 +698,32 @@ mod tests {
         );
     }
 
+    /// A context instance created in an included file is visible from the
+    /// including document — the include-closure counterpart of
+    /// `Document::a_document_exposes_a_context_instance_its_own_music_creates`,
+    /// which only checks a file seeing its own.
+    #[test]
+    fn an_included_files_context_instance_is_visible_to_the_including_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let voices = dir.path().join("voices.ily");
+        let score = dir.path().join("score.ly");
+        fs::write(&voices, "melody = { \\new Voice = \"vocals\" { c } }\n").unwrap();
+        fs::write(
+            &score,
+            "\\include \"voices.ily\"\n{ \\melody \\lyricsto \"vocals\" { la } }\n",
+        )
+        .unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), fs::read_to_string(&score).unwrap());
+
+        let scope = ws.scope_for(&url(&score));
+        let known = scope
+            .get_context_instance("vocals")
+            .expect("vocals, created in the included file");
+        assert_eq!(known.value.type_name.as_deref(), Some("Voice"));
+    }
+
     /// The other half of the same claim: a scope's fingerprint follows the
     /// content of the files in its closure, so an analysis made before an
     /// include was edited is not silently served afterwards.
@@ -702,6 +803,110 @@ mod tests {
         assert_eq!(
             ws.scope_for(&url(&plain)).fingerprint(),
             Scope::builtins_only().fingerprint()
+        );
+    }
+
+    /// The position a byte inside `needle`'s first occurrence in `src` maps
+    /// to — enough of a cursor to land inside the name being navigated from,
+    /// without having to hand-count characters in each test's source.
+    fn inside(src: &str, needle: &str) -> Position {
+        let offset = src.find(needle).expect("needle must occur in src") + 1;
+        crate::line_struct::LineIndex::new(src).position_at(offset)
+    }
+
+    /// The same as [`inside`], but searching for `needle` only after
+    /// `anchor`'s first occurrence — for a source with two occurrences of the
+    /// same name (a context instance's creation and a later reference to it),
+    /// where the cursor belongs on the second.
+    fn inside_after(src: &str, anchor: &str, needle: &str) -> Position {
+        let from = src.find(anchor).expect("anchor must occur in src");
+        let offset = from + src[from..].find(needle).expect("needle after anchor") + 1;
+        crate::line_struct::LineIndex::new(src).position_at(offset)
+    }
+
+    #[test]
+    fn goto_definition_from_new_finds_a_context_type_declared_in_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "\\layout { \\context { \\name MyStaff } }\n{ \\new MyStaff { c } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let locations = ws.goto_definition(&url(&score), inside(src, "MyStaff {"));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, url(&score));
+        let start = crate::line_struct::LineIndex::new(src)
+            .offset_at(locations[0].range.start)
+            .unwrap();
+        let end = crate::line_struct::LineIndex::new(src)
+            .offset_at(locations[0].range.end)
+            .unwrap();
+        assert_eq!(&src[start..end], "MyStaff");
+        // Landed on the `\name`'s declaration, not the `\new`'s reference.
+        assert!(start < src.find("{ \\new").unwrap());
+    }
+
+    #[test]
+    fn goto_definition_from_new_finds_a_context_type_declared_in_an_included_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let types = dir.path().join("types.ily");
+        let score = dir.path().join("score.ly");
+        fs::write(&types, "\\layout { \\context { \\name MyStaff } }\n").unwrap();
+        let src = "\\include \"types.ily\"\n{ \\new MyStaff { c } }\n";
+        fs::write(&score, src).unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let locations = ws.goto_definition(&url(&score), inside(src, "MyStaff {"));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations[0].uri,
+            url(&types),
+            "the declaration lives in the included file, not the score"
+        );
+    }
+
+    #[test]
+    fn goto_definition_from_lyricsto_finds_the_new_that_created_the_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "{ \\new Voice = \"vocals\" { c } \\lyricsto \"vocals\" { la } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let locations = ws.goto_definition(&url(&score), inside_after(src, "\\lyricsto", "vocals"));
+        assert_eq!(locations.len(), 1);
+        let start = crate::line_struct::LineIndex::new(src)
+            .offset_at(locations[0].range.start)
+            .unwrap();
+        let end = crate::line_struct::LineIndex::new(src)
+            .offset_at(locations[0].range.end)
+            .unwrap();
+        assert_eq!(&src[start..end], "vocals");
+        // Landed on the `\new`'s creation, before `\lyricsto`'s own reference.
+        assert!(start < src.find("\\lyricsto").unwrap());
+    }
+
+    #[test]
+    fn goto_definition_on_a_builtin_context_type_finds_nothing() {
+        // `Staff` is never declared with `\name` anywhere in this workspace —
+        // the shape a built-in type looks like from here, since install-layer
+        // types carry no file for a `Location` to point at (the documented
+        // gap in doc/command-parsing.md). Nothing is the right answer, not a
+        // location in the wrong file.
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "{ \\new Staff { c } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        assert!(
+            ws.goto_definition(&url(&score), inside(src, "Staff {"))
+                .is_empty()
         );
     }
 }

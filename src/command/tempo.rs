@@ -1,7 +1,11 @@
 //! `\tempo`, in each of its three written forms.
 
 use super::static_command::{StaticCommand, static_command};
-use super::{Arg, ArgKind, ArgReader, Candidate, Command, CompletionContext, MusicContext, Param};
+use super::{
+    Arg, ArgKind, ArgReader, Candidate, Command, CommandCall, CompletionContext, MusicContext,
+    Param,
+};
+use crate::vocabulary::Scope;
 
 static TEMPO_PARAMS: &[Param] = &[
     Param::optional("text", ArgKind::String),
@@ -16,7 +20,7 @@ static TEMPO_PARAMS: &[Param] = &[
 /// [`default_parse`](super::default_parse); [`signature`](Command::signature)
 /// still lists the three pieces for signature help and arity checks even
 /// though the default parser never walks it. `\tempo` has no music argument,
-/// so `music_context` is left at the (delegated) `StaticCommand` default,
+/// so [`music_context`](Command::music_context) just forwards to the base's
 /// `Inherit`.
 pub(super) struct TempoCommand {
     base: StaticCommand,
@@ -49,6 +53,21 @@ impl Command for TempoCommand {
 
     fn documentation(&self) -> Option<&super::Documentation> {
         self.base.documentation()
+    }
+
+    // `\tempo`'s base is `MusicContext::Inherit`, for which the trait's
+    // default (return `ambient` unchanged) and this forward already agree —
+    // but relying on that default is what let `\lyricsto` regress silently
+    // when its own base turned out to be `NonNote` (`super::lyricsto`).
+    // Forwarded explicitly so this wrapper can't drift the same way if
+    // `\tempo`'s context ever stops being `Inherit`.
+    fn music_context(
+        &self,
+        call: &CommandCall,
+        ambient: MusicContext,
+        scope: &Scope,
+    ) -> MusicContext {
+        self.base.music_context(call, ambient, scope)
     }
 
     fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {

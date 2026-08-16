@@ -413,7 +413,7 @@ fn unescape(escape: &str) -> &str {
 /// docstrings use, and all three hold code — Texinfo's prose environments
 /// (`@table`, `@itemize`) appear in the manual but in no docstring, and would
 /// come through as run-on prose if one ever did.
-fn texinfo_to_markdown(text: &str) -> String {
+pub(crate) fn texinfo_to_markdown(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut open: Option<&Environment> = None;
     // `split_inclusive` keeps each line's terminator, so a docstring's own line

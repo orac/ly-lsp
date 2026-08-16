@@ -7,6 +7,7 @@ use super::{
     Arg, ArgKind, Candidate, CheckContext, Command, CommandCall, CompletionContext, MusicContext,
     Param,
 };
+use crate::vocabulary::Scope;
 
 static REPEAT_PARAMS: &[Param] = &[
     Param::required("kind", ArgKind::BareWord),
@@ -68,6 +69,21 @@ impl Command for RepeatCommand {
 
     fn documentation(&self) -> Option<&super::Documentation> {
         self.base.documentation()
+    }
+
+    // `\repeat`'s base is built with `MusicContext::Inherit`, for which the
+    // trait's default (return `ambient` unchanged) and this forward already
+    // agree — but relying on that default is what let `\lyricsto` regress
+    // silently when its own base turned out to be `NonNote`
+    // (`super::lyricsto`). Forwarded explicitly so this wrapper can't drift
+    // the same way if `\repeat`'s context ever stops being `Inherit`.
+    fn music_context(
+        &self,
+        call: &CommandCall,
+        ambient: MusicContext,
+        scope: &Scope,
+    ) -> MusicContext {
+        self.base.music_context(call, ambient, scope)
     }
 
     fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {

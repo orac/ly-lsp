@@ -25,11 +25,13 @@ fn main() {
 
     println!("loaded in {elapsed:?}");
     // Top down: our curated signatures, the install, the words list.
+    // `Layer::len` counts both namespaces a layer can hold — commands and
+    // context types together — so "names" is what these numbers are.
     for layer in base.layers() {
-        println!("  a layer of {} commands", layer.len());
+        println!("  a layer of {} names", layer.len());
     }
     println!(
-        "install layer alone defines {} commands",
+        "install layer alone defines {} names",
         install::load(&share_dir.join("ly")).len()
     );
 }

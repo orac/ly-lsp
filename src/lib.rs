@@ -6,6 +6,7 @@
 pub mod code_action;
 pub mod command;
 pub mod command_assist;
+pub mod context;
 pub mod document;
 pub mod document_graph;
 pub mod install;
