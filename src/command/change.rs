@@ -31,13 +31,21 @@ use super::{
 };
 use crate::line_struct::Span;
 
-/// `type` and `name` — the two pieces [`ChangeCommand::parse_args`] reads by
-/// hand, listed here only so signature help and arity checks have parameter
-/// names to show; see the module doc for why `default_parse` can't walk this
-/// signature on its own.
+/// The `= "name"` clause inside [`CHANGE_PARAMS`], named separately because
+/// a `static`'s initialiser can't hold an inline temporary slice of
+/// non-`Copy` [`Param`]s.
+static CHANGE_ASSIGNMENT_PARAMS: &[Param] = &[
+    Param::required("=", ArgKind::Literal("=")),
+    Param::required("name", ArgKind::ContextName),
+];
+
+/// `type` and the `= name` clause — the two pieces [`ChangeCommand::parse_args`]
+/// reads by hand, listed here only so signature help and arity checks have
+/// parameter names to show; see the module doc for why `default_parse` can't
+/// walk this signature on its own.
 static CHANGE_PARAMS: &[Param] = &[
     Param::required("type", ArgKind::ContextType),
-    Param::required("name", ArgKind::ContextName),
+    Param::required("= name", ArgKind::Group(CHANGE_ASSIGNMENT_PARAMS)),
 ];
 
 /// `\change`. Wraps a [`StaticCommand`] for its
@@ -86,10 +94,8 @@ impl Command for ChangeCommand {
         };
         out.push(context_type);
 
-        if args.take_punct("=")
-            && let Some(name) = args.take(&ArgKind::ContextName)
-        {
-            out.push(name);
+        if let Some(assignment) = args.take(&ArgKind::Group(CHANGE_ASSIGNMENT_PARAMS)) {
+            out.push(assignment);
         }
         out
     }
@@ -101,6 +107,9 @@ impl Command for ChangeCommand {
     fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {
         match index {
             0 => context_type_candidates(ctx.scope),
+            // 1 is the whole `= name` Group — its only completable piece is
+            // `name`, so the cursor anywhere in the clause (including on the
+            // `=` itself, which offers nothing anyway) gets instance names.
             1 => context_instance_candidates(ctx.scope),
             _ => self.base.completions(index, ctx),
         }
@@ -157,14 +166,27 @@ mod tests {
         let call = call("\\change Staff = \"lower\"").expect("a change call");
         assert_eq!(call.name, "change");
         assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Staff"));
-        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "lower"));
         assert_eq!(call.args.len(), 2);
+        let Arg::Group { args, .. } = &call.args[1] else {
+            panic!(
+                "expected the = name clause as a Group, got {:?}",
+                call.args[1]
+            );
+        };
+        assert!(matches!(args[0], Arg::Literal { .. }));
+        assert!(matches!(&args[1], Arg::ContextName { name, .. } if name == "lower"));
     }
 
     #[test]
     fn reads_a_bare_symbol_name_too() {
         let call = call("\\change Staff = lower").expect("a change call");
-        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "lower"));
+        let Arg::Group { args, .. } = &call.args[1] else {
+            panic!(
+                "expected the = name clause as a Group, got {:?}",
+                call.args[1]
+            );
+        };
+        assert!(matches!(&args[1], Arg::ContextName { name, .. } if name == "lower"));
     }
 
     #[test]

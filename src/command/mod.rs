@@ -17,8 +17,10 @@
 //! signatures for ordinary music functions LilyPond defines in `ly/`
 //! (`\clef`, `\key`, `\relative`, …), which a file *can* shadow. Most of
 //! both are plain rows of [`RESERVED_ROWS`] and [`CURATED_ROWS`], built as a
-//! [`StaticCommand`](static_command::StaticCommand); the handful with
-//! genuinely irregular behaviour — [`relative`], [`fixed`], [`tempo`],
+//! [`StaticCommand`](static_command::StaticCommand) — `\tempo` among them,
+//! its `duration = value` clause an [`ArgKind::Group`] rather than a reason
+//! to be bespoke; the handful with genuinely irregular behaviour —
+//! [`relative`], [`fixed`],
 //! [`repeat`], [`new_context`] (serving both `\new` and `\context`, whose
 //! body's [`MusicContext`] depends on the context type named in the call,
 //! not on a fixed row), [`change`] (whose context type sometimes, but not
@@ -45,7 +47,6 @@ mod relative;
 mod repeat;
 pub mod scheme;
 mod static_command;
-mod tempo;
 pub mod variable;
 mod version;
 
@@ -109,11 +110,15 @@ pub trait Command: Send + Sync {
     /// against the same node.
     ///
     /// Override only when the shape can't be expressed as a parameter list at
-    /// all — `\tempo`'s literal `=` between its duration and its metronome
-    /// number is the one hand-written case that needs this. Do not override
-    /// merely to reject a bad argument; that belongs in [`check`](Command::check),
-    /// so that a wrong-but-parseable call still produces a structured
-    /// [`CommandCall`] for the refactorings to work with.
+    /// all — not because a piece is irregular in isolation ([`ArgKind::Literal`]
+    /// covers a fixed token like `\tempo`'s `=` on its own), but because
+    /// whether it's expected depends on what came before: `\tempo`'s `=` and
+    /// metronome number only belong once a duration was actually read, and
+    /// [`default_parse`]'s param-by-param walk can't express that
+    /// conditioning. Do not override merely to reject a bad argument; that
+    /// belongs in [`check`](Command::check), so that a wrong-but-parseable
+    /// call still produces a structured [`CommandCall`] for the refactorings
+    /// to work with.
     fn parse_args(&self, args: &mut ArgReader) -> Vec<Arg> {
         default_parse(self.signature(), args)
     }
@@ -224,7 +229,7 @@ pub trait Command: Send + Sync {
 }
 
 /// One parameter of a command's signature.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     /// The name from the definition (`weightList`), shown in signature help.
     /// `Cow` so hand-written impls can use literals while parsed ones own
@@ -291,6 +296,33 @@ pub enum ArgKind {
     /// signature help can still show it. Consumes exactly one node, which is
     /// right often enough to beat refusing the whole signature.
     Unknown(Cow<'static, str>),
+    /// A fixed punctuation token that belongs to the signature itself rather
+    /// than to any value the caller supplies — the `=` of `\tempo 4 = 120`,
+    /// `\new Staff = "id"` and `\change Staff = "lower"`. Consumes a
+    /// `punctuation` node whose text matches `text` exactly, so a bespoke
+    /// [`parse_args`](Command::parse_args) can read it through the same
+    /// [`ArgReader::take`] every other argument goes through, rather than a
+    /// method of its own.
+    Literal(&'static str),
+    /// A run of parameters that belong together — present as a unit or not at
+    /// all — rather than each independently optional: `\new type [= name]`'s
+    /// `=` and `name`, `\tempo [text] [duration = value]`'s `duration`, `=`
+    /// and `value`. Lets [`default_parse`] itself decide whether to consume
+    /// the whole clause, rather than every command whose grammar pairs an
+    /// `=` with something needing its own hand-written
+    /// [`parse_args`](Command::parse_args).
+    ///
+    /// Matched by [`consume_group`], prefix-preserving: a required piece that
+    /// fails partway through simply stops the group's own walk, keeping
+    /// whatever prefix already matched, rather than failing the group outright
+    /// — `\tempo 4` (duration read, `=` not yet typed) still matches, as a
+    /// one-piece group. Only an entirely-unmatched first piece makes the whole
+    /// group absent, which is what lets the *outer* [`Param::optional`] skip
+    /// past it cleanly. See [`consume_group`] for why this preserves the
+    /// `a_truncated_call_yields_a_prefix_of_the_complete_calls_arguments`
+    /// property test's invariant, at the cost of `Arg::Group` sometimes
+    /// holding fewer pieces than the `ArgKind::Group` that matched it lists.
+    Group(&'static [Param]),
     /// The context type named by `\new`/`\context` — `Staff` in `\new Staff`.
     /// A `symbol`, same shape as [`BareWord`](ArgKind::BareWord), but kept as
     /// its own kind because it names a different namespace (context types,
@@ -416,22 +448,6 @@ impl<'a> ArgReader<'a> {
     /// its caller.
     pub fn position(&self) -> usize {
         self.next
-    }
-
-    /// Consumes a literal punctuation token matching `text` exactly (`=`),
-    /// or returns `false` without advancing. Not part of [`ArgKind`] because
-    /// it names no argument value — just a fixed separator a bespoke
-    /// [`parse_args`](Command::parse_args) needs to step over, as
-    /// [`tempo::TempoCommand`] does between its duration and its metronome
-    /// number.
-    pub fn take_punct(&mut self, text: &str) -> bool {
-        match self.children.get(self.next) {
-            Some(node) if is_punct(*node, self.src, text) => {
-                self.next += 1;
-                true
-            }
-            _ => false,
-        }
     }
 }
 
@@ -795,6 +811,22 @@ pub enum Arg {
     Unknown {
         span: Span,
     },
+    /// An [`ArgKind::Literal`] argument: a fixed punctuation token, carrying
+    /// nothing beyond its span since its text is already known from the
+    /// [`ArgKind`] that matched it.
+    Literal {
+        span: Span,
+    },
+    /// An [`ArgKind::Group`] argument: the pieces actually matched, in order.
+    /// Prefix-preserving (see [`consume_group`]): may hold fewer pieces than
+    /// the [`ArgKind::Group`] that matched it lists — `\tempo 4` with no `=`
+    /// yet typed is one [`Arg::Count`] on its own, not the full three-piece
+    /// clause — but never zero, since an empty match is `None` from
+    /// [`consume_group`] rather than an empty `Group`.
+    Group {
+        span: Span,
+        args: Vec<Arg>,
+    },
     /// An [`ArgKind::ContextType`] argument: the context type name a
     /// `\new`/`\context` names, e.g. `Staff`.
     ContextType {
@@ -822,6 +854,8 @@ impl Arg {
             | Arg::String { span, .. }
             | Arg::PropertyPath { span, .. }
             | Arg::Unknown { span }
+            | Arg::Literal { span }
+            | Arg::Group { span, .. }
             | Arg::ContextType { span, .. }
             | Arg::ContextName { span, .. } => *span,
         }
@@ -988,8 +1022,15 @@ fn consume_arg(
             Some((Arg::Word { span, text }, i + 1))
         }
         ArgKind::String => consume_string(children, i, src),
+        ArgKind::Literal(text) if is_punct(node, src, text) => Some((
+            Arg::Literal {
+                span: node_span(node),
+            },
+            i + 1,
+        )),
         ArgKind::ContextName => consume_context_name(children, i, src),
         ArgKind::PropertyPath => consume_property_path(children, i, src),
+        ArgKind::Group(sub_params) => consume_group(sub_params, children, i, src, language),
         // `Unknown` must never claim a node `ArgKind::Music` would also claim.
         // It has no shape check of its own — that's the whole point of it —
         // so an *optional* `Unknown` parameter would otherwise consume
@@ -1010,6 +1051,49 @@ fn consume_arg(
         )),
         _ => None,
     }
+}
+
+/// Consumes an [`ArgKind::Group`]: a run of `sub_params`, walked the same way
+/// [`default_parse`] walks a whole signature — a required piece that fails
+/// stops the walk rather than failing the group outright — but starting from
+/// `children[start]` instead of wherever an [`ArgReader`] happens to be, and
+/// returning what it matched as one [`Arg::Group`] instead of extending a
+/// caller's `Vec` directly.
+///
+/// Prefix-preserving: `\tempo 4` (duration read, no `=` yet) still returns
+/// `Some` — a group of one, `[duration]` — because `sub_params`' first piece
+/// (`duration`) matched; only when *that* first piece fails to match at all
+/// does the whole group fail, returning `None` for the [`Param::optional`]
+/// that wraps it to skip past cleanly. Without this, a required piece
+/// failing partway through would have to erase pieces already matched to
+/// report "the group didn't happen", which would make a half-typed `\tempo
+/// 4` report no arguments at all — a regression from today's hand-written
+/// equivalent, and a break of the `a_truncated_call_yields_a_prefix_of_the_
+/// complete_calls_arguments` property test's invariant that a truncated call
+/// yields a prefix of the complete one's arguments.
+fn consume_group(
+    sub_params: &[Param],
+    children: &[Node],
+    start: usize,
+    src: &str,
+    language: Language,
+) -> Option<(Arg, usize)> {
+    let mut args = Vec::new();
+    let mut i = start;
+    for param in sub_params {
+        match consume_arg(&param.kind, children, i, src, language) {
+            Some((arg, next)) => {
+                i = next;
+                args.push(arg);
+            }
+            None if param.optional => continue,
+            None => break,
+        }
+    }
+    let first = args.first()?;
+    let end = args.last().map_or(first.span().end, |arg| arg.span().end);
+    let span = Span::new(first.span().start, end);
+    Some((Arg::Group { span, args }, i))
 }
 
 /// Whether `kind` is a node [`ArgKind::Music`] would itself consume: a `{ … }`
@@ -1288,6 +1372,27 @@ static VOLTA_PARAMS: &[Param] = &[
     Param::required("numbers", ArgKind::NumberList),
     Param::required("music", ArgKind::Music),
 ];
+/// The `duration = value` clause inside [`TEMPO_PARAMS`], named separately
+/// because a `static`'s initialiser can't hold an inline temporary slice of
+/// non-`Copy` [`Param`]s.
+static TEMPO_ASSIGNMENT_PARAMS: &[Param] = &[
+    Param::required("duration", ArgKind::Count),
+    Param::required("=", ArgKind::Literal("=")),
+    Param::required("value", ArgKind::Count),
+];
+/// `\tempo`, in each of its three written forms: `"text"`, `duration =
+/// metronome-number`, or both together. The `=` clause is an
+/// [`ArgKind::Group`] rather than three independent optional pieces — a bare
+/// `\tempo 4 120` (no `=`) must not misread `120` as the metronome number —
+/// but is itself optional as a whole, and prefix-preserving while it's being
+/// typed: `\tempo 4` alone still parses as far as `duration`. That's enough
+/// for [`default_parse`] to walk unaided, so `\tempo` needs no bespoke
+/// [`Command`] impl of its own, unlike `\relative`/`\fixed`/`\repeat`/
+/// `\new`/`\context`/`\change`.
+static TEMPO_PARAMS: &[Param] = &[
+    Param::optional("text", ArgKind::String),
+    Param::optional("duration = value", ArgKind::Group(TEMPO_ASSIGNMENT_PARAMS)),
+];
 /// Shared by [`relative`] and [`fixed`], the two commands whose reference
 /// pitch is optional and, when present, decides the [`MusicContext`] their
 /// body reads in.
@@ -1336,6 +1441,8 @@ const ALTERNATIVE_DOC: &str = "Supplies the alternate endings for an enclosing `
      or `\\repeat segno`: one `{ … }` block per ending, in order, inside `music`.";
 const VOLTA_DOC: &str = "Marks `music` as belonging to volta (numbered ending) `numbers`, \
      inside an enclosing `\\repeat`.";
+const TEMPO_DOC: &str =
+    "Sets the tempo. `\\tempo \"Allegro\" 4=120` Either argument may be omitted.";
 const CLEF_DOC: &str =
     "Sets the staff's clef to `name` (`treble`, `bass`, `alto`, `tenor`, `percussion`, …).";
 const KEY_DOC: &str = "Sets the key signature to `tonic` in `mode` (e.g. `\\major`)";
@@ -1369,8 +1476,11 @@ struct Row(
 
 /// LilyPond's reserved words: every hand-written command
 /// whose only job is to consume a fixed signature and (maybe) set a fixed
-/// [`MusicContext`] for its body. `\repeat`, `\relative`, `\fixed` and
-/// `\tempo` aren't here — each needs one method [`StaticCommand`](static_command::StaticCommand)
+/// [`MusicContext`] for its body — `\tempo` included, now that
+/// [`ArgKind::Group`] can express its `duration = value` clause as a single
+/// optional, prefix-preserving piece of signature rather than a bespoke
+/// [`parse_args`](Command::parse_args). `\repeat`, `\relative` and `\fixed`
+/// still aren't here — each needs one method [`StaticCommand`](static_command::StaticCommand)
 /// can't express, so each gets its own file, wrapping a `StaticCommand` for
 /// the rest. `\volta` looks like it should join them too — an earlier
 /// version flagged one with no lexically enclosing `\repeat volta`/`\repeat
@@ -1404,6 +1514,7 @@ static RESERVED_ROWS: &[Row] = {
         Row(&["with"],                  MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
         Row(&["set"],                   PROPERTY_PARAMS,         Inherit,  None,                  &[]),
         Row(&["unset"],                 PROPERTY_PARAMS,         Inherit,  None,                  &[]),
+        Row(&["tempo"],                 TEMPO_PARAMS,            Inherit,  Some(TEMPO_DOC),       &[]),
         Row(&["include"],               INCLUDE_PARAMS,          Inherit,  None,                  &[]),
     ]
 };
@@ -1473,7 +1584,6 @@ pub static RESERVED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
         RESERVED_ROWS,
         vec![
             ("repeat", Arc::new(repeat::command()) as Arc<dyn Command>),
-            ("tempo", Arc::new(tempo::command())),
             ("version", Arc::new(version::command())),
             ("new", Arc::new(new_context::command("new", NEW_DOC))),
             (
@@ -2019,7 +2129,14 @@ mod tests {
     fn new_reads_a_named_instance() {
         let call = call("\\new Staff = \"upper\" { c }").expect("a new call");
         assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Staff"));
-        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "upper"));
+        let Arg::Group { args, .. } = &call.args[1] else {
+            panic!(
+                "expected the = name clause as a Group, got {:?}",
+                call.args[1]
+            );
+        };
+        assert!(matches!(args[0], Arg::Literal { .. }));
+        assert!(matches!(&args[1], Arg::ContextName { name, .. } if name == "upper"));
         assert!(matches!(call.args[2], Arg::Music { .. }));
         assert_eq!(call.args.len(), 3);
     }
@@ -2047,7 +2164,14 @@ mod tests {
         let src = "\\new Voice = \"vocals\" \\with { fontSize = #-2 } { c }";
         let call = call(src).expect("a new call");
         assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Voice"));
-        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "vocals"));
+        let Arg::Group { args, .. } = &call.args[1] else {
+            panic!(
+                "expected the = name clause as a Group, got {:?}",
+                call.args[1]
+            );
+        };
+        assert!(matches!(args[0], Arg::Literal { .. }));
+        assert!(matches!(&args[1], Arg::ContextName { name, .. } if name == "vocals"));
         assert!(matches!(call.args[2], Arg::Unknown { .. }));
         assert!(matches!(call.args[3], Arg::Music { .. }));
         assert_eq!(call.args.len(), 4);
@@ -2058,7 +2182,14 @@ mod tests {
         let call = call("\\context Voice = \"vocals\" { c }").expect("a context call");
         assert_eq!(call.name, "context");
         assert!(matches!(&call.args[0], Arg::ContextType { name, .. } if name == "Voice"));
-        assert!(matches!(&call.args[1], Arg::ContextName { name, .. } if name == "vocals"));
+        let Arg::Group { args, .. } = &call.args[1] else {
+            panic!(
+                "expected the = name clause as a Group, got {:?}",
+                call.args[1]
+            );
+        };
+        assert!(matches!(args[0], Arg::Literal { .. }));
+        assert!(matches!(&args[1], Arg::ContextName { name, .. } if name == "vocals"));
         assert!(matches!(call.args[2], Arg::Music { .. }));
         assert_eq!(call.args.len(), 3);
     }
@@ -2255,8 +2386,16 @@ mod tests {
     #[test]
     fn tempo_reads_a_duration_and_metronome_number() {
         let call = call("\\tempo 4 = 120").expect("a tempo call");
-        assert!(matches!(call.args[0], Arg::Count { value: 4, .. }));
-        assert!(matches!(call.args[1], Arg::Count { value: 120, .. }));
+        assert_eq!(call.args.len(), 1);
+        let Arg::Group { args, .. } = &call.args[0] else {
+            panic!(
+                "expected the duration/=/value clause as a Group, got {:?}",
+                call.args[0]
+            );
+        };
+        assert!(matches!(args[0], Arg::Count { value: 4, .. }));
+        assert!(matches!(args[1], Arg::Literal { .. }));
+        assert!(matches!(args[2], Arg::Count { value: 120, .. }));
     }
 
     #[test]
@@ -2269,19 +2408,32 @@ mod tests {
     #[test]
     fn tempo_reads_text_and_duration_together() {
         let call = call("\\tempo \"Allegro\" 4 = 120").expect("a tempo call");
-        assert_eq!(call.args.len(), 3);
+        assert_eq!(call.args.len(), 2);
         assert!(matches!(&call.args[0], Arg::String { text, .. } if text == "Allegro"));
-        assert!(matches!(call.args[1], Arg::Count { value: 4, .. }));
-        assert!(matches!(call.args[2], Arg::Count { value: 120, .. }));
+        let Arg::Group { args, .. } = &call.args[1] else {
+            panic!(
+                "expected the duration/=/value clause as a Group, got {:?}",
+                call.args[1]
+            );
+        };
+        assert!(matches!(args[0], Arg::Count { value: 4, .. }));
+        assert!(matches!(args[1], Arg::Literal { .. }));
+        assert!(matches!(args[2], Arg::Count { value: 120, .. }));
     }
 
     #[test]
     fn tempo_duration_without_an_equals_sign_stops_there() {
         // A duration with no `=` isn't a complete metronome mark; the number
-        // after it is left unconsumed rather than misread as the value.
+        // after it is left unconsumed rather than misread as the value — but
+        // the duration itself, prefix-preserving, still comes through as a
+        // one-piece Group.
         let call = call("\\tempo 4 120").expect("a tempo call");
         assert_eq!(call.args.len(), 1);
-        assert!(matches!(call.args[0], Arg::Count { value: 4, .. }));
+        let Arg::Group { args, .. } = &call.args[0] else {
+            panic!("expected a one-piece Group, got {:?}", call.args[0]);
+        };
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0], Arg::Count { value: 4, .. }));
     }
 
     /// The full [`Commands`] for `src`, nested calls and all — what

@@ -518,10 +518,19 @@ impl Document {
     /// point one past the last argument actually parsed, for a call still
     /// being typed — the `span().contains` check is what tells that apart
     /// from the cursor really landing inside this one.
+    ///
+    /// A `\new`/`\context`/`\change` instance name sits inside an
+    /// `Arg::Group` (the `= "name"` clause), not directly in `call.args`, so
+    /// an `Arg::Group` found at `site.index` is searched one level deep
+    /// before giving up — [`ArgKind::Group`](crate::command::ArgKind::Group)
+    /// only ever nests one level, so this doesn't need to recurse further.
     fn context_arg_at(&self, position: Position) -> Option<&Arg> {
         let offset = self.line_index.offset_at(position)?;
         let site = self.commands().call_site_at(offset, self.text())?;
-        let arg = site.call.args.get(site.index)?;
+        let arg = match site.call.args.get(site.index)? {
+            Arg::Group { args, .. } => args.iter().find(|arg| arg.span().contains(offset))?,
+            arg => arg,
+        };
         (arg.span().contains(offset)
             && matches!(arg, Arg::ContextType { .. } | Arg::ContextName { .. }))
         .then_some(arg)

@@ -10,7 +10,7 @@
 //! [`Arg::BareWord`] and [`Arg::Word`] →[`SemanticTokenType::KEYWORD`], as per the `\repeat volta` example above.
 //! [`Arg::ContextType`] → [`SemanticTokenType::TYPE`], e.g. `\new Staff`.
 //! [`Arg::ContextName`] → [`SemanticTokenType::VARIABLE`], e.g. `\new Staff = horns`.
-//! 
+//!
 //! # What doesn't get a token
 //!
 //! - [`Arg::String`]: a quoted `"bass"` is already a `string` node the
@@ -86,6 +86,22 @@ fn token_type_index(ty: &SemanticTokenType) -> u32 {
         .expect("emitted token type must be declared in TOKEN_TYPES") as u32
 }
 
+/// `args` and, one level deep, whatever an `Arg::Group` among them holds —
+/// the `= "name"` clause `\new`/`\context`/`\change` parse as a single
+/// [`Arg::Group`](crate::command::Arg::Group) rather than flat entries.
+/// Yields the group itself too, harmlessly, since nothing here matches that
+/// variant. [`ArgKind::Group`](crate::command::ArgKind::Group) only ever
+/// nests one level, so this doesn't need to recurse further.
+fn flat_args(args: &[Arg]) -> impl Iterator<Item = &Arg> {
+    args.iter().flat_map(|arg| {
+        let nested: &[Arg] = match arg {
+            Arg::Group { args, .. } => args,
+            _ => &[],
+        };
+        std::iter::once(arg).chain(nested.iter())
+    })
+}
+
 /// The semantic tokens for the whole of `doc`, delta-encoded and ready to
 /// return from `textDocument/semanticTokens/full`. See the module docs for
 /// which argument kinds are covered.
@@ -97,7 +113,7 @@ pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
     let mut tagged: Vec<(Span, u32)> = doc
         .commands()
         .iter()
-        .flat_map(|call| &call.args)
+        .flat_map(|call| flat_args(&call.args))
         .filter_map(|arg| match arg {
             Arg::BareWord { span, .. } | Arg::Word { span, .. } => Some((*span, keyword)),
             Arg::ContextType { span, .. } => Some((*span, context_type)),
@@ -356,7 +372,7 @@ mod tests {
                 let mut expected_spans: Vec<Span> = doc
                     .commands()
                     .iter()
-                    .flat_map(|call| &call.args)
+                    .flat_map(|call| flat_args(&call.args))
                     .filter_map(|arg| match arg {
                         Arg::BareWord { span, .. }
                         | Arg::Word { span, .. }

@@ -27,15 +27,27 @@ use super::{
 use crate::line_struct::Span;
 use crate::vocabulary::Scope;
 
-/// `type`, the optional `= "name"`, the optional `\with { … }` block, and
-/// `music` — the four pieces [`NewContextCommand::parse_args`] reads by
+/// The `= "name"` clause inside [`NEW_CONTEXT_PARAMS`], named separately
+/// because a `static`'s initialiser can't hold an inline temporary slice of
+/// non-`Copy` [`Param`]s.
+static NEW_CONTEXT_ASSIGNMENT_PARAMS: &[Param] = &[
+    Param::required("=", ArgKind::Literal("=")),
+    Param::required("name", ArgKind::ContextName),
+];
+
+/// `type`, the optional `= name` clause, the optional `\with { … }` block,
+/// and `music` — the four pieces [`NewContextCommand::parse_args`] reads by
 /// hand, listed here only so signature help and arity checks have parameter
-/// names to show; [`default_parse`](super::default_parse) never walks this,
-/// since the `= "name"` pair and the `\with` block are shapes no single
-/// [`ArgKind`] covers.
+/// names to show. `= name` is an [`ArgKind::Group`] rather than two
+/// independent optional pieces — a bare `\new Staff name` (no `=`) must not
+/// misread `name` as the following music — but
+/// [`default_parse`](super::default_parse) still never walks this on its
+/// own: the `\with` block needs its own keyword-and-block handling, and
+/// `named_context`'s flattening ([`super::parse`]) means this reader starts
+/// mid-stream rather than at a plain `escaped_word`.
 static NEW_CONTEXT_PARAMS: &[Param] = &[
     Param::required("type", ArgKind::ContextType),
-    Param::optional("name", ArgKind::ContextName),
+    Param::optional("= name", ArgKind::Group(NEW_CONTEXT_ASSIGNMENT_PARAMS)),
     Param::optional("with", ArgKind::Unknown(Cow::Borrowed("with block"))),
     Param::required("music", ArgKind::Music),
 ];
@@ -119,18 +131,8 @@ impl Command for NewContextCommand {
         };
         out.push(context_type);
 
-        // `= "name"`: a separate punctuation skip followed by the name,
-        // rather than folding `=` into the parameter's own consumption — the
-        // same choice `\tempo` makes for the literal `=` between its
-        // duration and its metronome number (`super::tempo`), the only other
-        // place in this module that steps over a fixed token mid-signature.
-        // Keeping `=` a punctuation skip means `ArgKind::ContextName` keeps
-        // its one meaning everywhere else it's used (`\lyricsto`, `\change`),
-        // rather than gaining a second, `=`-prefixed one just for this call.
-        if args.take_punct("=")
-            && let Some(name) = args.take(&ArgKind::ContextName)
-        {
-            out.push(name);
+        if let Some(assignment) = args.take(&ArgKind::Group(NEW_CONTEXT_ASSIGNMENT_PARAMS)) {
+            out.push(assignment);
         }
 
         // `\with { … }`: consumed as one `Arg::Unknown` spanning the keyword
@@ -182,6 +184,9 @@ impl Command for NewContextCommand {
     fn completions(&self, index: usize, ctx: &CompletionContext) -> Vec<Candidate> {
         match index {
             0 => context_type_candidates(ctx.scope),
+            // 1 is the whole `= name` Group — its only completable piece is
+            // `name`, so the cursor anywhere in the clause (including on the
+            // `=` itself, which offers nothing anyway) gets instance names.
             1 => context_instance_candidates(ctx.scope),
             _ => self.base.completions(index, ctx),
         }

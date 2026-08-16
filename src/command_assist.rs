@@ -322,13 +322,31 @@ fn parameter_information(param: &Param) -> ParameterInformation {
     }
 }
 
+/// Resolves an [`ArgKind::Group`] to the kind of its first non-[`Literal`](ArgKind::Literal)
+/// piece — the one a candidate could actually belong to, `=` never offering
+/// any — so [`completion_item`] can decide insertion punctuation for it the
+/// same way it would for a plain parameter. `\new`/`\context`/`\change`'s
+/// `= name` clause is the only group with completions today, and its one
+/// candidate-bearing piece is `name`; anything else passes through
+/// unchanged.
+fn resolve_group(kind: &ArgKind) -> &ArgKind {
+    match kind {
+        ArgKind::Group(sub) => sub
+            .iter()
+            .map(|p| &p.kind)
+            .find(|k| !matches!(k, ArgKind::Literal(_)))
+            .unwrap_or(kind),
+        other => other,
+    }
+}
+
 /// Renders one [`Candidate`] for `param`, adding whatever punctuation the
 /// parameter it fills calls for: a leading backslash for an [`ArgKind::Word`]
 /// value (`\major`), quotes for an [`ArgKind::String`] (`"2.24.3"`). That's
 /// the one place a candidate's on-page label and what actually needs typing
 /// differ, since [`Candidate::label`] deliberately carries neither.
 fn completion_item(param: &Param, candidate: &Candidate) -> CompletionItem {
-    let text = match param.kind {
+    let text = match resolve_group(&param.kind) {
         ArgKind::Word => format!("\\{}", candidate.label),
         // A context instance name is quoted on insertion even though a bare
         // symbol parses identically (`\new Voice = vocals` is as valid as
@@ -395,6 +413,22 @@ mod tests {
     fn signature_help_none_outside_a_call() {
         let (doc, pos) = doc_at("c d |e");
         assert!(signature_help(&doc, pos).is_none());
+    }
+
+    #[test]
+    fn signature_help_shows_grouped_clauses_as_one_bracket() {
+        // `duration = value` and `= name` are each an `ArgKind::Group`: one
+        // optional clause, not two or three independently optional pieces.
+        let (doc, pos) = doc_at("\\tempo |");
+        let help = signature_help(&doc, pos).expect("signature help");
+        assert_eq!(
+            help.signatures[0].label,
+            "\\tempo [text] [duration = value]"
+        );
+
+        let (doc, pos) = doc_at("{ \\new Staff |}");
+        let help = signature_help(&doc, pos).expect("signature help");
+        assert_eq!(help.signatures[0].label, "\\new type [= name] [with] music");
     }
 
     /// A workspace with no installation behind it, which is what every test
