@@ -862,6 +862,26 @@ impl Arg {
     }
 }
 
+/// `args` and, one level deep, whatever an [`Arg::Group`] among them holds —
+/// the `= "name"` clause `\new`/`\context`/`\change` parse as a single group
+/// rather than flat entries. Yields the group itself too, harmlessly, since
+/// no caller is looking for that variant. [`ArgKind::Group`] only ever nests
+/// one level, so this doesn't need to recurse further.
+///
+/// Shared by [`semantic_tokens`](crate::semantic_tokens), which tags the
+/// arguments it finds, and by [`Document`](crate::document::Document)'s
+/// context-reference lookups, which collect them — both want every argument a
+/// call actually holds, and neither cares about the nesting.
+pub fn flat_args(args: &[Arg]) -> impl Iterator<Item = &Arg> {
+    args.iter().flat_map(|arg| {
+        let nested: &[Arg] = match arg {
+            Arg::Group { args, .. } => args,
+            _ => &[],
+        };
+        std::iter::once(arg).chain(nested.iter())
+    })
+}
+
 /// Parses the command at `children[start]` against the [`Command`] impl
 /// `scope` resolves it to, if it resolves to one, consuming as many of its
 /// arguments as are present. `language` is the note-name language active at

@@ -48,7 +48,7 @@ use tower_lsp::lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokensLegend,
 };
 
-use crate::command::Arg;
+use crate::command::{Arg, flat_args};
 use crate::document::Document;
 use crate::line_struct::{LineIndex, Span};
 
@@ -84,22 +84,6 @@ fn token_type_index(ty: &SemanticTokenType) -> u32 {
         .iter()
         .position(|t| t == ty)
         .expect("emitted token type must be declared in TOKEN_TYPES") as u32
-}
-
-/// `args` and, one level deep, whatever an `Arg::Group` among them holds —
-/// the `= "name"` clause `\new`/`\context`/`\change` parse as a single
-/// [`Arg::Group`](crate::command::Arg::Group) rather than flat entries.
-/// Yields the group itself too, harmlessly, since nothing here matches that
-/// variant. [`ArgKind::Group`](crate::command::ArgKind::Group) only ever
-/// nests one level, so this doesn't need to recurse further.
-fn flat_args(args: &[Arg]) -> impl Iterator<Item = &Arg> {
-    args.iter().flat_map(|arg| {
-        let nested: &[Arg] = match arg {
-            Arg::Group { args, .. } => args,
-            _ => &[],
-        };
-        std::iter::once(arg).chain(nested.iter())
-    })
 }
 
 /// The semantic tokens for the whole of `doc`, delta-encoded and ready to

@@ -23,8 +23,9 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::command::{
-    ArgKind, CallSite, Candidate, Command, CompletionContext, Param, signature_label,
+    Arg, ArgKind, CallSite, Candidate, Command, CompletionContext, Param, signature_label,
 };
+use crate::context::{ContextInstance, ContextType};
 use crate::document::Document;
 use crate::line_struct::Span;
 use crate::vocabulary::Scope;
@@ -267,15 +268,27 @@ fn command_names(scope: &Scope, range: Range) -> Vec<CompletionItem> {
         .collect()
 }
 
-/// Hover documentation for the command word at `position`, if the cursor sits
-/// on one: where the command came from, what it is — a signature for most
-/// commands, a summary of the value for a variable — and its documentation
-/// where there is any. `None` when the cursor is elsewhere in a call's header or
-/// body — hovering an argument value isn't wired up here, only the command word
-/// itself — and `None` for a command with neither
+/// Hover documentation for the name at `position`.
+///
+/// On a command word: where the command came from, what it is — a signature
+/// for most commands, a summary of the value for a variable — and its
+/// documentation where there is any. `None` for a command with neither
 /// [`synopsis`](Command::synopsis) nor documentation: a popup reading just
 /// `\foo` over the `\foo` you are already looking at is worse than nothing.
+///
+/// On a context type or instance argument — the `Staff` of `\new Staff`, the
+/// `"vocals"` of `\lyricsto "vocals"` — [`context_hover`] answers instead,
+/// and is tried first: those arguments are the one part of a call's header
+/// that names something in its own right, so the "only the command word"
+/// rule the rest of a call still follows would be answering about `\new`
+/// while the cursor is on `Staff`.
+///
+/// `None` anywhere else in a call's header or body.
 pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
+    if let Some(hover) = context_hover(doc, position) {
+        return Some(hover);
+    }
+
     let (offset, site) = call_at(doc, position)?;
     if !site.call.keyword.contains(offset) {
         return None;
@@ -295,6 +308,81 @@ pub fn hover(doc: &Document, position: Position) -> Option<Hover> {
         }),
         range: Some(doc.line_index().range_of(site.call.keyword)),
     })
+}
+
+/// Hover documentation for the context type or instance at `position`, if the
+/// cursor sits on one: the same shape as a command's hover — where the name
+/// came from, then what it is — for the two namespaces
+/// [`Document::context_arg_at`] recognises, which no [`CallSite`] of their
+/// own would answer for. `None` when the cursor is anywhere else, and when
+/// the name resolves to nothing the scope knows.
+fn context_hover(doc: &Document, position: Position) -> Option<Hover> {
+    let arg = doc.context_arg_at(position)?;
+    let described = match arg {
+        Arg::ContextType { name, .. } => {
+            let known = doc.scope().get_context_type(name)?;
+            attribute(known.layer.origin(), describe_context_type(known.value)?)
+        }
+        Arg::ContextName { name, .. } => {
+            let known = doc.scope().get_context_instance(name)?;
+            attribute(
+                known.layer.origin(),
+                describe_context_instance(known.value)?,
+            )
+        }
+        _ => return None,
+    };
+
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: described,
+        }),
+        range: Some(doc.line_index().range_of(arg.span())),
+    })
+}
+
+/// `described`, with where it came from italicised above it — the attribution
+/// every hover this module renders leads with, so a context type and a
+/// command say where they came from the same way.
+fn attribute(origin: &str, described: String) -> String {
+    format!("*{origin}*\n\n{described}")
+}
+
+/// What a context type *is*, as Markdown: the name and the aliases it also
+/// answers to, then its `\description` where it has one, ruled off from each
+/// other exactly as [`describe`] rules a command's synopsis off from its
+/// documentation.
+///
+/// `None` for a type with neither a description nor an alias — a popup
+/// reading "`MyStaff` context" over the `MyStaff` you are already looking at
+/// is worse than nothing, the same rule [`hover`] follows for a command with
+/// nothing to say.
+fn describe_context_type(context_type: &ContextType) -> Option<String> {
+    let synopsis = match context_type.aliases.as_slice() {
+        [] => return context_type.description.clone(),
+        aliases => {
+            let aliases: Vec<String> = aliases.iter().map(|alias| format!("`{alias}`")).collect();
+            format!(
+                "`{}` context, also known as {}",
+                context_type.name,
+                aliases.join(", ")
+            )
+        }
+    };
+    match &context_type.description {
+        Some(description) => Some(format!("{synopsis}\n\n---\n\n{description}")),
+        None => Some(synopsis),
+    }
+}
+
+/// What a context instance *is*: which type it was created as, which is the
+/// one thing about it a `\change` or `\lyricsto` site doesn't say for itself.
+/// `None` where [`ContextInstance::type_name`] is — a half-typed `\new =
+/// "vocals"` names no type to report.
+fn describe_context_instance(instance: &ContextInstance) -> Option<String> {
+    let type_name = instance.type_name.as_ref()?;
+    Some(format!("`{}` — a `{type_name}` context", instance.name))
 }
 
 /// What a command *is*, as Markdown: its [`synopsis`](Command::synopsis), and
@@ -663,6 +751,52 @@ mod tests {
         doc_at(&format!(
             "\\layout {{ \\context {{ \\name MyStaff \\description \"Custom staff.\" }} }}\n{src}"
         ))
+    }
+
+    #[test]
+    fn hover_over_a_context_type_shows_its_description() {
+        let (doc, pos) = doc_with_a_declared_context("{ \\new My|Staff { c } }");
+        assert_eq!(markup_of(&doc, pos), "*untitled*\n\nCustom staff.");
+    }
+
+    #[test]
+    fn hover_over_a_context_type_lists_the_aliases_it_also_answers_to() {
+        let (doc, pos) = doc_at(
+            "\\layout { \\context { \\name MyStaff \\alias Staff \\description \"Custom staff.\" } }\n{ \\new My|Staff { c } }",
+        );
+        assert_eq!(
+            markup_of(&doc, pos),
+            "*untitled*\n\n`MyStaff` context, also known as `Staff`\n\n---\n\nCustom staff."
+        );
+    }
+
+    #[test]
+    fn hover_stays_quiet_over_a_context_type_with_nothing_to_say() {
+        // Neither a description nor an alias: a popup reading "`MyStaff`
+        // context" over the `MyStaff` you are looking at is worse than
+        // nothing, the same rule an undocumented command follows.
+        let (doc, pos) =
+            doc_at("\\layout { \\context { \\name MyStaff } }\n{ \\new My|Staff { c } }");
+        assert!(hover(&doc, pos).is_none());
+    }
+
+    #[test]
+    fn hover_over_a_context_instance_names_the_type_it_was_created_as() {
+        // What a `\lyricsto` site doesn't say for itself: which kind of
+        // context `"vocals"` is.
+        let (doc, pos) = doc_at("{ \\new Voice = \"vocals\" { c } \\lyricsto \"voc|als\" { la } }");
+        assert_eq!(
+            markup_of(&doc, pos),
+            "*untitled*\n\n`vocals` — a `Voice` context"
+        );
+    }
+
+    #[test]
+    fn hover_over_the_new_keyword_still_describes_the_command() {
+        // The context hover is tried first, but only claims the cursor when
+        // it really is on the type argument.
+        let (doc, pos) = doc_with_a_declared_context("{ \\n|ew MyStaff { c } }");
+        assert!(markup_of(&doc, pos).contains("\\new"));
     }
 
     #[test]

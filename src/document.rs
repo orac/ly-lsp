@@ -524,7 +524,11 @@ impl Document {
     /// an `Arg::Group` found at `site.index` is searched one level deep
     /// before giving up — [`ArgKind::Group`](crate::command::ArgKind::Group)
     /// only ever nests one level, so this doesn't need to recurse further.
-    fn context_arg_at(&self, position: Position) -> Option<&Arg> {
+    /// [`context_type_at`](Self::context_type_at) and
+    /// [`context_name_at`](Self::context_name_at) read the name out of it;
+    /// [`command_assist::hover`](crate::command_assist) wants the [`Arg`]
+    /// whole, since a hover popup has to say which range it belongs to.
+    pub(crate) fn context_arg_at(&self, position: Position) -> Option<&Arg> {
         let offset = self.line_index.offset_at(position)?;
         let site = self.commands().call_site_at(offset, self.text())?;
         let arg = match site.call.args.get(site.index)? {
@@ -655,6 +659,94 @@ impl Document {
         self.commands_defined
             .get_context_instance(name)
             .map(|instance| self.line_index.range_of(instance.span))
+    }
+
+    /// Every place this document's commands *refer to* the context type
+    /// `name` — the `Staff` of `\new Staff`, `\context Staff`, `\change Staff
+    /// = "lower"` — as LSP ranges in source order.
+    ///
+    /// The context-type counterpart of
+    /// [`reference_ranges`](Self::reference_ranges), read off the parsed
+    /// commands rather than the `reference` [`Symbol`]s for the same reason
+    /// [`context_type_at`](Self::context_type_at) exists: a context type is a
+    /// bare `symbol` node the symbol query never captures, meaningful only
+    /// through the argument position a command's signature gives it.
+    ///
+    /// A `\context { \name Foo }` *declaration* is a different grammar shape
+    /// altogether and never parses as an [`Arg::ContextType`], so — unlike
+    /// [`context_instance_reference_ranges`](Self::context_instance_reference_ranges)
+    /// — nothing has to be filtered back out here to keep declarations and
+    /// references apart.
+    pub fn context_type_reference_ranges(&self, name: &str) -> Vec<Range> {
+        self.context_arg_ranges(|arg| match arg {
+            Arg::ContextType { span, name: found } if found == name => Some(*span),
+            _ => None,
+        })
+    }
+
+    /// Every place this document's commands refer to the context instance
+    /// `name` — `\change`'s and `\lyricsto`'s targets, and any further `\new
+    /// … = "name"` — as LSP ranges in source order, *excluding* the creation
+    /// [`context_instance_creation`](Self::context_instance_creation) reports
+    /// as the definition.
+    ///
+    /// The `\new Voice = "vocals"` that creates the instance parses as an
+    /// [`Arg::ContextName`] too, so without that exclusion the creation would
+    /// be reported twice over: once as a definition and once as a reference
+    /// to itself. Commands need no such care — a `foo = …` binding and a
+    /// `\foo` call are different nodes — but a context instance is named the
+    /// same way wherever it appears.
+    pub fn context_instance_reference_ranges(&self, name: &str) -> Vec<Range> {
+        let creation = self.context_instance_creation(name);
+        self.context_arg_ranges(|arg| match arg {
+            Arg::ContextName { span, name: found } if found == name => Some(self.unquoted(*span)),
+            _ => None,
+        })
+        .into_iter()
+        .filter(|range| Some(*range) != creation)
+        .collect()
+    }
+
+    /// The ranges of every argument in the document `matching` picks out, in
+    /// source order. Sorted rather than taken as found: calls nest, so a
+    /// `\change` inside a `\new`'s body follows its enclosing call's own
+    /// arguments in [`Commands`]' keyword order while preceding none of them
+    /// in the source.
+    fn context_arg_ranges(&self, matching: impl Fn(&Arg) -> Option<Span>) -> Vec<Range> {
+        let mut spans: Vec<Span> = self
+            .commands()
+            .iter()
+            .flat_map(|call| command::flat_args(&call.args))
+            .filter_map(matching)
+            .collect();
+        spans.sort_by_key(|span| span.start);
+        spans
+            .into_iter()
+            .map(|span| self.line_index.range_of(span))
+            .collect()
+    }
+
+    /// `span` without the quotes around it, where it has any.
+    ///
+    /// An [`Arg::ContextName`] spans the whole `string` node, quotes
+    /// included, while the [`ContextInstance`] a `\new` creates spans only
+    /// the contents. Trimming here makes the two agree, so that the creating
+    /// `\new`'s own argument and the definition it declares are one range
+    /// rather than two that overlap — which is what lets
+    /// [`context_instance_reference_ranges`](Self::context_instance_reference_ranges)
+    /// filter the creation out by comparison, and what stops document
+    /// highlighting underlining one name twice at two different widths.
+    ///
+    /// [`ContextInstance`]: crate::context::ContextInstance
+    fn unquoted(&self, span: Span) -> Span {
+        let text = &self.text()[span.start..span.end];
+        match text
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            Some(_) => Span::new(span.start + 1, span.end - 1),
+            None => span,
+        }
     }
 
     pub fn reference_ranges(&self, name: &str) -> Vec<Range> {
@@ -1515,6 +1607,74 @@ mod tests {
     fn context_instance_creation_is_none_for_an_uncreated_name() {
         let doc = Document::new("{ \\lyricsto \"vocals\" { la } }".to_string());
         assert!(doc.context_instance_creation("vocals").is_none());
+    }
+
+    /// The source text each of `ranges` covers, for comparing what was found
+    /// against the words actually written.
+    fn covered<'a>(doc: &Document, src: &'a str, ranges: &[Range]) -> Vec<&'a str> {
+        ranges
+            .iter()
+            .map(|range| {
+                let start = doc.line_index().offset_at(range.start).unwrap();
+                let end = doc.line_index().offset_at(range.end).unwrap();
+                &src[start..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_type_references_are_found_in_source_order() {
+        let src = "{ \\new MyStaff { c } \\context MyStaff { d } \\new Voice { e } }";
+        let doc = Document::new(src.to_string());
+        let ranges = doc.context_type_reference_ranges("MyStaff");
+        assert_eq!(covered(&doc, src, &ranges), vec!["MyStaff", "MyStaff"]);
+        assert!(ranges[0].start < ranges[1].start);
+    }
+
+    #[test]
+    fn a_context_type_declaration_is_not_one_of_its_references() {
+        // `\name MyStaff` is a `\context { … }` directive, never an
+        // `Arg::ContextType`, so it has no business in the reference list —
+        // `context_type_declaration` is what answers for it.
+        let src = "\\layout { \\context { \\name MyStaff } }\n{ \\new MyStaff { c } }";
+        let doc = Document::new(src.to_string());
+        let ranges = doc.context_type_reference_ranges("MyStaff");
+        assert_eq!(ranges.len(), 1);
+        let start = doc.line_index().offset_at(ranges[0].start).unwrap();
+        assert!(start > src.find("\\new").unwrap());
+    }
+
+    #[test]
+    fn context_instance_references_exclude_the_new_that_created_it() {
+        // The `\new`'s own `"vocals"` is the definition, and comes back from
+        // `context_instance_creation`; reporting it here as well would double
+        // it up in find-references and in document highlighting.
+        let src = "{ \\new Voice = \"vocals\" { c } \\lyricsto \"vocals\" { la } }";
+        let doc = Document::new(src.to_string());
+        let ranges = doc.context_instance_reference_ranges("vocals");
+        assert_eq!(ranges.len(), 1);
+        let start = doc.line_index().offset_at(ranges[0].start).unwrap();
+        assert!(start > src.find("\\lyricsto").unwrap());
+    }
+
+    #[test]
+    fn a_context_instance_reference_covers_the_name_without_its_quotes() {
+        // `Arg::ContextName` spans the whole `string` node, quotes and all,
+        // where `ContextInstance::span` covers only the contents. The two
+        // have to agree, or the creation couldn't be told apart from a
+        // reference to it by range alone.
+        let src = "{ \\change Staff = \"lower\" }";
+        let doc = Document::new(src.to_string());
+        let ranges = doc.context_instance_reference_ranges("lower");
+        assert_eq!(covered(&doc, src, &ranges), vec!["lower"]);
+    }
+
+    #[test]
+    fn an_unquoted_context_instance_reference_is_covered_whole() {
+        let src = "{ \\change Staff = lower }";
+        let doc = Document::new(src.to_string());
+        let ranges = doc.context_instance_reference_ranges("lower");
+        assert_eq!(covered(&doc, src, &ranges), vec!["lower"]);
     }
 
     #[test]

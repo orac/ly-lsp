@@ -178,6 +178,12 @@ impl DocumentGraph {
     /// Document highlights for `position` in `uri`: matched bracket ranges, or
     /// all definitions/references of the symbol under the cursor, within the
     /// same document only.
+    ///
+    /// A context type or instance is looked for before the ordinary symbol,
+    /// the same order and for the same reason as in
+    /// [`goto_definition`](Self::goto_definition) — each namespace is
+    /// answered from its own tables, so highlighting `Staff` in `\new Staff`
+    /// never lights up an unrelated `Staff = { … }` variable.
     pub fn document_highlights(&self, uri: &Url, position: Position) -> Vec<DocumentHighlight> {
         if let Some(Some(pair)) = self.with_document(uri, |doc| doc.bracket_at(position)) {
             return pair
@@ -189,26 +195,40 @@ impl DocumentGraph {
                 .collect();
         }
 
-        let Some(Some(name)) =
-            self.with_document(uri, |doc| doc.symbol_at(position).map(str::to_string))
-        else {
+        let occurrences = self.with_document(uri, |doc| {
+            if let Some(name) = doc.context_type_at(position) {
+                return (
+                    doc.context_type_declaration(name).into_iter().collect(),
+                    doc.context_type_reference_ranges(name),
+                );
+            }
+            if let Some(name) = doc.context_name_at(position) {
+                return (
+                    doc.context_instance_creation(name).into_iter().collect(),
+                    doc.context_instance_reference_ranges(name),
+                );
+            }
+            match doc.symbol_at(position) {
+                Some(name) => (doc.definition_ranges(name), doc.reference_ranges(name)),
+                None => (Vec::new(), Vec::new()),
+            }
+        });
+
+        let Some((written, read)) = occurrences else {
             return Vec::new();
         };
 
-        let mut highlights = Vec::new();
-        if let Some(ranges) = self.with_document(uri, |doc| doc.definition_ranges(&name)) {
-            highlights.extend(ranges.into_iter().map(|range| DocumentHighlight {
+        let highlight = |kind| {
+            move |range| DocumentHighlight {
                 range,
-                kind: Some(DocumentHighlightKind::WRITE),
-            }));
-        }
-        if let Some(ranges) = self.with_document(uri, |doc| doc.reference_ranges(&name)) {
-            highlights.extend(ranges.into_iter().map(|range| DocumentHighlight {
-                range,
-                kind: Some(DocumentHighlightKind::READ),
-            }));
-        }
-        highlights
+                kind: Some(kind),
+            }
+        };
+        written
+            .into_iter()
+            .map(highlight(DocumentHighlightKind::WRITE))
+            .chain(read.into_iter().map(highlight(DocumentHighlightKind::READ)))
+            .collect()
     }
 
     /// Resolves go-to-definition at `position` in document `uri`.
@@ -336,22 +356,68 @@ impl DocumentGraph {
     /// whose include closure can see the definition the cursor resolves to — so
     /// unrelated files that happen to reuse the same name are not conflated, and
     /// files merely on disk are not scanned.
+    /// Tried in the same order as [`goto_definition`](Self::goto_definition),
+    /// minus the `\include` path (a file name is nobody's symbol): a context
+    /// type, a context instance, then the ordinary symbol under the cursor.
+    /// Each namespace answers for itself, so `\new MyStaff` and a variable
+    /// that happens to be called `MyStaff` are never conflated.
     pub fn references(
         &self,
         uri: &Url,
         position: Position,
         include_declaration: bool,
     ) -> Vec<Location> {
+        if let Some(Some(name)) =
+            self.with_document(uri, |doc| doc.context_type_at(position).map(str::to_string))
+        {
+            let definitions = self.context_type_definitions(&name, uri);
+            return self.gather_references(uri, definitions, include_declaration, |doc| {
+                doc.context_type_reference_ranges(&name)
+            });
+        }
+
+        if let Some(Some(name)) =
+            self.with_document(uri, |doc| doc.context_name_at(position).map(str::to_string))
+        {
+            let definitions = self.context_instance_definitions(&name, uri);
+            return self.gather_references(uri, definitions, include_declaration, |doc| {
+                doc.context_instance_reference_ranges(&name)
+            });
+        }
+
         let Some(Some(name)) =
             self.with_document(uri, |doc| doc.symbol_at(position).map(str::to_string))
         else {
             return Vec::new();
         };
 
-        // The files that define this name, as the cursor sees it. If there's no
-        // definition (e.g. a built-in), anchor on the cursor's own file so we
-        // still report its references.
         let definitions = self.definitions_of(&name, uri);
+        self.gather_references(uri, definitions, include_declaration, |doc| {
+            doc.reference_ranges(&name)
+        })
+    }
+
+    /// The find-references answer for a name whose `definitions` have already
+    /// been resolved in whichever namespace it belongs to: every range
+    /// `ranges` reads off an open document that can see one of those
+    /// definitions, plus the definitions themselves where the client asked
+    /// for them.
+    ///
+    /// The anchoring rule lives here, once, rather than in each namespace's
+    /// caller: references come only from *open* documents whose include
+    /// closure reaches a file that defines the name, so two unrelated files
+    /// reusing a spelling are never conflated and files merely on disk are
+    /// never scanned. Where there is no definition at all — a built-in
+    /// command, or a context type the install declares and no
+    /// [`Location`] can point at — the cursor's own file anchors instead, so
+    /// its references are still reported.
+    fn gather_references(
+        &self,
+        uri: &Url,
+        definitions: Vec<Location>,
+        include_declaration: bool,
+        ranges: impl Fn(&Document) -> Vec<Range>,
+    ) -> Vec<Location> {
         let anchors: HashSet<Url> = if definitions.is_empty() {
             std::iter::once(uri.clone()).collect()
         } else {
@@ -364,11 +430,9 @@ impl DocumentGraph {
             if closure.is_disjoint(&anchors) {
                 continue;
             }
-            let ranges = self
-                .with_document(&open_uri, |doc| doc.reference_ranges(&name))
-                .unwrap_or_default();
+            let found = self.with_document(&open_uri, &ranges).unwrap_or_default();
             locations.extend(
-                ranges
+                found
                     .into_iter()
                     .map(|r| Location::new(open_uri.clone(), r)),
             );
@@ -888,6 +952,154 @@ mod tests {
         assert_eq!(&src[start..end], "vocals");
         // Landed on the `\new`'s creation, before `\lyricsto`'s own reference.
         assert!(start < src.find("\\lyricsto").unwrap());
+    }
+
+    /// The source text `locations` cover, in the order they came back.
+    fn covered<'a>(src: &'a str, locations: &[Location]) -> Vec<&'a str> {
+        let lines = crate::line_struct::LineIndex::new(src);
+        locations
+            .iter()
+            .map(|location| {
+                let start = lines.offset_at(location.range.start).unwrap();
+                let end = lines.offset_at(location.range.end).unwrap();
+                &src[start..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn find_references_on_a_context_type_finds_every_new_that_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "\\layout { \\context { \\name MyStaff } }\n{ \\new MyStaff { c } \\context MyStaff { d } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let locations = ws.references(&url(&score), inside(src, "MyStaff {"), false);
+        assert_eq!(covered(src, &locations), vec!["MyStaff", "MyStaff"]);
+
+        // With the declaration asked for, the `\name` joins them.
+        let with_declaration = ws.references(&url(&score), inside(src, "MyStaff {"), true);
+        assert_eq!(with_declaration.len(), 3);
+    }
+
+    #[test]
+    fn find_references_on_a_context_type_reaches_an_including_file() {
+        // The include closure rule find-references already follows for
+        // commands: the score can see the declaration in the header, so its
+        // own `\new` counts as a reference to it.
+        let dir = tempfile::tempdir().unwrap();
+        let types = dir.path().join("types.ily");
+        let score = dir.path().join("score.ly");
+        fs::write(&types, "\\layout { \\context { \\name MyStaff } }\n").unwrap();
+        let src = "\\include \"types.ily\"\n{ \\new MyStaff { c } }\n";
+        fs::write(&score, src).unwrap();
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let locations = ws.references(&url(&score), inside(src, "MyStaff {"), false);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, url(&score));
+    }
+
+    #[test]
+    fn find_references_on_a_context_instance_skips_the_new_that_created_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "{ \\new Voice = \"vocals\" { c } \\lyricsto \"vocals\" { la } \\change Voice = \"vocals\" }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let at = inside_after(src, "\\lyricsto", "vocals");
+        let locations = ws.references(&url(&score), at, false);
+        assert_eq!(
+            covered(src, &locations),
+            vec!["vocals", "vocals"],
+            "the `\\lyricsto` and the `\\change`, not the `\\new` that created it"
+        );
+        for location in &locations {
+            let start = crate::line_struct::LineIndex::new(src)
+                .offset_at(location.range.start)
+                .unwrap();
+            assert!(start > src.find("\\lyricsto").unwrap());
+        }
+
+        assert_eq!(
+            ws.references(&url(&score), at, true).len(),
+            3,
+            "the creation comes back as the declaration instead"
+        );
+    }
+
+    #[test]
+    fn a_variable_of_the_same_name_is_not_confused_with_a_context_type() {
+        // Separate namespaces: `MyStaff = { … }` binds a command, and the
+        // `\new MyStaff` names a context type. Neither should report the
+        // other's occurrences.
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "MyStaff = { c }\n\\layout { \\context { \\name MyStaff } }\n{ \\new MyStaff { \\MyStaff } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let from_context = ws.references(&url(&score), inside(src, "MyStaff {"), false);
+        assert_eq!(covered(src, &from_context), vec!["MyStaff"]);
+        let start = crate::line_struct::LineIndex::new(src)
+            .offset_at(from_context[0].range.start)
+            .unwrap();
+        assert_eq!(start, src.find("\\new MyStaff").unwrap() + "\\new ".len());
+
+        let from_command = ws.references(&url(&score), inside(src, "\\MyStaff"), false);
+        assert_eq!(covered(src, &from_command), vec!["\\MyStaff"]);
+    }
+
+    #[test]
+    fn highlighting_a_context_type_marks_its_declaration_and_its_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "\\layout { \\context { \\name MyStaff } }\n{ \\new MyStaff { c } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let highlights = ws.document_highlights(&url(&score), inside(src, "MyStaff {"));
+        let kinds: Vec<_> = highlights.iter().map(|h| h.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(DocumentHighlightKind::WRITE),
+                Some(DocumentHighlightKind::READ)
+            ]
+        );
+    }
+
+    #[test]
+    fn highlighting_a_context_instance_covers_each_name_once() {
+        // The `\new`'s own name is the WRITE; without the creation being
+        // excluded from the references it would also come back as a READ,
+        // and the two ranges would overlap at different widths.
+        let dir = tempfile::tempdir().unwrap();
+        let score = dir.path().join("score.ly");
+        let src = "{ \\new Voice = \"vocals\" { c } \\lyricsto \"vocals\" { la } }\n";
+
+        let ws = DocumentGraph::new();
+        ws.open(url(&score), src.to_string());
+
+        let highlights =
+            ws.document_highlights(&url(&score), inside_after(src, "\\lyricsto", "vocals"));
+        assert_eq!(highlights.len(), 2);
+        let mut ranges: Vec<_> = highlights.iter().map(|h| h.range).collect();
+        ranges.dedup();
+        assert_eq!(ranges.len(), 2, "the two occurrences are distinct places");
+        let locations: Vec<Location> = highlights
+            .iter()
+            .map(|h| Location::new(url(&score), h.range))
+            .collect();
+        assert_eq!(covered(src, &locations), vec!["vocals", "vocals"]);
     }
 
     #[test]
