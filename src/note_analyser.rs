@@ -197,6 +197,30 @@ impl<'a> Analyser<'a> {
                     after_event = false;
                     i += 1;
                 }
+                // Tree-sitter wraps an in-progress construct in one `ERROR`
+                // node the moment any part of it doesn't parse cleanly yet —
+                // a bare `\new` with nothing typed after it, or an unclosed
+                // `\with { … }` (which pulls everything after it, including
+                // the `\new` call itself, into one top-level `ERROR`; see
+                // `command_assist::context_argument_completions`'s doc for
+                // `dump_tree` output of both). Recursing into it the same way
+                // as an ordinary nested block lets `handle_command` still
+                // find and record the calls inside — signature help and
+                // go-to-definition need them even while the surrounding
+                // syntax is mid-edit — but forced to `Region::NonNote`
+                // regardless of the ambient region, so nothing read out of
+                // this recovered, possibly-garbled subtree is ever misread
+                // as a note or reported as an invalid one: that's the same
+                // protection `analyse`'s own error-span filtering gives
+                // `self.problems`, applied here to `self.events` too, since
+                // an `ERROR` node's content can't be trusted the way a
+                // cleanly parsed one can (the `sn`/`bd` drum-part regression
+                // test guards exactly this).
+                "ERROR" => {
+                    self.walk(child, mode, Region::NonNote);
+                    after_event = false;
+                    i += 1;
+                }
                 "chord" if region == Region::NoteMusic => {
                     i = self.read_chord(&children, i, &mut mode);
                     after_event = true;

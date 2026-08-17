@@ -1692,18 +1692,14 @@ impl Commands {
             .filter(|call| covers(call, offset, src))
             .max_by_key(|call| call.keyword.start)?;
 
-        // The first argument the cursor hasn't yet moved past — the one it's
+        // The parameter the cursor hasn't yet moved past — the one it's
         // inside, or, in the gap before it, the one about to be typed. Past
         // every parsed argument (into the trailing reach `covers` extended us
-        // into), this is `None`, and the index falls out at `args.len()`: the
-        // next parameter the signature has yet to see.
-        let index = call
-            .args
-            .iter()
-            .position(|arg| offset <= arg.span().end)
-            .unwrap_or(call.args.len());
+        // into), this is `None`, and the index falls out at `signature().len()`
+        // at most: the next parameter the signature has yet to see.
+        let (index, matched) = align_arg_to_param(&call.args, call.cmd.signature(), offset);
 
-        if let Some(Arg::Music { span }) = call.args.get(index)
+        if let Some(Arg::Music { span }) = matched
             && span.start < offset
             && offset < span.end
         {
@@ -1712,6 +1708,72 @@ impl Commands {
 
         Some(CallSite { call, index })
     }
+}
+
+/// Aligns `args` — [`CommandCall::args`], parsed positionally, with any
+/// skipped optional parameter simply absent from the vector — against
+/// `params`, walking both in lockstep and matching each argument to the next
+/// parameter whose [`ArgKind`] it fits, skipping any parameter an argument
+/// doesn't match — the same way [`default_parse`] itself decides whether to
+/// skip an optional parameter. Returns the parameter index `offset` falls
+/// inside or is about to be typed into, together with the argument it
+/// landed inside, if any.
+///
+/// This is what [`Commands::call_site_at`] used to get by reading an
+/// argument's *position in `args`* directly as its parameter index — correct
+/// only as long as every optional parameter up to that point was actually
+/// typed. The moment one is skipped, every later argument sits one slot
+/// earlier in `args` than its parameter: `\new type \with { … }`, `[= name]`
+/// skipped, parses to `args == [type, with]`, and `with`'s `Arg` sits at
+/// `args[1]` — `[= name]`'s own slot in `signature()`, not `with`'s — so
+/// reading the index straight off `args` reports `[= name]` active for the
+/// rest of the call. Walking `params` in step with `args` and skipping a
+/// parameter whenever the next argument doesn't fit its kind keeps the two
+/// in line regardless of which optional parameters were actually typed.
+fn align_arg_to_param<'a>(
+    args: &'a [Arg],
+    params: &[Param],
+    offset: usize,
+) -> (usize, Option<&'a Arg>) {
+    let mut param_index = 0;
+    for arg in args {
+        while param_index < params.len() && !arg_matches_kind(arg, &params[param_index].kind) {
+            param_index += 1;
+        }
+        if param_index >= params.len() {
+            break;
+        }
+        if offset <= arg.span().end {
+            return (param_index, Some(arg));
+        }
+        param_index += 1;
+    }
+    (param_index.min(params.len()), None)
+}
+
+/// Whether `arg` is the [`Arg`] variant [`consume_arg`] builds from a node
+/// matching `kind` — the correspondence [`align_arg_to_param`] walks
+/// [`CommandCall::args`] against `signature()` with. Matches by variant
+/// alone (ignoring each side's payload, e.g. an [`ArgKind::Literal`]'s exact
+/// text), so it only misaligns two adjacent optional parameters that share
+/// the same kind — none of today's signatures do.
+fn arg_matches_kind(arg: &Arg, kind: &ArgKind) -> bool {
+    matches!(
+        (arg, kind),
+        (Arg::BareWord { .. }, ArgKind::BareWord)
+            | (Arg::Count { .. }, ArgKind::Count)
+            | (Arg::NumberList { .. }, ArgKind::NumberList)
+            | (Arg::Music { .. }, ArgKind::Music)
+            | (Arg::Pitch { .. }, ArgKind::Pitch)
+            | (Arg::Word { .. }, ArgKind::Word)
+            | (Arg::String { .. }, ArgKind::String)
+            | (Arg::PropertyPath { .. }, ArgKind::PropertyPath)
+            | (Arg::Unknown { .. }, ArgKind::Unknown(_))
+            | (Arg::Literal { .. }, ArgKind::Literal(_))
+            | (Arg::Group { .. }, ArgKind::Group(_))
+            | (Arg::ContextType { .. }, ArgKind::ContextType)
+            | (Arg::ContextName { .. }, ArgKind::ContextName)
+    )
 }
 
 /// Where the cursor sits with respect to one [`CommandCall`]: the call itself,

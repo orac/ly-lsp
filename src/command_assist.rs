@@ -890,6 +890,442 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "MyStaff"));
     }
 
+    /// One character's worth of state: the active parameter signature help
+    /// reports and the completion labels offered, both read immediately
+    /// after that character was inserted.
+    struct Typed {
+        active_parameter: Option<u32>,
+        completions: Vec<String>,
+    }
+
+    /// Types `typed` into `doc` one character at a time, starting at
+    /// `offset`, through [`Document::apply_change`] — the same incremental,
+    /// edit-against-the-previous-tree path a real editor drives, and
+    /// deliberately not a fresh parse of the finished text.
+    ///
+    /// That distinction is the point: [`Document`] reparses incrementally
+    /// against its old tree on every keystroke (`document.rs`'s
+    /// `apply_change`), and that path can behave differently from parsing
+    /// the same final text from scratch — an `ERROR`-recovered node from
+    /// three keystrokes ago doesn't necessarily resolve itself the same way
+    /// a fresh parse of the finished string would. A test built from
+    /// [`doc_at`] alone (single parse, cursor dropped in after the fact)
+    /// cannot see that difference; only replaying the keystrokes can. The
+    /// signature-help/completion flicker reported while typing `\new` is
+    /// exactly this: real, only visible mid-edit.
+    ///
+    /// Returns one [`Typed`] per character of `typed`, so a caller can
+    /// inspect the state after any prefix has been typed — in particular
+    /// the state immediately before and after each space, which is what the
+    /// tests below check.
+    fn type_and_record(mut doc: Document, mut offset: usize, typed: &str) -> Vec<Typed> {
+        use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
+
+        typed
+            .chars()
+            .map(|ch| {
+                let pos = doc.line_index().position_at(offset);
+                doc.apply_change(TextDocumentContentChangeEvent {
+                    range: Some(Range::new(pos, pos)),
+                    range_length: None,
+                    text: ch.to_string(),
+                });
+                offset += ch.len_utf8();
+                let cursor = doc.line_index().position_at(offset);
+                Typed {
+                    active_parameter: signature_help(&doc, cursor).and_then(|h| h.active_parameter),
+                    completions: labels_at(&doc, cursor, &no_install(&doc)),
+                }
+            })
+            .collect()
+    }
+
+    /// The [`Typed`] state right before and right after the first space
+    /// following `marker` in the string [`type_and_record`] typed —
+    /// `marker` being the token that precedes the whitespace boundary a test
+    /// wants to check, e.g. `"\\new"` for the space between `\new` and
+    /// whatever context type follows it. `marker` must appear in the typed
+    /// string with exactly one space right after it, on pain of a panic
+    /// that names what went wrong rather than an out-of-bounds index.
+    fn gap<'a>(trace: &'a [Typed], typed: &str, marker: &str) -> (&'a Typed, &'a Typed) {
+        let after_marker = typed
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker:?} not found in {typed:?}"))
+            + marker.len();
+        assert_eq!(
+            typed.as_bytes().get(after_marker),
+            Some(&b' '),
+            "{marker:?} in {typed:?} must be followed by a single space"
+        );
+        (&trace[after_marker - 1], &trace[after_marker])
+    }
+
+    /// What [`assert_state`] expects [`Typed::completions`] to look like at
+    /// one checkpoint — not just whether the list is empty, but which
+    /// candidate source it should have come from, so a passing test proves
+    /// the right *kind* of completion was offered, not merely a non-empty
+    /// one.
+    enum Completions {
+        /// No candidates — an open-ended parameter (`with`, `music`) or a
+        /// parameter with a closed set that happens to have none typed yet.
+        None,
+        /// `label` is among the candidates offered, from whichever source
+        /// (context types, context instances, …) is active at that point.
+        Contains(&'static str),
+        /// The generic every-command-in-scope fallback
+        /// ([`command_names`]/[`word_being_typed`]) — what a cursor mid-word
+        /// gets when nothing more specific claims the position first. Typing
+        /// an engraver name inside `\with { … }` lands here for want of a
+        /// dedicated with-block completion source; that's a known gap of
+        /// its own, not part of what this test pins down, so it's only
+        /// checked for shape (non-empty, contains an ordinary command) not
+        /// content.
+        VocabularyFallback,
+    }
+
+    /// Checks both halves of [`Typed`] against what a checkpoint should show:
+    /// the active parameter signature help reports, and — per `expect` —
+    /// what [`completions`] offers there. `label` names the checkpoint in
+    /// any failure message.
+    fn assert_state(
+        state: &Typed,
+        active_parameter: Option<u32>,
+        expect: Completions,
+        label: &str,
+    ) {
+        assert_eq!(
+            state.active_parameter, active_parameter,
+            "{label}: active parameter"
+        );
+        match expect {
+            Completions::None => assert!(
+                state.completions.is_empty(),
+                "{label}: expected no completions, got {:?}",
+                state.completions
+            ),
+            Completions::Contains(want) => assert!(
+                state.completions.iter().any(|got| got == want),
+                "{label}: expected {want:?} among completions, got {:?}",
+                state.completions
+            ),
+            Completions::VocabularyFallback => assert!(
+                state.completions.iter().any(|got| got == "\\relative"),
+                "{label}: expected the whole-vocabulary fallback (containing \\relative), got {:?}",
+                state.completions
+            ),
+        }
+    }
+
+    /// A document with a declared `MyStaff` context type and one existing
+    /// `Voice` instance named `"existing"` — the same no-install-needed
+    /// setup [`doc_with_a_declared_context`] uses for hover, extended with
+    /// an instance so the `[= name]` parameter's completions
+    /// (`context_instance_candidates`) have something to offer besides the
+    /// call being typed. The cursor sits inside an already-open `{ }` block
+    /// — the ordinary place to start typing a `\new`.
+    fn doc_ready_for_new() -> (Document, usize) {
+        let text = "\\layout { \\context { \\name MyStaff } }\n\
+             { \\new Voice = \"existing\" { c } }\n\
+             { }\n"
+            .to_string();
+        let offset = text.rfind("{ }").unwrap() + 2; // between "{ " and "}"
+        (Document::new(text), offset)
+    }
+
+    /// A bare `\new` with nothing typed after it yet parses into an `ERROR`
+    /// node ([`context_argument_completions`]'s doc explains why), which
+    /// used to lose the call for [`signature_help`] entirely — nothing was
+    /// reported active at all, rather than the `type` parameter (index 0)
+    /// [`context_argument_completions`] was already, separately, offering
+    /// context-type completions for at this exact spot. Fixed by
+    /// `note_analyser::Analyser::walk`'s `"ERROR"` arm, which recurses into
+    /// an error-recovered node instead of skipping it, so `handle_command`
+    /// still finds and records the call inside.
+    #[test]
+    fn signature_help_tracks_the_type_parameter_at_a_bare_new() {
+        let typed = "\\new MyStaff";
+        let (doc, offset) = doc_ready_for_new();
+        let trace = type_and_record(doc, offset, typed);
+        let (before, after) = gap(&trace, typed, "\\new");
+
+        assert_state(
+            before,
+            Some(0),
+            Completions::Contains("MyStaff"),
+            "before the space after \\new",
+        );
+        assert_state(
+            after,
+            Some(0),
+            Completions::Contains("MyStaff"),
+            "after the space after \\new",
+        );
+    }
+
+    /// Every combination of `\new`'s two optional pieces — `[= name]` and
+    /// `[\with { … }]` — typed out in full, checking both [`signature_help`]'s
+    /// active parameter and what [`completions`] offers at every whitespace
+    /// boundary in the call's header (`music`'s own body is excluded:
+    /// [`Commands::call_site_at`] is documented to report nothing once the
+    /// cursor is inside an already-open music body, which is intentional,
+    /// not a gap this test is about).
+    ///
+    /// Parameter indices throughout: 0 = `type`, 1 = `[= name]`, 2 = `with`,
+    /// 3 = `music`.
+    mod new_signature_help_through_every_combination {
+        use super::*;
+
+        /// Both optional pieces present.
+        #[test]
+        fn name_and_with() {
+            let typed = "\\new MyStaff = \"piano\" \\with { \\consists some_engraver } { music }";
+            let (doc, offset) = doc_ready_for_new();
+            let trace = type_and_record(doc, offset, typed);
+
+            let (before, after) = gap(&trace, typed, "\\new");
+            assert_state(
+                before,
+                Some(0),
+                Completions::Contains("MyStaff"),
+                "before \\new's space: type",
+            );
+            assert_state(
+                after,
+                Some(0),
+                Completions::Contains("MyStaff"),
+                "after \\new's space: still type",
+            );
+
+            let (before, after) = gap(&trace, typed, "MyStaff");
+            assert_state(
+                before,
+                Some(0),
+                Completions::Contains("MyStaff"),
+                "before the space after the type: still type",
+            );
+            assert_state(
+                after,
+                Some(1),
+                Completions::Contains("\"existing\""),
+                "after the space after the type: = name",
+            );
+
+            // `[= name]` is one `ArgKind::Group`, matched prefix-preserving
+            // (see `consume_group`): `=` alone, with nothing typed after it,
+            // already counts as a complete one-piece group, so once the
+            // cursor moves past the trailing whitespace it falls straight
+            // through to `with` (index 2) rather than staying on `[= name]`
+            // until an actual name follows — a quirk of the same shape as
+            // the other two this test pins, but pre-existing and out of
+            // scope here, so this only records it, rather than trying to
+            // fix it too.
+            let (before, after) = gap(&trace, typed, "=");
+            assert_state(
+                before,
+                Some(1),
+                Completions::Contains("\"existing\""),
+                "before the space after =: = name",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after =: with, even with no name typed yet",
+            );
+
+            let (before, after) = gap(&trace, typed, "\"piano\"");
+            assert_state(
+                before,
+                Some(1),
+                Completions::Contains("\"existing\""),
+                "before the space after the name: still = name",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after the name: with",
+            );
+
+            // The cursor sits right at the end of the word `\with` itself
+            // here, the same "mid-word" spot `\consists` is caught in
+            // below — so it gets the same vocabulary fallback, not `with`'s
+            // own (empty) candidate list.
+            let (before, after) = gap(&trace, typed, "\\with");
+            assert_state(
+                before,
+                Some(2),
+                Completions::VocabularyFallback,
+                "before the space after \\with: with",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after \\with: still with",
+            );
+
+            // While the `\with` block is open and not yet closed, the whole
+            // call sits inside an `ERROR`-recovered node — the same shape as
+            // the bare-`\new` dead spot above, and fixed the same way — so
+            // it stays on `with` throughout the block's own body rather than
+            // going dark.
+            let (before, after) = gap(&trace, typed, "{");
+            assert_state(
+                before,
+                Some(2),
+                Completions::None,
+                "before the space after \\with's opening brace: with",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after \\with's opening brace: still with",
+            );
+
+            let (before, after) = gap(&trace, typed, "\\consists");
+            assert_state(
+                before,
+                Some(2),
+                Completions::VocabularyFallback,
+                "before the space after \\consists, inside \\with: with",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after \\consists, inside \\with: still with",
+            );
+
+            let (before, after) = gap(&trace, typed, "some_engraver");
+            assert_state(
+                before,
+                Some(2),
+                Completions::None,
+                "before the space after the engraver name, inside \\with: with",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after the engraver name, inside \\with: still with",
+            );
+
+            let (before, after) = gap(&trace, typed, "}");
+            assert_state(
+                before,
+                Some(2),
+                Completions::None,
+                "before the space after \\with's closing brace: with",
+            );
+            assert_state(
+                after,
+                Some(3),
+                Completions::None,
+                "after the space after \\with's closing brace: music",
+            );
+        }
+
+        /// `[= name]` present, `[\with]` never typed at all: signature help
+        /// cannot know in advance that `\with` is about to be skipped, so
+        /// once the name is complete the next parameter it reports is still
+        /// `with` (index 2) — the next one in declaration order — not
+        /// `music` (index 3), even though that is what actually follows.
+        #[test]
+        fn name_only() {
+            let typed = "\\new MyStaff = \"piano\" { music }";
+            let (doc, offset) = doc_ready_for_new();
+            let trace = type_and_record(doc, offset, typed);
+
+            let (before, after) = gap(&trace, typed, "\"piano\"");
+            assert_state(
+                before,
+                Some(1),
+                Completions::Contains("\"existing\""),
+                "before the space after the name: = name",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after the name, with never typed: with",
+            );
+        }
+
+        /// `[\with]` present, `[= name]` skipped.
+        #[test]
+        fn with_only() {
+            let typed = "\\new MyStaff \\with { \\consists some_engraver } { music }";
+            let (doc, offset) = doc_ready_for_new();
+            let trace = type_and_record(doc, offset, typed);
+
+            let (before, after) = gap(&trace, typed, "MyStaff");
+            assert_state(
+                before,
+                Some(0),
+                Completions::Contains("MyStaff"),
+                "before the space after the type: still type",
+            );
+            assert_state(
+                after,
+                Some(1),
+                Completions::Contains("\"existing\""),
+                "after the space after the type: = name (still offered, even though about to be skipped)",
+            );
+
+            let (before, after) = gap(&trace, typed, "\\with");
+            assert_state(
+                before,
+                Some(2),
+                Completions::VocabularyFallback,
+                "before the space after \\with, name skipped: with",
+            );
+            assert_state(
+                after,
+                Some(2),
+                Completions::None,
+                "after the space after \\with, name skipped: still with",
+            );
+
+            let (before, after) = gap(&trace, typed, "}");
+            assert_state(
+                before,
+                Some(2),
+                Completions::None,
+                "before the space after \\with's closing brace, name skipped: with",
+            );
+            assert_state(
+                after,
+                Some(3),
+                Completions::None,
+                "after the space after \\with's closing brace, name skipped: music",
+            );
+        }
+
+        /// Neither optional piece present.
+        #[test]
+        fn neither() {
+            let typed = "\\new MyStaff { music }";
+            let (doc, offset) = doc_ready_for_new();
+            let trace = type_and_record(doc, offset, typed);
+
+            let (before, after) = gap(&trace, typed, "MyStaff");
+            assert_state(
+                before,
+                Some(0),
+                Completions::Contains("MyStaff"),
+                "before the space after the type: still type",
+            );
+            assert_state(
+                after,
+                Some(1),
+                Completions::Contains("\"existing\""),
+                "after the space after the type: = name (still offered, even though about to be skipped)",
+            );
+        }
+    }
+
     #[test]
     fn an_unrelated_bare_reserved_word_is_unaffected_by_the_context_fallback() {
         // `keyword_awaiting_its_first_argument` only recognises
