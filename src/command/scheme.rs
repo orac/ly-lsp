@@ -336,8 +336,17 @@ fn arg_kind(predicate: &str) -> ArgKind {
         // isn't matched, which is the safe failure (see [`consume_arg`]).
         "symbol-list-or-symbol?" | "key-list-or-symbol?" => ArgKind::PropertyPath,
         // `\time`'s beat structure (`\time 3,3,2 8/8`) is written exactly
-        // like `\volta`'s numbers.
-        "number-list?" => ArgKind::NumberList,
+        // like `\volta`'s numbers, under either name LilyPond has given the
+        // predicate: `number-list?` through 2.24, renamed to
+        // `optionally-grouped-beat-structure?` from 2.26 (which also allows
+        // a list-of-lists grouped form — Scheme syntax this doesn't parse,
+        // so it's simply not matched, the safe failure `consume_arg`
+        // describes).
+        "number-list?" | "optionally-grouped-beat-structure?" => ArgKind::NumberList,
+        // `\tuplet`'s ratio and `\time`'s own time signature — `3/2`, `4/4` —
+        // under either name LilyPond has given the latter predicate:
+        // `fraction?` through 2.24, renamed to `time-signature?` from 2.26.
+        "fraction?" | "time-signature?" => ArgKind::Fraction,
         other => ArgKind::Unknown(Cow::Owned(other.to_string())),
     }
 }

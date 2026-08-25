@@ -1339,4 +1339,22 @@ mod tests {
             vec!["volta", "unfold", "percent", "tremolo", "segno"]
         );
     }
+
+    #[test]
+    fn signature_help_clears_its_active_parameter_right_past_a_closed_string() {
+        // A quoted string's span already ends at its own closing quote, so
+        // typing (or just moving the cursor) one more byte past it can never
+        // still be extending `filename` — unlike a bareword or number, which
+        // has nothing stopping it from growing right there. Both offsets
+        // sit in the trailing whitespace `covers` bridges (see
+        // `call_site_just_past_a_half_typed_argument` in `command::mod`), so
+        // getting this right is `align_arg_to_param`'s job, not `covers`'.
+        let (doc, pos) = doc_at("\\include \"foo.ly\"|");
+        let help = signature_help(&doc, pos).expect("signature help");
+        assert_eq!(help.active_parameter, None);
+
+        let (doc, pos) = doc_at("\\include \"foo.ly\" |");
+        let help = signature_help(&doc, pos).expect("signature help");
+        assert_eq!(help.active_parameter, None);
+    }
 }

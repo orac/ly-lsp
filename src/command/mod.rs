@@ -276,6 +276,10 @@ pub enum ArgKind {
     Count,
     /// A comma-separated list of unsigned integers — the `2,3` of `\volta 2,3`.
     NumberList,
+    /// A time-signature-shaped fraction — the `4/4` of `\time 4/4`. A single
+    /// `fraction` token in the grammar (`unsignedInteger '/' unsignedInteger`
+    /// lexed as one), not two numbers either side of a `/` punctuation node.
+    Fraction,
     /// A music expression: a `{ … }` or `<< … >>` block, or a single braceless
     /// note or chord (`\repeat percent 4 c2`).
     Music,
@@ -788,6 +792,11 @@ pub enum Arg {
         span: Span,
         values: Vec<u32>,
     },
+    /// An [`ArgKind::Fraction`] argument: the value isn't needed anywhere yet
+    /// (see [`Arg::Unknown`]/[`Arg::Literal`]), so only the span is kept.
+    Fraction {
+        span: Span,
+    },
     Music {
         span: Span,
     },
@@ -848,6 +857,7 @@ impl Arg {
             Arg::BareWord { span, .. }
             | Arg::Count { span, .. }
             | Arg::NumberList { span, .. }
+            | Arg::Fraction { span }
             | Arg::Music { span }
             | Arg::Pitch { span, .. }
             | Arg::Word { span, .. }
@@ -1025,6 +1035,12 @@ fn consume_arg(
             Some((Arg::Count { span, value }, i + 1))
         }
         ArgKind::NumberList => consume_number_list(children, i, src),
+        ArgKind::Fraction if node.kind() == "fraction" => Some((
+            Arg::Fraction {
+                span: node_span(node),
+            },
+            i + 1,
+        )),
         ArgKind::Music if is_block(node.kind()) => Some((
             Arg::Music {
                 span: node_span(node),
@@ -1051,19 +1067,24 @@ fn consume_arg(
         ArgKind::ContextName => consume_context_name(children, i, src),
         ArgKind::PropertyPath => consume_property_path(children, i, src),
         ArgKind::Group(sub_params) => consume_group(sub_params, children, i, src, language),
-        // `Unknown` must never claim a node `ArgKind::Music` would also claim.
-        // It has no shape check of its own — that's the whole point of it —
-        // so an *optional* `Unknown` parameter would otherwise consume
-        // whatever sits next unconditionally, including the real music
-        // argument that follows when the optional one was simply omitted.
-        // `\tuplet 3/2 { c d e }` is the case that matters most: the
-        // (optional, unmapped) tuplet-span predicate sits directly before the
-        // required music, and every real score omits the span. Declining
-        // here is what makes that `Unknown` parameter fail to match instead
-        // of swallowing the block whole, so `default_parse` skips it (it's
-        // optional) and tries the block against `music` instead, where it
-        // belongs. See `looks_like_music`.
-        ArgKind::Unknown(_) if !looks_like_music(node.kind()) => Some((
+        // `Unknown` must never claim a node `ArgKind::Music` or
+        // `ArgKind::Fraction` would also claim. It has no shape check of its
+        // own — that's the whole point of it — so an *optional* `Unknown`
+        // parameter would otherwise consume whatever sits next
+        // unconditionally, including the real argument that follows when the
+        // optional one was simply omitted. `\tuplet 3/2 { c d e }` is the
+        // case that matters most for music: the (optional, unmapped)
+        // tuplet-span predicate sits directly before the required music, and
+        // every real score omits the span. Declining here is what makes that
+        // `Unknown` parameter fail to match instead of swallowing the block
+        // whole, so `default_parse` skips it (it's optional) and tries the
+        // block against `music` instead, where it belongs. `\time`'s own
+        // beat-structure predicate — unmapped as of LilyPond 2.26, having
+        // been renamed from `number-list?` — is the equivalent case for
+        // `Fraction`: without this, it would swallow the `4/4` meant for the
+        // required `fraction` parameter right after it. See
+        // `looks_like_a_typed_shape`.
+        ArgKind::Unknown(_) if !looks_like_a_typed_shape(node.kind()) => Some((
             Arg::Unknown {
                 span: node_span(node),
             },
@@ -1116,12 +1137,13 @@ fn consume_group(
     Some((Arg::Group { span, args }, i))
 }
 
-/// Whether `kind` is a node [`ArgKind::Music`] would itself consume: a `{ … }`
-/// or `<< … >>` block, or the leading token of a braceless note or chord.
+/// Whether `kind` is a node some more specific [`ArgKind`] would itself
+/// consume — [`Music`](ArgKind::Music)'s `{ … }`/`<< … >>` block or braceless
+/// note/chord, or [`Fraction`](ArgKind::Fraction)'s `fraction` token.
 /// [`ArgKind::Unknown`] must decline these — see the comment where it's
 /// matched in [`consume_arg`].
-fn looks_like_music(kind: &str) -> bool {
-    is_block(kind) || kind == "symbol" || kind == "chord"
+fn looks_like_a_typed_shape(kind: &str) -> bool {
+    is_block(kind) || kind == "symbol" || kind == "chord" || kind == "fraction"
 }
 
 /// Consumes a braceless music argument — a single note or chord written without
@@ -1697,7 +1719,7 @@ impl Commands {
         // every parsed argument (into the trailing reach `covers` extended us
         // into), this is `None`, and the index falls out at `signature().len()`
         // at most: the next parameter the signature has yet to see.
-        let (index, matched) = align_arg_to_param(&call.args, call.cmd.signature(), offset);
+        let (index, matched) = align_arg_to_param(&call.args, call.cmd.signature(), offset, src);
 
         if let Some(Arg::Music { span }) = matched
             && span.start < offset
@@ -1730,10 +1752,21 @@ impl Commands {
 /// rest of the call. Walking `params` in step with `args` and skipping a
 /// parameter whenever the next argument doesn't fit its kind keeps the two
 /// in line regardless of which optional parameters were actually typed.
+///
+/// `offset` sitting exactly at an argument's own span end counts as still
+/// inside it, generously — `src` is needed for the one case where that's
+/// wrong. A bareword, number or fraction has nothing stopping it from
+/// growing if another character is typed right there, so the current
+/// argument staying active until a separator actually appears is the useful
+/// answer. A quoted string is different: its span's last byte is already the
+/// closing quote, so typing right past it can never extend the string —
+/// [`quoted_string_closes_at_its_own_end`] recognises that shape and treats
+/// `offset` landing exactly there as past it instead.
 fn align_arg_to_param<'a>(
     args: &'a [Arg],
     params: &[Param],
     offset: usize,
+    src: &str,
 ) -> (usize, Option<&'a Arg>) {
     let mut param_index = 0;
     for arg in args {
@@ -1743,12 +1776,29 @@ fn align_arg_to_param<'a>(
         if param_index >= params.len() {
             break;
         }
-        if offset <= arg.span().end {
+        let end = arg.span().end;
+        let still_inside = if quoted_string_closes_at_its_own_end(arg, src) {
+            offset < end
+        } else {
+            offset <= end
+        };
+        if still_inside {
             return (param_index, Some(arg));
         }
         param_index += 1;
     }
     (param_index.min(params.len()), None)
+}
+
+/// Whether `arg` is an [`Arg::String`] read from a quoted `"…"` — as opposed
+/// to the bare-symbol shape [`consume_string`] accepts for the same
+/// [`ArgKind::String`] — so that its span's last byte is the closing quote
+/// itself. See [`align_arg_to_param`] for why that makes it, uniquely among
+/// argument shapes, unable to grow from a character typed right past its own
+/// end.
+fn quoted_string_closes_at_its_own_end(arg: &Arg, src: &str) -> bool {
+    matches!(arg, Arg::String { .. })
+        && src.as_bytes().get(arg.span().end.wrapping_sub(1)) == Some(&b'"')
 }
 
 /// Whether `arg` is the [`Arg`] variant [`consume_arg`] builds from a node
@@ -1763,6 +1813,7 @@ fn arg_matches_kind(arg: &Arg, kind: &ArgKind) -> bool {
         (Arg::BareWord { .. }, ArgKind::BareWord)
             | (Arg::Count { .. }, ArgKind::Count)
             | (Arg::NumberList { .. }, ArgKind::NumberList)
+            | (Arg::Fraction { .. }, ArgKind::Fraction)
             | (Arg::Music { .. }, ArgKind::Music)
             | (Arg::Pitch { .. }, ArgKind::Pitch)
             | (Arg::Word { .. }, ArgKind::Word)
@@ -1796,12 +1847,31 @@ pub struct CallSite<'a> {
 /// whitespace immediately following it that the user may still be typing
 /// into — contains `offset`. See [`Commands::call_site_at`] for why the
 /// trailing-whitespace reach matters.
+///
+/// Right at the far end of that reach, where real (non-whitespace) source
+/// resumes, `call` covers `offset` only if it still has a parameter left
+/// unfilled — `\new Staff` reaching up to a pre-existing `}` right after
+/// (nothing typed for `[= name]`/`with`/the required `music` yet) is exactly
+/// the "about to type the next piece" case this function exists for: the
+/// call is plainly not done, whatever sits next. But `\time 4/4` has matched
+/// every parameter in its signature, so extending its reach onto whatever
+/// comes next (a note, another call, …) has nothing left for that content to
+/// mean — without this check it would linger there anyway, misreporting
+/// `\time`'s signature (with no parameter actually active) at the start of
+/// unrelated content one call over.
 fn covers(call: &CommandCall, offset: usize, src: &str) -> bool {
     if call.span.contains(offset) {
         return true;
     }
     let reach = call.span.end + trailing_whitespace_len(src, call.span.end);
-    call.span.end <= offset && offset <= reach
+    if !(call.span.end <= offset && offset <= reach) {
+        return false;
+    }
+    if offset < reach || reach == src.len() {
+        return true;
+    }
+    let (index, _) = align_arg_to_param(&call.args, call.cmd.signature(), offset, src);
+    index < call.cmd.signature().len()
 }
 
 /// The length, in bytes, of the run of ASCII whitespace starting at `from`.
