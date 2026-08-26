@@ -1457,6 +1457,55 @@ static CLEF_NAME_CANDIDATES: &[Candidate] = &[
 ];
 static CLEF_COMPLETIONS: &[&[Candidate]] = &[CLEF_NAME_CANDIDATES];
 
+/// `\language`'s note-name language, offered at its `language` parameter
+/// (index 0). Mirrors [`note_names::Language`](crate::note_names::Language)'s
+/// thirteen variants, one spelling each — the ASCII form where a language
+/// also accepts an accented one (`francais` alongside `français`), since
+/// that's the one worth typing to completion.
+static LANGUAGE_NAME_CANDIDATES: &[Candidate] = &[
+    Candidate::new(
+        "catalan",
+        "Catalan note names (do, re, mi, fa, sol, la, si).",
+    ),
+    Candidate::new(
+        "deutsch",
+        "German note names (c, d, e, f, g, a, h), with is/es for sharp/flat.",
+    ),
+    Candidate::new(
+        "english",
+        "English note names (c, d, e, f, g, a, b), with s/f for sharp/flat.",
+    ),
+    Candidate::new(
+        "espanol",
+        "Spanish note names (do, re, mi, fa, sol, la, si).",
+    ),
+    Candidate::new(
+        "francais",
+        "French note names (do, re, mi, fa, sol, la, si).",
+    ),
+    Candidate::new(
+        "italiano",
+        "Italian note names (do, re, mi, fa, sol, la, si).",
+    ),
+    Candidate::new(
+        "nederlands",
+        "Dutch note names (c, d, e, f, g, a, b); LilyPond's default.",
+    ),
+    Candidate::new("norsk", "Norwegian note names (c, d, e, f, g, a, h)."),
+    Candidate::new(
+        "portugues",
+        "Portuguese note names (do, re, mi, fa, sol, la, si).",
+    ),
+    Candidate::new("semi-german", "German note names, identical to deutsch."),
+    Candidate::new("suomi", "Finnish note names (c, d, e, f, g, a, h)."),
+    Candidate::new("svenska", "Swedish note names (c, d, e, f, g, a, h)."),
+    Candidate::new(
+        "vlaams",
+        "Flemish note names (do, re, mi, fa, sol, la, si).",
+    ),
+];
+static LANGUAGE_COMPLETIONS: &[&[Candidate]] = &[LANGUAGE_NAME_CANDIDATES];
+
 /// `\key`'s mode word, offered at its `mode` parameter (index 1); index 0
 /// (the tonic pitch) is open-ended, so it gets no candidates of its own.
 static KEY_MODE_CANDIDATES: &[Candidate] = &[
@@ -1578,7 +1627,7 @@ static CURATED_ROWS: &[Row] = {
     &[
         Row(&["volta"],                 VOLTA_PARAMS,            Inherit,  Some(VOLTA_DOC),       &[]),
         Row(&["clef"],                  CLEF_PARAMS,             Inherit,  Some(CLEF_DOC),        CLEF_COMPLETIONS),
-        Row(&["language"],              LANGUAGE_PARAMS,         Inherit,  None,                  &[]),
+        Row(&["language"],              LANGUAGE_PARAMS,         Inherit,  None,                  LANGUAGE_COMPLETIONS),
         Row(&["key"],                   KEY_PARAMS,              Inherit,  Some(KEY_DOC),         KEY_COMPLETIONS),
         Row(&["transpose"],             TRANSPOSE_PARAMS,        Inherit,  Some(TRANSPOSE_DOC),   &[]),
     ]
