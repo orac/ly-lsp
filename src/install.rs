@@ -22,6 +22,7 @@ use crate::command::Command;
 use crate::command::variable::Variable;
 use crate::context::{self, ContextType};
 use crate::document;
+use crate::note_names::NoteNames;
 use crate::vocabulary::Layer;
 
 /// The files LilyPond's own bootstrap (`ly/declarations-init.ly`, `\include`d
@@ -78,14 +79,20 @@ pub fn context_file_names() -> &'static [&'static str] {
     CONTEXT_FILES
 }
 
-/// Builds the install [`Layer`] by reading [`FILES`] out of `ly_dir`, in
+/// Builds the install [`Layer`] by reading [`FILES`] out of `share_dir`'s
+/// `ly` directory, in
 /// order, and folding every file's bindings into one map. A name bound more
 /// than once — within a file, or by a later file in the list — keeps the
 /// last binding, which is LilyPond's own resolution order: it parses these
 /// files in this same sequence.
 ///
+/// `share_dir` is the version-specific share directory
+/// (`share/lilypond/2.24.3`) rather than the `ly` directory under it, because
+/// the layer's third piece of knowledge — the note-name languages
+/// [`NoteNames::read`] reads — lives in a sibling directory, `scm/lily`.
+///
 /// A file that can't be read (a version whose layout has shifted, a
-/// permissions problem, `ly_dir` not existing at all) is skipped rather than
+/// permissions problem, `share_dir` not existing at all) is skipped rather than
 /// failing the whole load: a smaller install layer beats none, and the
 /// alternative is refusing every score undefined-reference diagnostics just
 /// because one file went missing.
@@ -107,7 +114,13 @@ pub fn context_file_names() -> &'static [&'static str] {
 /// `\context { \Staff … }` relies on `\Staff` being a real reference to the
 /// `Staff` context definition, exactly as an ordinary zero-argument name
 /// would be.
-pub fn load(ly_dir: &Path) -> Layer {
+///
+/// Carries the installation's note-name languages as well, so that a
+/// [`Scope`](crate::vocabulary::Scope) built on this layer resolves pitches
+/// and completes `\language` against the same version everything else here
+/// came from.
+pub fn load(share_dir: &Path) -> Layer {
+    let ly_dir = &share_dir.join("ly");
     let mut commands: HashMap<String, Arc<dyn Command>> = HashMap::new();
     for file in FILES {
         let Ok(text) = std::fs::read_to_string(ly_dir.join(file)) else {
@@ -151,7 +164,9 @@ pub fn load(ly_dir: &Path) -> Layer {
             .or_insert_with(|| Arc::new(Variable::new(name.clone())) as Arc<dyn Command>);
     }
 
-    Layer::new(origin(ly_dir), commands).with_context_types(context_types)
+    Layer::new(origin(share_dir), commands)
+        .with_context_types(context_types)
+        .with_note_names(Arc::new(NoteNames::read(share_dir)))
 }
 
 /// Folds `performer`'s declaration of a context type into `engraver`'s,
@@ -195,8 +210,8 @@ pub fn version(share_dir: &Path) -> Option<&str> {
 /// What hover calls this layer: `lilypond-2.24.3`, naming the version whose
 /// files it read. A directory that doesn't name a [`version`] still names
 /// LilyPond, just not which one.
-fn origin(ly_dir: &Path) -> String {
-    match ly_dir.parent().and_then(version) {
+fn origin(share_dir: &Path) -> String {
+    match version(share_dir) {
         Some(version) => format!("lilypond-{version}"),
         None => "lilypond".to_string(),
     }
@@ -208,23 +223,32 @@ mod tests {
 
     #[test]
     fn a_missing_directory_yields_an_empty_layer_rather_than_failing() {
-        let layer = load(Path::new("/does/not/exist/ever/ly"));
+        let layer = load(Path::new("/does/not/exist/ever"));
         assert!(layer.is_empty());
     }
 
     #[test]
     fn the_layer_is_named_for_the_version_it_read() {
         assert_eq!(
-            origin(Path::new("/usr/share/lilypond/2.24.3/ly")),
+            origin(Path::new("/usr/share/lilypond/2.24.3")),
             "lilypond-2.24.3"
         );
+    }
+
+    /// A share directory holding just the `ly` files a test writes, so that
+    /// [`load`] finds them where it expects them.
+    fn share_dir_containing(dir: &Path) -> std::io::Result<std::path::PathBuf> {
+        let ly_dir = dir.join("ly");
+        std::fs::create_dir_all(&ly_dir)?;
+        Ok(ly_dir)
     }
 
     #[test]
     fn reads_a_zero_argument_command_from_a_declared_file() {
         let dir = tempfile::tempdir().unwrap();
+        let ly_dir = share_dir_containing(dir.path()).unwrap();
         std::fs::write(
-            dir.path().join("declarations-init.ly"),
+            ly_dir.join("declarations-init.ly"),
             "break = #(make-music 'LineBreakEvent 'break-permission 'force)\n",
         )
         .unwrap();
@@ -242,13 +266,14 @@ mod tests {
         // Same shape as LilyPond's own parse order: later files are read
         // later, so a name both bind resolves to the later file's version.
         let dir = tempfile::tempdir().unwrap();
+        let ly_dir = share_dir_containing(dir.path()).unwrap();
         std::fs::write(
-            dir.path().join("declarations-init.ly"),
+            ly_dir.join("declarations-init.ly"),
             "dup = #(define-music-function (m) (ly:music?) m)\n",
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("music-functions-init.ly"),
+            ly_dir.join("music-functions-init.ly"),
             "dup = #(define-music-function (a b) (ly:music? ly:music?) a)\n",
         )
         .unwrap();

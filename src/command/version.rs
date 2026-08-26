@@ -3,7 +3,7 @@
 use super::static_command::{StaticCommand, static_command};
 use super::{
     ArgKind, Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext,
-    Param, static_command::curated,
+    NoteEntry, Param, static_command::curated,
 };
 use crate::vocabulary::Scope;
 
@@ -35,7 +35,7 @@ impl Command for VersionCommand {
         self.base.documentation()
     }
 
-    // `\version`'s base is `MusicContext::Inherit`, for which the trait's
+    // `\version`'s base is `NoteEntry::Inherit`, for which the trait's
     // default (return `ambient` unchanged) and this forward already agree —
     // but relying on that default is what let `\lyricsto` regress silently
     // when its own base turned out to be `NonNote` (`super::lyricsto`).
@@ -67,7 +67,7 @@ pub(super) fn command() -> VersionCommand {
         base: static_command(
             "version",
             VERSION_PARAMS,
-            MusicContext::Inherit,
+            NoteEntry::Inherit,
             curated(VERSION_DOC),
             &[],
         ),

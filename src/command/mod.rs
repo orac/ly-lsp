@@ -24,10 +24,14 @@
 //! [`repeat`], [`new_context`] (serving both `\new` and `\context`, whose
 //! body's [`MusicContext`] depends on the context type named in the call,
 //! not on a fixed row), [`change`] (whose context type sometimes, but not
-//! always, arrives wrapped in an `assignment_lhs` node) and [`lyricsto`]
+//! always, arrives wrapped in an `assignment_lhs` node), [`lyricsto`]
 //! (whose voice-name parameter, like `new_context`'s and `change`'s context
 //! name, is completed by looking the document's [`Scope`] up rather than
-//! from a fixed table) — each get their own file here, wrapping a
+//! from a fixed table) and [`language`] (serving both `\language` and
+//! `\include`, since one of LilyPond's language files is a `\language`
+//! shim, and reading both the language it selects and the names worth
+//! offering out of the installation's own note-name data) — each get their
+//! own file here, wrapping a
 //! `StaticCommand` and overriding the one method that makes them bespoke.
 //! The other layer built so far is the user's own files. [`definition`] builds
 //! one [`Layer`] per file out of everything it binds — a definition being a
@@ -41,6 +45,7 @@
 mod change;
 pub mod definition;
 mod fixed;
+mod language;
 mod lyricsto;
 mod new_context;
 mod relative;
@@ -129,8 +134,10 @@ pub trait Command: Send + Sync {
     ///
     /// Takes the parsed call because the answer often depends on an argument:
     /// `\relative c'` reads its own reference pitch out of `call` and returns
-    /// `MusicContext::Relative(pitch)`. Takes `ambient` because some contexts
-    /// inherit rather than replace it. Takes `scope` because deciding whether
+    /// `ambient.with_entry(NoteEntry::Relative(pitch))`. Takes `ambient`
+    /// because every context is built from the one it was reached in — a
+    /// command that changes the entry mode inherits the language, and
+    /// `\language`, which changes the language, inherits the entry mode. Takes `scope` because deciding whether
     /// a `\new`/`\context` body is note music depends on the named context
     /// type's declaration — its aliases in particular — which lives in the
     /// document's [`Scope`], not in anything the call itself carries. The
@@ -353,12 +360,64 @@ pub enum ArgKind {
     ContextName,
 }
 
-/// How music inside a command's body is to be read. Mirrors the analyser's
-/// internal `Mode`/`Region` pair, which collapses into this once commands stop
-/// steering them by hand-written name matches; see `note_analyser`'s
-/// `ambient_context`/`mode_and_region` for the two-way conversion.
+/// How music inside a command's body is to be read: the way its symbols are
+/// entered, and the note-name language they are spelled in.
+///
+/// The two travel together because [`Command::music_context`] is the one
+/// place either can change, and a command that changes one usually leaves the
+/// other alone: `\chordmode` re-reads the symbols but keeps the language,
+/// `\language` changes the language and reads the music no differently. Every
+/// impl builds its answer from the `ambient` context it is handed, so
+/// inheriting is the default and replacing is the deliberate act.
+///
+/// The two halves differ in *reach*, which is the analyser's business rather
+/// than a command's: an entry mode governs the body and stops at its closing
+/// brace, while a language change outlives it, LilyPond's parser switching
+/// note names for the rest of the parse. See
+/// [`note_analyser::Analyser::handle_command`](crate::note_analyser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicContext {
+    /// How to read the symbols: absolute, relative, chord mode, not music at all.
+    pub entry: NoteEntry,
+    /// The note names those symbols are spelled in, as `\language` last left it.
+    pub language: Language,
+}
+
+impl MusicContext {
+    /// A context reading `entry`-wise in `language`.
+    pub fn new(entry: NoteEntry, language: Language) -> Self {
+        Self { entry, language }
+    }
+
+    /// This context with a different [`NoteEntry`], keeping the language — what
+    /// a mode-switching command (`\chordmode`, `\relative`, `\lyricmode`)
+    /// returns for its body.
+    #[must_use]
+    pub fn with_entry(&self, entry: NoteEntry) -> Self {
+        Self {
+            entry,
+            language: self.language.clone(),
+        }
+    }
+
+    /// This context with a different [`Language`], keeping the entry mode —
+    /// what [`language`] returns for a `\language` that named one it knows.
+    #[must_use]
+    pub fn with_language(&self, language: Language) -> Self {
+        Self {
+            entry: self.entry,
+            language,
+        }
+    }
+}
+
+/// How the symbols in a music expression are to be read. Mirrors the
+/// analyser's internal `Mode`/`Region` pair, which collapses into this once
+/// commands stop steering them by hand-written name matches; see
+/// `note_analyser`'s `ambient_context`/`mode_and_region` for the two-way
+/// conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MusicContext {
+pub enum NoteEntry {
     /// No opinion: read the body the same way the command itself was reached
     /// in. Right for the overwhelming majority of commands (`\repeat`,
     /// `\volta`, `\set`, …), which neither establish nor block a music
@@ -390,13 +449,13 @@ pub struct ArgReader<'a> {
     src: &'a str,
     /// The note-name language active where this call was found, needed to
     /// resolve an [`ArgKind::Pitch`] the same way an ordinary note is resolved.
-    language: Language,
+    language: &'a Language,
     /// The index of the first unconsumed sibling.
     next: usize,
 }
 
 impl<'a> ArgReader<'a> {
-    fn new(children: &'a [Node<'a>], start: usize, src: &'a str, language: Language) -> Self {
+    fn new(children: &'a [Node<'a>], start: usize, src: &'a str, language: &'a Language) -> Self {
         Self {
             children,
             src,
@@ -920,7 +979,7 @@ pub fn parse(
     children: &[Node],
     start: usize,
     src: &str,
-    language: Language,
+    language: &Language,
     scope: &Scope,
 ) -> Option<(CommandCall, usize)> {
     let node = *children.get(start)?;
@@ -978,7 +1037,7 @@ fn parse_call(
     children: &[Node],
     start: usize,
     src: &str,
-    language: Language,
+    language: &Language,
     scope: &Scope,
     map_next: impl Fn(usize) -> usize,
 ) -> Option<(CommandCall, usize)> {
@@ -1015,7 +1074,7 @@ fn consume_arg(
     children: &[Node],
     i: usize,
     src: &str,
-    language: Language,
+    language: &Language,
 ) -> Option<(Arg, usize)> {
     let node = *children.get(i)?;
     match kind {
@@ -1117,7 +1176,7 @@ fn consume_group(
     children: &[Node],
     start: usize,
     src: &str,
-    language: Language,
+    language: &Language,
 ) -> Option<(Arg, usize)> {
     let mut args = Vec::new();
     let mut i = start;
@@ -1209,7 +1268,7 @@ fn consume_pitch(
     children: &[Node],
     start: usize,
     src: &str,
-    language: Language,
+    language: &Language,
 ) -> Option<(Arg, usize)> {
     let node = *children.get(start)?;
     if node.kind() != "symbol" {
@@ -1389,7 +1448,7 @@ fn is_punct(node: Node, src: &str, text: &str) -> bool {
 }
 
 /// Clamps an octave (the analyser's octave arithmetic is `i32`) to the `i8`
-/// [`MusicContext::Fixed`] carries. No real score writes a `\fixed` reference
+/// [`NoteEntry::Fixed`] carries. No real score writes a `\fixed` reference
 /// anywhere near either bound; the clamp exists so a pathological one (or a
 /// fuzzer) can't panic instead of just misbehaving cosmetically.
 pub(crate) fn clamp_octave(octave: i32) -> i8 {
@@ -1457,55 +1516,6 @@ static CLEF_NAME_CANDIDATES: &[Candidate] = &[
 ];
 static CLEF_COMPLETIONS: &[&[Candidate]] = &[CLEF_NAME_CANDIDATES];
 
-/// `\language`'s note-name language, offered at its `language` parameter
-/// (index 0). Mirrors [`note_names::Language`](crate::note_names::Language)'s
-/// thirteen variants, one spelling each — the ASCII form where a language
-/// also accepts an accented one (`francais` alongside `français`), since
-/// that's the one worth typing to completion.
-static LANGUAGE_NAME_CANDIDATES: &[Candidate] = &[
-    Candidate::new(
-        "catalan",
-        "Catalan note names (do, re, mi, fa, sol, la, si).",
-    ),
-    Candidate::new(
-        "deutsch",
-        "German note names (c, d, e, f, g, a, h), with is/es for sharp/flat.",
-    ),
-    Candidate::new(
-        "english",
-        "English note names (c, d, e, f, g, a, b), with s/f for sharp/flat.",
-    ),
-    Candidate::new(
-        "espanol",
-        "Spanish note names (do, re, mi, fa, sol, la, si).",
-    ),
-    Candidate::new(
-        "francais",
-        "French note names (do, re, mi, fa, sol, la, si).",
-    ),
-    Candidate::new(
-        "italiano",
-        "Italian note names (do, re, mi, fa, sol, la, si).",
-    ),
-    Candidate::new(
-        "nederlands",
-        "Dutch note names (c, d, e, f, g, a, b); LilyPond's default.",
-    ),
-    Candidate::new("norsk", "Norwegian note names (c, d, e, f, g, a, h)."),
-    Candidate::new(
-        "portugues",
-        "Portuguese note names (do, re, mi, fa, sol, la, si).",
-    ),
-    Candidate::new("semi-german", "German note names, identical to deutsch."),
-    Candidate::new("suomi", "Finnish note names (c, d, e, f, g, a, h)."),
-    Candidate::new("svenska", "Swedish note names (c, d, e, f, g, a, h)."),
-    Candidate::new(
-        "vlaams",
-        "Flemish note names (do, re, mi, fa, sol, la, si).",
-    ),
-];
-static LANGUAGE_COMPLETIONS: &[&[Candidate]] = &[LANGUAGE_NAME_CANDIDATES];
-
 /// `\key`'s mode word, offered at its `mode` parameter (index 1); index 0
 /// (the tonic pitch) is open-ended, so it gets no candidates of its own.
 static KEY_MODE_CANDIDATES: &[Candidate] = &[
@@ -1560,7 +1570,7 @@ const CONTEXT_DOC: &str = "Finds the existing `type` context, optionally the one
 struct Row(
     &'static [&'static str],
     &'static [Param],
-    MusicContext,
+    NoteEntry,
     Option<&'static str>,
     &'static [&'static [Candidate]],
 );
@@ -1587,7 +1597,7 @@ struct Row(
 /// exists to avoid. Kept hand-aligned instead, one row per line.
 #[rustfmt::skip]
 static RESERVED_ROWS: &[Row] = {
-    use MusicContext::{Absolute, Chord, Inherit, NonNote};
+    use NoteEntry::{Absolute, Chord, Inherit, NonNote};
     &[
         Row(&["alternative"],           MUSIC_ONLY_PARAMS,       Inherit,  Some(ALTERNATIVE_DOC), &[]),
         Row(&["notemode", "notes"],     MUSIC_ONLY_PARAMS,       Absolute, None,                  &[]),
@@ -1606,7 +1616,6 @@ static RESERVED_ROWS: &[Row] = {
         Row(&["set"],                   PROPERTY_PARAMS,         Inherit,  None,                  &[]),
         Row(&["unset"],                 PROPERTY_PARAMS,         Inherit,  None,                  &[]),
         Row(&["tempo"],                 TEMPO_PARAMS,            Inherit,  Some(TEMPO_DOC),       &[]),
-        Row(&["include"],               INCLUDE_PARAMS,          Inherit,  None,                  &[]),
     ]
 };
 
@@ -1623,11 +1632,10 @@ static RESERVED_ROWS: &[Row] = {
 /// is checked by `install_layer_defines_every_curated_name`.
 #[rustfmt::skip]
 static CURATED_ROWS: &[Row] = {
-    use MusicContext::Inherit;
+    use NoteEntry::Inherit;
     &[
         Row(&["volta"],                 VOLTA_PARAMS,            Inherit,  Some(VOLTA_DOC),       &[]),
         Row(&["clef"],                  CLEF_PARAMS,             Inherit,  Some(CLEF_DOC),        CLEF_COMPLETIONS),
-        Row(&["language"],              LANGUAGE_PARAMS,         Inherit,  None,                  LANGUAGE_COMPLETIONS),
         Row(&["key"],                   KEY_PARAMS,              Inherit,  Some(KEY_DOC),         KEY_COMPLETIONS),
         Row(&["transpose"],             TRANSPOSE_PARAMS,        Inherit,  Some(TRANSPOSE_DOC),   &[]),
     ]
@@ -1645,14 +1653,14 @@ const OURS: &str = "built-in";
 fn table(rows: &[Row], bespoke: Vec<(&str, Arc<dyn Command>)>) -> Layer {
     let mut table: HashMap<String, Arc<dyn Command>> = HashMap::new();
 
-    for Row(names, params, context, doc, completions) in rows {
+    for Row(names, params, entry, doc, completions) in rows {
         for &name in *names {
             table.insert(
                 name.to_string(),
                 Arc::new(static_command(
                     name,
                     params,
-                    *context,
+                    *entry,
                     doc.and_then(curated),
                     completions,
                 )),
@@ -1683,6 +1691,7 @@ pub static RESERVED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
             ),
             ("change", Arc::new(change::command())),
             ("lyricsto", Arc::new(lyricsto::command())),
+            ("include", Arc::new(language::include(INCLUDE_PARAMS))),
         ],
     ))
 });
@@ -1699,6 +1708,7 @@ pub static CURATED: LazyLock<Arc<Layer>> = LazyLock::new(|| {
                 Arc::new(relative::command()) as Arc<dyn Command>,
             ),
             ("fixed", Arc::new(fixed::command())),
+            ("language", Arc::new(language::command(LANGUAGE_PARAMS))),
         ],
     ))
 });
@@ -1942,6 +1952,7 @@ impl std::ops::Deref for Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::note_names::fixture_language;
     use tree_sitter::Tree;
 
     fn tree(src: &str) -> Tree {
@@ -1968,7 +1979,7 @@ mod tests {
             &children,
             start,
             src,
-            Language::DEFAULT,
+            &fixture_language(),
             &Scope::builtins_only(),
         )
         .map(|(call, _)| call)
@@ -1990,7 +2001,7 @@ mod tests {
             &children,
             start,
             src,
-            Language::DEFAULT,
+            &fixture_language(),
             &Scope::builtins_only(),
         )
     }
@@ -2097,7 +2108,7 @@ mod tests {
             &children,
             start,
             src,
-            Language::DEFAULT,
+            &fixture_language(),
             &Scope::builtins_only(),
         )
         .expect("a repeat call");
@@ -2132,7 +2143,7 @@ mod tests {
                 &children,
                 0,
                 "\\override NoteHead.color = #red",
-                Language::DEFAULT,
+                &fixture_language(),
                 &Scope::builtins_only(),
             )
             .is_none()
@@ -2458,19 +2469,23 @@ mod tests {
         // fallback: the type name alone is checked against the hand-written
         // root list.
         let call = call("\\new Lyrics { la }").expect("a new call");
-        let context =
-            call.cmd
-                .music_context(&call, MusicContext::Absolute, &Scope::builtins_only());
-        assert_eq!(context, MusicContext::NonNote);
+        let context = call.cmd.music_context(
+            &call,
+            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            &Scope::builtins_only(),
+        );
+        assert_eq!(context.entry, NoteEntry::NonNote);
     }
 
     #[test]
     fn new_staff_reads_as_ordinary_note_music() {
         let call = call("\\new Staff { c }").expect("a new call");
-        let context =
-            call.cmd
-                .music_context(&call, MusicContext::Absolute, &Scope::builtins_only());
-        assert_eq!(context, MusicContext::Absolute);
+        let context = call.cmd.music_context(
+            &call,
+            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            &Scope::builtins_only(),
+        );
+        assert_eq!(context.entry, NoteEntry::Absolute);
     }
 
     #[test]
@@ -2490,10 +2505,12 @@ mod tests {
         let scope = Scope::builtins().for_document(&[layer]);
 
         let call = call("\\new MyLyrics { la }").expect("a new call");
-        let context = call
-            .cmd
-            .music_context(&call, MusicContext::Absolute, &scope);
-        assert_eq!(context, MusicContext::NonNote);
+        let context = call.cmd.music_context(
+            &call,
+            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            &scope,
+        );
+        assert_eq!(context.entry, NoteEntry::NonNote);
     }
 
     #[test]

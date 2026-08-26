@@ -1,1227 +1,466 @@
-//! Note-name spellings per language, generated from LilyPond's
-//! `scm/define-note-names.scm` by `tools/gen_note_names.py`. Do not edit by
-//! hand; re-run the generator against a LilyPond checkout instead.
+//! Note-name spellings per language, read from the LilyPond installation's own `scm/lily/define-note-names.scm`.
 //!
-//! Each table maps a spelling to its diatonic note name (`0 = c` … `6 = b`)
-//! and alteration in quarter-tone steps (sharp `+2`, flat `-2`).
+//! LilyPond's note names are language-dependent and we resolve pitches lexically, so we need exactly the tables its parser uses — for the version the workspace is actually running, not for whichever version happened to be around when this file was written. So this is a reader, not a table: [`NoteNames::read`] parses the installation's own data, the same way [`install`](crate::install) reads its `.ly` files for commands.
+//!
+//! Two files are read, both under `scm/lily`:
+//!
+//! - `define-note-names.scm`, whose `language-pitch-names` alist holds one block per language (`(nederlands . ((ceses . ,(ly:make-pitch -1 0 DOUBLE-FLAT)) …))`) and whose tail aliases some of them (`català` is also `catalan`, `deutsch` is also `semi-german`).
+//! - `lily-library.scm`, for what the alteration constants those entries name are worth. They are rationals in whole tones (`FLAT` is `-1/2`), which we scale to the quarter-tone integers a [`Language`] stores.
+//!
+//! Reading the constants rather than knowing them is what lets a language whose alterations go beyond the usual nine — 2.24's `arabic`, with its `FIVE-HALF-FLAT` — come through whole rather than half-parsed.
+//!
+//! A [`Language`] is a cheap handle on one language's table, held in a [`MusicContext`](crate::command::MusicContext) and passed around by the note analyser as the language in force. The whole set belongs to the install [`Layer`](crate::vocabulary::Layer) that read it, and a [`Scope`](crate::vocabulary::Scope) hands out the nearest one.
 
-/// A note-name language selectable with `\language` or by including the
-/// matching `.ly` file. [`Language::Nederlands`] is LilyPond's default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language {
-    Catalan,
-    Deutsch,
-    English,
-    Espanol,
-    Francais,
-    Italiano,
-    Nederlands,
-    Norsk,
-    Portugues,
-    SemiGerman,
-    Suomi,
-    Svenska,
-    Vlaams,
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, LazyLock};
+
+/// The language LilyPond's parser starts in, before any `\language` or language include.
+///
+/// Named here because `define-note-names.scm` doesn't say so — the default is wired into the parser, not into the data — and looked up by name so that it survives the file being reordered. [`NoteNames::parse`] falls back to whichever language the file declares first if a future version drops or renames this one.
+const DEFAULT_LANGUAGE: &str = "nederlands";
+
+/// Quarter tones to the whole tone, the unit LilyPond writes its alteration constants in (`DOUBLE-FLAT` is `-1`, a whole tone flat) and the factor that converts them to the quarter-tone integers a [`Language`] stores.
+const QUARTER_TONES_PER_WHOLE_TONE: i32 = 4;
+
+/// Every note-name language one LilyPond installation knows, by every name it answers to.
+///
+/// Aliases share their canonical language's table rather than copying it, so `\language "català"` and `\language "catalan"` yield the same [`Language`], reporting the same [`name`](Language::name).
+#[derive(Debug)]
+pub struct NoteNames {
+    /// Keyed by every accepted spelling, canonical and alias alike.
+    languages: HashMap<String, Language>,
+    /// The language in force before anything selects one. See [`DEFAULT_LANGUAGE`].
+    default: Language,
 }
 
-impl Language {
-    /// LilyPond's default note-name language, in force until a
-    /// `\language` or language include changes it.
-    pub const DEFAULT: Language = Language::Nederlands;
+/// The registry for a workspace with no readable installation: it knows no language at all, and its [`default_language`](NoteNames::default_language) knows no spellings.
+///
+/// Shared rather than rebuilt, so that [`Scope::note_names`](crate::vocabulary::Scope::note_names) can hand out a reference without every scope owning one.
+static NONE_AT_ALL: LazyLock<NoteNames> = LazyLock::new(|| NoteNames {
+    languages: HashMap::new(),
+    default: Language(Arc::new(LanguageNames {
+        name: String::new(),
+        table: Vec::new(),
+    })),
+});
 
-    /// The language a `\language "name"` string or a `name`(`.ly`) include
-    /// selects, or `None` if it names no known language.
-    pub fn from_name(name: &str) -> Option<Language> {
-        Some(match name {
-            "catalan" => Language::Catalan,
-            "català" => Language::Catalan,
-            "deutsch" => Language::Deutsch,
-            "english" => Language::English,
-            "espanol" => Language::Espanol,
-            "español" => Language::Espanol,
-            "francais" => Language::Francais,
-            "français" => Language::Francais,
-            "italiano" => Language::Italiano,
-            "nederlands" => Language::Nederlands,
-            "norsk" => Language::Norsk,
-            "portugues" => Language::Portugues,
-            "português" => Language::Portugues,
-            "semi-german" => Language::SemiGerman,
-            "suomi" => Language::Suomi,
-            "svenska" => Language::Svenska,
-            "vlaams" => Language::Vlaams,
-            _ => return None,
-        })
-    }
+/// One language's note names: a cheap, shareable handle on a table read out of the install.
+///
+/// Cloning bumps a refcount, which is what lets a [`MusicContext`](crate::command::MusicContext) carry the language in force without the analyser copying a table per command call.
+///
+/// Two languages are equal when they have the same [`name`](Self::name). That is the question the analyser actually asks — "did this `\language` change anything?" — and it makes an alias equal to what it aliases, since both report the canonical name.
+#[derive(Clone)]
+pub struct Language(Arc<LanguageNames>);
 
-    /// The note-name table for this language, sorted by spelling.
-    fn table(self) -> &'static [(&'static str, u8, i8)] {
-        match self {
-            Language::Catalan => CATALAN_NAMES,
-            Language::Deutsch => DEUTSCH_NAMES,
-            Language::English => ENGLISH_NAMES,
-            Language::Espanol => ESPANOL_NAMES,
-            Language::Francais => FRANCAIS_NAMES,
-            Language::Italiano => ITALIANO_NAMES,
-            Language::Nederlands => NEDERLANDS_NAMES,
-            Language::Norsk => NORSK_NAMES,
-            Language::Portugues => PORTUGUES_NAMES,
-            Language::SemiGerman => SEMI_GERMAN_NAMES,
-            Language::Suomi => SUOMI_NAMES,
-            Language::Svenska => SVENSKA_NAMES,
-            Language::Vlaams => VLAAMS_NAMES,
-        }
-    }
+/// One row of a language's table: a spelling, its diatonic note name (`0 = c` … `6 = b`), and its alteration in quarter-tone steps (sharp `+2`, flat `-2`).
+type Spelling = (String, u8, i8);
 
-    /// Resolves a note-name spelling to its `(note name, alteration)`, or
-    /// `None` if this language has no such note.
-    pub fn note(self, spelling: &str) -> Option<(u8, i8)> {
-        self.table()
-            .binary_search_by_key(&spelling, |&(name, _, _)| name)
-            .ok()
-            .map(|i| {
-                let (_, note, alt) = self.table()[i];
-                (note, alt)
-            })
-    }
+/// A language part-way through being read: the name its header gave, and the spellings gathered under it so far.
+type PartialLanguage = (String, Vec<Spelling>);
 
-    /// A spelling for the pitch `(note name, alteration)` in this language, or
-    /// `None` if it has no name for it. Where a language gives several spellings
-    /// (English `ef` and `e-flat`), the shortest is chosen, so callers get the
-    /// terse form a writer would use rather than the spelled-out alias.
-    pub fn spell(self, note_name: u8, alteration: i8) -> Option<&'static str> {
-        self.table()
-            .iter()
-            .filter(|&&(_, note, alt)| note == note_name && alt == alteration)
-            .map(|&(name, _, _)| name)
-            .min_by_key(|name| name.len())
-    }
+/// The table behind a [`Language`], shared by every handle on it.
+#[derive(Debug)]
+struct LanguageNames {
+    /// The canonical name, as `define-note-names.scm` writes it — `català`, not the `catalan` alias.
+    name: String,
+    /// Sorted by spelling, so [`Language::note`] can binary-search it.
+    table: Vec<Spelling>,
 }
 
-#[rustfmt::skip]
-static CATALAN_NAMES: &[(&str, u8, i8)] = &[
-    ("do", 0, 0),
-    ("dob", 0, -2),
-    ("dobb", 0, -4),
-    ("dod", 0, 2),
-    ("dodd", 0, 4),
-    ("doqb", 0, -1),
-    ("doqd", 0, 1),
-    ("doqs", 0, 1),
-    ("dos", 0, 2),
-    ("doss", 0, 4),
-    ("dotqb", 0, -3),
-    ("dotqd", 0, 3),
-    ("dotqs", 0, 3),
-    ("fa", 3, 0),
-    ("fab", 3, -2),
-    ("fabb", 3, -4),
-    ("fad", 3, 2),
-    ("fadd", 3, 4),
-    ("faqb", 3, -1),
-    ("faqd", 3, 1),
-    ("faqs", 3, 1),
-    ("fas", 3, 2),
-    ("fass", 3, 4),
-    ("fatqb", 3, -3),
-    ("fatqd", 3, 3),
-    ("fatqs", 3, 3),
-    ("la", 5, 0),
-    ("lab", 5, -2),
-    ("labb", 5, -4),
-    ("lad", 5, 2),
-    ("ladd", 5, 4),
-    ("laqb", 5, -1),
-    ("laqd", 5, 1),
-    ("laqs", 5, 1),
-    ("las", 5, 2),
-    ("lass", 5, 4),
-    ("latqb", 5, -3),
-    ("latqd", 5, 3),
-    ("latqs", 5, 3),
-    ("mi", 2, 0),
-    ("mib", 2, -2),
-    ("mibb", 2, -4),
-    ("mid", 2, 2),
-    ("midd", 2, 4),
-    ("miqb", 2, -1),
-    ("miqd", 2, 1),
-    ("miqs", 2, 1),
-    ("mis", 2, 2),
-    ("miss", 2, 4),
-    ("mitqb", 2, -3),
-    ("mitqd", 2, 3),
-    ("mitqs", 2, 3),
-    ("re", 1, 0),
-    ("reb", 1, -2),
-    ("rebb", 1, -4),
-    ("red", 1, 2),
-    ("redd", 1, 4),
-    ("reqb", 1, -1),
-    ("reqd", 1, 1),
-    ("reqs", 1, 1),
-    ("res", 1, 2),
-    ("ress", 1, 4),
-    ("retqb", 1, -3),
-    ("retqd", 1, 3),
-    ("retqs", 1, 3),
-    ("si", 6, 0),
-    ("sib", 6, -2),
-    ("sibb", 6, -4),
-    ("sid", 6, 2),
-    ("sidd", 6, 4),
-    ("siqb", 6, -1),
-    ("siqd", 6, 1),
-    ("siqs", 6, 1),
-    ("sis", 6, 2),
-    ("siss", 6, 4),
-    ("sitqb", 6, -3),
-    ("sitqd", 6, 3),
-    ("sitqs", 6, 3),
-    ("sol", 4, 0),
-    ("solb", 4, -2),
-    ("solbb", 4, -4),
-    ("sold", 4, 2),
-    ("soldd", 4, 4),
-    ("solqb", 4, -1),
-    ("solqd", 4, 1),
-    ("solqs", 4, 1),
-    ("sols", 4, 2),
-    ("solss", 4, 4),
-    ("soltqb", 4, -3),
-    ("soltqd", 4, 3),
-    ("soltqs", 4, 3),
-];
-
-#[rustfmt::skip]
-static DEUTSCH_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("aeh", 5, -1),
-    ("ah", 5, -1),
-    ("aih", 5, 1),
-    ("ais", 5, 2),
-    ("aisih", 5, 3),
-    ("aisis", 5, 4),
-    ("as", 5, -2),
-    ("asah", 5, -3),
-    ("asas", 5, -4),
-    ("aseh", 5, -3),
-    ("ases", 5, -4),
-    ("b", 6, -2),
-    ("c", 0, 0),
-    ("ceh", 0, -1),
-    ("ces", 0, -2),
-    ("ceseh", 0, -3),
-    ("ceses", 0, -4),
-    ("cih", 0, 1),
-    ("cis", 0, 2),
-    ("cisih", 0, 3),
-    ("cisis", 0, 4),
-    ("d", 1, 0),
-    ("deh", 1, -1),
-    ("des", 1, -2),
-    ("deseh", 1, -3),
-    ("deses", 1, -4),
-    ("dih", 1, 1),
-    ("dis", 1, 2),
-    ("disih", 1, 3),
-    ("disis", 1, 4),
-    ("e", 2, 0),
-    ("eeh", 2, -1),
-    ("eh", 2, -1),
-    ("eih", 2, 1),
-    ("eis", 2, 2),
-    ("eisih", 2, 3),
-    ("eisis", 2, 4),
-    ("es", 2, -2),
-    ("eseh", 2, -3),
-    ("eses", 2, -4),
-    ("f", 3, 0),
-    ("feh", 3, -1),
-    ("fes", 3, -2),
-    ("feseh", 3, -3),
-    ("feses", 3, -4),
-    ("fih", 3, 1),
-    ("fis", 3, 2),
-    ("fisih", 3, 3),
-    ("fisis", 3, 4),
-    ("g", 4, 0),
-    ("geh", 4, -1),
-    ("ges", 4, -2),
-    ("geseh", 4, -3),
-    ("geses", 4, -4),
-    ("gih", 4, 1),
-    ("gis", 4, 2),
-    ("gisih", 4, 3),
-    ("gisis", 4, 4),
-    ("h", 6, 0),
-    ("heh", 6, -1),
-    ("heseh", 6, -3),
-    ("heses", 6, -4),
-    ("hih", 6, 1),
-    ("his", 6, 2),
-    ("hisih", 6, 3),
-    ("hisis", 6, 4),
-];
-
-#[rustfmt::skip]
-static ENGLISH_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("a-flat", 5, -2),
-    ("a-flatflat", 5, -4),
-    ("a-natural", 5, 0),
-    ("a-sharp", 5, 2),
-    ("a-sharpsharp", 5, 4),
-    ("af", 5, -2),
-    ("aff", 5, -4),
-    ("aqf", 5, -1),
-    ("aqs", 5, 1),
-    ("as", 5, 2),
-    ("ass", 5, 4),
-    ("atqf", 5, -3),
-    ("atqs", 5, 3),
-    ("ax", 5, 4),
-    ("b", 6, 0),
-    ("b-flat", 6, -2),
-    ("b-flatflat", 6, -4),
-    ("b-natural", 6, 0),
-    ("b-sharp", 6, 2),
-    ("b-sharpsharp", 6, 4),
-    ("bf", 6, -2),
-    ("bff", 6, -4),
-    ("bqf", 6, -1),
-    ("bqs", 6, 1),
-    ("bs", 6, 2),
-    ("bss", 6, 4),
-    ("btqf", 6, -3),
-    ("btqs", 6, 3),
-    ("bx", 6, 4),
-    ("c", 0, 0),
-    ("c-flat", 0, -2),
-    ("c-flatflat", 0, -4),
-    ("c-natural", 0, 0),
-    ("c-sharp", 0, 2),
-    ("c-sharpsharp", 0, 4),
-    ("cf", 0, -2),
-    ("cff", 0, -4),
-    ("cqf", 0, -1),
-    ("cqs", 0, 1),
-    ("cs", 0, 2),
-    ("css", 0, 4),
-    ("ctqf", 0, -3),
-    ("ctqs", 0, 3),
-    ("cx", 0, 4),
-    ("d", 1, 0),
-    ("d-flat", 1, -2),
-    ("d-flatflat", 1, -4),
-    ("d-natural", 1, 0),
-    ("d-sharp", 1, 2),
-    ("d-sharpsharp", 1, 4),
-    ("df", 1, -2),
-    ("dff", 1, -4),
-    ("dqf", 1, -1),
-    ("dqs", 1, 1),
-    ("ds", 1, 2),
-    ("dss", 1, 4),
-    ("dtqf", 1, -3),
-    ("dtqs", 1, 3),
-    ("dx", 1, 4),
-    ("e", 2, 0),
-    ("e-flat", 2, -2),
-    ("e-flatflat", 2, -4),
-    ("e-natural", 2, 0),
-    ("e-sharp", 2, 2),
-    ("e-sharpsharp", 2, 4),
-    ("ef", 2, -2),
-    ("eff", 2, -4),
-    ("eqf", 2, -1),
-    ("eqs", 2, 1),
-    ("es", 2, 2),
-    ("ess", 2, 4),
-    ("etqf", 2, -3),
-    ("etqs", 2, 3),
-    ("ex", 2, 4),
-    ("f", 3, 0),
-    ("f-flat", 3, -2),
-    ("f-flatflat", 3, -4),
-    ("f-natural", 3, 0),
-    ("f-sharp", 3, 2),
-    ("f-sharpsharp", 3, 4),
-    ("ff", 3, -2),
-    ("fff", 3, -4),
-    ("fqf", 3, -1),
-    ("fqs", 3, 1),
-    ("fs", 3, 2),
-    ("fss", 3, 4),
-    ("ftqf", 3, -3),
-    ("ftqs", 3, 3),
-    ("fx", 3, 4),
-    ("g", 4, 0),
-    ("g-flat", 4, -2),
-    ("g-flatflat", 4, -4),
-    ("g-natural", 4, 0),
-    ("g-sharp", 4, 2),
-    ("g-sharpsharp", 4, 4),
-    ("gf", 4, -2),
-    ("gff", 4, -4),
-    ("gqf", 4, -1),
-    ("gqs", 4, 1),
-    ("gs", 4, 2),
-    ("gss", 4, 4),
-    ("gtqf", 4, -3),
-    ("gtqs", 4, 3),
-    ("gx", 4, 4),
-];
-
-#[rustfmt::skip]
-static ESPANOL_NAMES: &[(&str, u8, i8)] = &[
-    ("do", 0, 0),
-    ("dob", 0, -2),
-    ("dobb", 0, -4),
-    ("docb", 0, -1),
-    ("docs", 0, 1),
-    ("dos", 0, 2),
-    ("doss", 0, 4),
-    ("dotcb", 0, -3),
-    ("dotcs", 0, 3),
-    ("dox", 0, 4),
-    ("fa", 3, 0),
-    ("fab", 3, -2),
-    ("fabb", 3, -4),
-    ("facb", 3, -1),
-    ("facs", 3, 1),
-    ("fas", 3, 2),
-    ("fass", 3, 4),
-    ("fatcb", 3, -3),
-    ("fatcs", 3, 3),
-    ("fax", 3, 4),
-    ("la", 5, 0),
-    ("lab", 5, -2),
-    ("labb", 5, -4),
-    ("lacb", 5, -1),
-    ("lacs", 5, 1),
-    ("las", 5, 2),
-    ("lass", 5, 4),
-    ("latcb", 5, -3),
-    ("latcs", 5, 3),
-    ("lax", 5, 4),
-    ("mi", 2, 0),
-    ("mib", 2, -2),
-    ("mibb", 2, -4),
-    ("micb", 2, -1),
-    ("mics", 2, 1),
-    ("mis", 2, 2),
-    ("miss", 2, 4),
-    ("mitcb", 2, -3),
-    ("mitcs", 2, 3),
-    ("mix", 2, 4),
-    ("re", 1, 0),
-    ("reb", 1, -2),
-    ("rebb", 1, -4),
-    ("recb", 1, -1),
-    ("recs", 1, 1),
-    ("res", 1, 2),
-    ("ress", 1, 4),
-    ("retcb", 1, -3),
-    ("retcs", 1, 3),
-    ("rex", 1, 4),
-    ("si", 6, 0),
-    ("sib", 6, -2),
-    ("sibb", 6, -4),
-    ("sicb", 6, -1),
-    ("sics", 6, 1),
-    ("sis", 6, 2),
-    ("siss", 6, 4),
-    ("sitcb", 6, -3),
-    ("sitcs", 6, 3),
-    ("six", 6, 4),
-    ("sol", 4, 0),
-    ("solb", 4, -2),
-    ("solbb", 4, -4),
-    ("solcb", 4, -1),
-    ("solcs", 4, 1),
-    ("sols", 4, 2),
-    ("solss", 4, 4),
-    ("soltcb", 4, -3),
-    ("soltcs", 4, 3),
-    ("solx", 4, 4),
-];
-
-#[rustfmt::skip]
-static FRANCAIS_NAMES: &[(&str, u8, i8)] = &[
-    ("do", 0, 0),
-    ("dob", 0, -2),
-    ("dobb", 0, -4),
-    ("dobsb", 0, -3),
-    ("dod", 0, 2),
-    ("dodd", 0, 4),
-    ("dodsd", 0, 3),
-    ("dosb", 0, -1),
-    ("dosd", 0, 1),
-    ("dox", 0, 4),
-    ("fa", 3, 0),
-    ("fab", 3, -2),
-    ("fabb", 3, -4),
-    ("fabsb", 3, -3),
-    ("fad", 3, 2),
-    ("fadd", 3, 4),
-    ("fadsd", 3, 3),
-    ("fasb", 3, -1),
-    ("fasd", 3, 1),
-    ("fax", 3, 4),
-    ("la", 5, 0),
-    ("lab", 5, -2),
-    ("labb", 5, -4),
-    ("labsb", 5, -3),
-    ("lad", 5, 2),
-    ("ladd", 5, 4),
-    ("ladsd", 5, 3),
-    ("lasb", 5, -1),
-    ("lasd", 5, 1),
-    ("lax", 5, 4),
-    ("mi", 2, 0),
-    ("mib", 2, -2),
-    ("mibb", 2, -4),
-    ("mibsb", 2, -3),
-    ("mid", 2, 2),
-    ("midd", 2, 4),
-    ("midsd", 2, 3),
-    ("misb", 2, -1),
-    ("misd", 2, 1),
-    ("mix", 2, 4),
-    ("re", 1, 0),
-    ("reb", 1, -2),
-    ("rebb", 1, -4),
-    ("rebsb", 1, -3),
-    ("red", 1, 2),
-    ("redd", 1, 4),
-    ("redsd", 1, 3),
-    ("resb", 1, -1),
-    ("resd", 1, 1),
-    ("rex", 1, 4),
-    ("ré", 1, 0),
-    ("réb", 1, -2),
-    ("rébb", 1, -4),
-    ("rébsb", 1, -3),
-    ("réd", 1, 2),
-    ("rédd", 1, 4),
-    ("rédsd", 1, 3),
-    ("résb", 1, -1),
-    ("résd", 1, 1),
-    ("réx", 1, 4),
-    ("si", 6, 0),
-    ("sib", 6, -2),
-    ("sibb", 6, -4),
-    ("sibsb", 6, -3),
-    ("sid", 6, 2),
-    ("sidd", 6, 4),
-    ("sidsd", 6, 3),
-    ("sisb", 6, -1),
-    ("sisd", 6, 1),
-    ("six", 6, 4),
-    ("sol", 4, 0),
-    ("solb", 4, -2),
-    ("solbb", 4, -4),
-    ("solbsb", 4, -3),
-    ("sold", 4, 2),
-    ("soldd", 4, 4),
-    ("soldsd", 4, 3),
-    ("solsb", 4, -1),
-    ("solsd", 4, 1),
-    ("solx", 4, 4),
-];
-
-#[rustfmt::skip]
-static ITALIANO_NAMES: &[(&str, u8, i8)] = &[
-    ("do", 0, 0),
-    ("dob", 0, -2),
-    ("dobb", 0, -4),
-    ("dobsb", 0, -3),
-    ("dod", 0, 2),
-    ("dodd", 0, 4),
-    ("dodsd", 0, 3),
-    ("dosb", 0, -1),
-    ("dosd", 0, 1),
-    ("fa", 3, 0),
-    ("fab", 3, -2),
-    ("fabb", 3, -4),
-    ("fabsb", 3, -3),
-    ("fad", 3, 2),
-    ("fadd", 3, 4),
-    ("fadsd", 3, 3),
-    ("fasb", 3, -1),
-    ("fasd", 3, 1),
-    ("la", 5, 0),
-    ("lab", 5, -2),
-    ("labb", 5, -4),
-    ("labsb", 5, -3),
-    ("lad", 5, 2),
-    ("ladd", 5, 4),
-    ("ladsd", 5, 3),
-    ("lasb", 5, -1),
-    ("lasd", 5, 1),
-    ("mi", 2, 0),
-    ("mib", 2, -2),
-    ("mibb", 2, -4),
-    ("mibsb", 2, -3),
-    ("mid", 2, 2),
-    ("midd", 2, 4),
-    ("midsd", 2, 3),
-    ("misb", 2, -1),
-    ("misd", 2, 1),
-    ("re", 1, 0),
-    ("reb", 1, -2),
-    ("rebb", 1, -4),
-    ("rebsb", 1, -3),
-    ("red", 1, 2),
-    ("redd", 1, 4),
-    ("redsd", 1, 3),
-    ("resb", 1, -1),
-    ("resd", 1, 1),
-    ("si", 6, 0),
-    ("sib", 6, -2),
-    ("sibb", 6, -4),
-    ("sibsb", 6, -3),
-    ("sid", 6, 2),
-    ("sidd", 6, 4),
-    ("sidsd", 6, 3),
-    ("sisb", 6, -1),
-    ("sisd", 6, 1),
-    ("sol", 4, 0),
-    ("solb", 4, -2),
-    ("solbb", 4, -4),
-    ("solbsb", 4, -3),
-    ("sold", 4, 2),
-    ("soldd", 4, 4),
-    ("soldsd", 4, 3),
-    ("solsb", 4, -1),
-    ("solsd", 4, 1),
-];
-
-#[rustfmt::skip]
-static NEDERLANDS_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("aeh", 5, -1),
-    ("aes", 5, -2),
-    ("aeseh", 5, -3),
-    ("aeses", 5, -4),
-    ("aih", 5, 1),
-    ("ais", 5, 2),
-    ("aisih", 5, 3),
-    ("aisis", 5, 4),
-    ("as", 5, -2),
-    ("ases", 5, -4),
-    ("b", 6, 0),
-    ("beh", 6, -1),
-    ("bes", 6, -2),
-    ("beseh", 6, -3),
-    ("beses", 6, -4),
-    ("bih", 6, 1),
-    ("bis", 6, 2),
-    ("bisih", 6, 3),
-    ("bisis", 6, 4),
-    ("c", 0, 0),
-    ("ceh", 0, -1),
-    ("ces", 0, -2),
-    ("ceseh", 0, -3),
-    ("ceses", 0, -4),
-    ("cih", 0, 1),
-    ("cis", 0, 2),
-    ("cisih", 0, 3),
-    ("cisis", 0, 4),
-    ("d", 1, 0),
-    ("deh", 1, -1),
-    ("des", 1, -2),
-    ("deseh", 1, -3),
-    ("deses", 1, -4),
-    ("dih", 1, 1),
-    ("dis", 1, 2),
-    ("disih", 1, 3),
-    ("disis", 1, 4),
-    ("e", 2, 0),
-    ("eeh", 2, -1),
-    ("ees", 2, -2),
-    ("eeseh", 2, -3),
-    ("eeses", 2, -4),
-    ("eih", 2, 1),
-    ("eis", 2, 2),
-    ("eisih", 2, 3),
-    ("eisis", 2, 4),
-    ("es", 2, -2),
-    ("eses", 2, -4),
-    ("f", 3, 0),
-    ("feh", 3, -1),
-    ("fes", 3, -2),
-    ("feseh", 3, -3),
-    ("feses", 3, -4),
-    ("fih", 3, 1),
-    ("fis", 3, 2),
-    ("fisih", 3, 3),
-    ("fisis", 3, 4),
-    ("g", 4, 0),
-    ("geh", 4, -1),
-    ("ges", 4, -2),
-    ("geseh", 4, -3),
-    ("geses", 4, -4),
-    ("gih", 4, 1),
-    ("gis", 4, 2),
-    ("gisih", 4, 3),
-    ("gisis", 4, 4),
-];
-
-#[rustfmt::skip]
-static NORSK_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("aeh", 5, -1),
-    ("aes", 5, -2),
-    ("aeseh", 5, -3),
-    ("aeses", 5, -4),
-    ("aess", 5, -2),
-    ("aesseh", 5, -3),
-    ("aessess", 5, -4),
-    ("aih", 5, 1),
-    ("ais", 5, 2),
-    ("aisih", 5, 3),
-    ("aisis", 5, 4),
-    ("aiss", 5, 2),
-    ("aissih", 5, 3),
-    ("aississ", 5, 4),
-    ("as", 5, -2),
-    ("ases", 5, -4),
-    ("ass", 5, -2),
-    ("assess", 5, -4),
-    ("b", 6, -2),
-    ("beh", 6, -3),
-    ("bes", 6, -4),
-    ("bess", 6, -4),
-    ("c", 0, 0),
-    ("ceh", 0, -1),
-    ("ces", 0, -2),
-    ("ceseh", 0, -3),
-    ("ceses", 0, -4),
-    ("cess", 0, -2),
-    ("cesseh", 0, -3),
-    ("cessess", 0, -4),
-    ("cih", 0, 1),
-    ("cis", 0, 2),
-    ("cisih", 0, 3),
-    ("cisis", 0, 4),
-    ("ciss", 0, 2),
-    ("cissih", 0, 3),
-    ("cississ", 0, 4),
-    ("d", 1, 0),
-    ("deh", 1, -1),
-    ("des", 1, -2),
-    ("deseh", 1, -3),
-    ("deses", 1, -4),
-    ("dess", 1, -2),
-    ("desseh", 1, -3),
-    ("dessess", 1, -4),
-    ("dih", 1, 1),
-    ("dis", 1, 2),
-    ("disih", 1, 3),
-    ("disis", 1, 4),
-    ("diss", 1, 2),
-    ("dissih", 1, 3),
-    ("dississ", 1, 4),
-    ("e", 2, 0),
-    ("eeh", 2, -1),
-    ("ees", 2, -2),
-    ("eeseh", 2, -3),
-    ("eeses", 2, -4),
-    ("eess", 2, -2),
-    ("eesseh", 2, -3),
-    ("eessess", 2, -4),
-    ("eih", 2, 1),
-    ("eis", 2, 2),
-    ("eisih", 2, 3),
-    ("eisis", 2, 4),
-    ("eiss", 2, 2),
-    ("eissih", 2, 3),
-    ("eississ", 2, 4),
-    ("es", 2, -2),
-    ("eses", 2, -4),
-    ("ess", 2, -2),
-    ("essess", 2, -4),
-    ("f", 3, 0),
-    ("feh", 3, -1),
-    ("fes", 3, -2),
-    ("feseh", 3, -3),
-    ("feses", 3, -4),
-    ("fess", 3, -2),
-    ("fesseh", 3, -3),
-    ("fessess", 3, -4),
-    ("fih", 3, 1),
-    ("fis", 3, 2),
-    ("fisih", 3, 3),
-    ("fisis", 3, 4),
-    ("fiss", 3, 2),
-    ("fissih", 3, 3),
-    ("fississ", 3, 4),
-    ("g", 4, 0),
-    ("geh", 4, -1),
-    ("ges", 4, -2),
-    ("geseh", 4, -3),
-    ("geses", 4, -4),
-    ("gess", 4, -2),
-    ("gesseh", 4, -3),
-    ("gessess", 4, -4),
-    ("gih", 4, 1),
-    ("gis", 4, 2),
-    ("gisih", 4, 3),
-    ("gisis", 4, 4),
-    ("giss", 4, 2),
-    ("gissih", 4, 3),
-    ("gississ", 4, 4),
-    ("h", 6, 0),
-    ("heh", 6, -1),
-    ("hih", 6, 1),
-    ("his", 6, 2),
-    ("hisih", 6, 3),
-    ("hisis", 6, 4),
-    ("hiss", 6, 2),
-    ("hissih", 6, 3),
-    ("hississ", 6, 4),
-];
-
-#[rustfmt::skip]
-static PORTUGUES_NAMES: &[(&str, u8, i8)] = &[
-    ("do", 0, 0),
-    ("dob", 0, -2),
-    ("dobb", 0, -4),
-    ("dobqt", 0, -1),
-    ("dobtqt", 0, -3),
-    ("dos", 0, 2),
-    ("dosqt", 0, 1),
-    ("doss", 0, 4),
-    ("dostqt", 0, 3),
-    ("fa", 3, 0),
-    ("fab", 3, -2),
-    ("fabb", 3, -4),
-    ("fabqt", 3, -1),
-    ("fabtqt", 3, -3),
-    ("fas", 3, 2),
-    ("fasqt", 3, 1),
-    ("fass", 3, 4),
-    ("fastqt", 3, 3),
-    ("la", 5, 0),
-    ("lab", 5, -2),
-    ("labb", 5, -4),
-    ("labqt", 5, -1),
-    ("labtqt", 5, -3),
-    ("las", 5, 2),
-    ("lasqt", 5, 1),
-    ("lass", 5, 4),
-    ("lastqt", 5, 3),
-    ("mi", 2, 0),
-    ("mib", 2, -2),
-    ("mibb", 2, -4),
-    ("mibqt", 2, -1),
-    ("mibtqt", 2, -3),
-    ("mis", 2, 2),
-    ("misqt", 2, 1),
-    ("miss", 2, 4),
-    ("mistqt", 2, 3),
-    ("re", 1, 0),
-    ("reb", 1, -2),
-    ("rebb", 1, -4),
-    ("rebqt", 1, -1),
-    ("rebtqt", 1, -3),
-    ("res", 1, 2),
-    ("resqt", 1, 1),
-    ("ress", 1, 4),
-    ("restqt", 1, 3),
-    ("si", 6, 0),
-    ("sib", 6, -2),
-    ("sibb", 6, -4),
-    ("sibqt", 6, -1),
-    ("sibtqt", 6, -3),
-    ("sis", 6, 2),
-    ("sisqt", 6, 1),
-    ("siss", 6, 4),
-    ("sistqt", 6, 3),
-    ("sol", 4, 0),
-    ("solb", 4, -2),
-    ("solbb", 4, -4),
-    ("solbqt", 4, -1),
-    ("solbtqt", 4, -3),
-    ("sols", 4, 2),
-    ("solsqt", 4, 1),
-    ("solss", 4, 4),
-    ("solstqt", 4, 3),
-];
-
-#[rustfmt::skip]
-static SEMI_GERMAN_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("aeh", 5, -1),
-    ("ah", 5, -1),
-    ("aih", 5, 1),
-    ("ais", 5, 2),
-    ("aisih", 5, 3),
-    ("aisis", 5, 4),
-    ("as", 5, -2),
-    ("asah", 5, -3),
-    ("asas", 5, -4),
-    ("aseh", 5, -3),
-    ("ases", 5, -4),
-    ("b", 6, -2),
-    ("c", 0, 0),
-    ("ceh", 0, -1),
-    ("ces", 0, -2),
-    ("ceseh", 0, -3),
-    ("ceses", 0, -4),
-    ("cih", 0, 1),
-    ("cis", 0, 2),
-    ("cisih", 0, 3),
-    ("cisis", 0, 4),
-    ("d", 1, 0),
-    ("deh", 1, -1),
-    ("des", 1, -2),
-    ("deseh", 1, -3),
-    ("deses", 1, -4),
-    ("dih", 1, 1),
-    ("dis", 1, 2),
-    ("disih", 1, 3),
-    ("disis", 1, 4),
-    ("e", 2, 0),
-    ("eeh", 2, -1),
-    ("eh", 2, -1),
-    ("eih", 2, 1),
-    ("eis", 2, 2),
-    ("eisih", 2, 3),
-    ("eisis", 2, 4),
-    ("es", 2, -2),
-    ("eseh", 2, -3),
-    ("eses", 2, -4),
-    ("f", 3, 0),
-    ("feh", 3, -1),
-    ("fes", 3, -2),
-    ("feseh", 3, -3),
-    ("feses", 3, -4),
-    ("fih", 3, 1),
-    ("fis", 3, 2),
-    ("fisih", 3, 3),
-    ("fisis", 3, 4),
-    ("g", 4, 0),
-    ("geh", 4, -1),
-    ("ges", 4, -2),
-    ("geseh", 4, -3),
-    ("geses", 4, -4),
-    ("gih", 4, 1),
-    ("gis", 4, 2),
-    ("gisih", 4, 3),
-    ("gisis", 4, 4),
-    ("h", 6, 0),
-    ("heh", 6, -1),
-    ("heseh", 6, -3),
-    ("heses", 6, -4),
-    ("hih", 6, 1),
-    ("his", 6, 2),
-    ("hisih", 6, 3),
-    ("hisis", 6, 4),
-];
-
-#[rustfmt::skip]
-static SUOMI_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("aeh", 5, -1),
-    ("aih", 5, 1),
-    ("ais", 5, 2),
-    ("aisih", 5, 3),
-    ("aisis", 5, 4),
-    ("as", 5, -2),
-    ("asah", 5, -3),
-    ("asas", 5, -4),
-    ("aseh", 5, -3),
-    ("ases", 5, -4),
-    ("b", 6, -2),
-    ("bb", 6, -4),
-    ("bes", 6, -4),
-    ("c", 0, 0),
-    ("ceh", 0, -1),
-    ("ces", 0, -2),
-    ("ceseh", 0, -3),
-    ("ceses", 0, -4),
-    ("cih", 0, 1),
-    ("cis", 0, 2),
-    ("cisih", 0, 3),
-    ("cisis", 0, 4),
-    ("d", 1, 0),
-    ("deh", 1, -1),
-    ("des", 1, -2),
-    ("deseh", 1, -3),
-    ("deses", 1, -4),
-    ("dih", 1, 1),
-    ("dis", 1, 2),
-    ("disih", 1, 3),
-    ("disis", 1, 4),
-    ("e", 2, 0),
-    ("eeh", 2, -1),
-    ("eih", 2, 1),
-    ("eis", 2, 2),
-    ("eisih", 2, 3),
-    ("eisis", 2, 4),
-    ("es", 2, -2),
-    ("eseh", 2, -3),
-    ("eses", 2, -4),
-    ("f", 3, 0),
-    ("feh", 3, -1),
-    ("fes", 3, -2),
-    ("feseh", 3, -3),
-    ("feses", 3, -4),
-    ("fih", 3, 1),
-    ("fis", 3, 2),
-    ("fisih", 3, 3),
-    ("fisis", 3, 4),
-    ("g", 4, 0),
-    ("geh", 4, -1),
-    ("ges", 4, -2),
-    ("geseh", 4, -3),
-    ("geses", 4, -4),
-    ("gih", 4, 1),
-    ("gis", 4, 2),
-    ("gisih", 4, 3),
-    ("gisis", 4, 4),
-    ("h", 6, 0),
-    ("heh", 6, -1),
-    ("heseh", 6, -3),
-    ("heses", 6, -4),
-    ("hih", 6, 1),
-    ("his", 6, 2),
-    ("hisih", 6, 3),
-    ("hisis", 6, 4),
-];
-
-#[rustfmt::skip]
-static SVENSKA_NAMES: &[(&str, u8, i8)] = &[
-    ("a", 5, 0),
-    ("aeh", 5, -1),
-    ("aih", 5, 1),
-    ("aiss", 5, 2),
-    ("aissih", 5, 3),
-    ("aississ", 5, 4),
-    ("ass", 5, -2),
-    ("asseh", 5, -3),
-    ("assess", 5, -4),
-    ("b", 6, -2),
-    ("c", 0, 0),
-    ("ceh", 0, -1),
-    ("cess", 0, -2),
-    ("cesseh", 0, -3),
-    ("cessess", 0, -4),
-    ("cih", 0, 1),
-    ("ciss", 0, 2),
-    ("cissih", 0, 3),
-    ("cississ", 0, 4),
-    ("d", 1, 0),
-    ("deh", 1, -1),
-    ("dess", 1, -2),
-    ("desseh", 1, -3),
-    ("dessess", 1, -4),
-    ("dih", 1, 1),
-    ("diss", 1, 2),
-    ("dissih", 1, 3),
-    ("dississ", 1, 4),
-    ("e", 2, 0),
-    ("eeh", 2, -1),
-    ("eih", 2, 1),
-    ("eiss", 2, 2),
-    ("eissih", 2, 3),
-    ("eississ", 2, 4),
-    ("ess", 2, -2),
-    ("esseh", 2, -3),
-    ("essess", 2, -4),
-    ("f", 3, 0),
-    ("feh", 3, -1),
-    ("fess", 3, -2),
-    ("fesseh", 3, -3),
-    ("fessess", 3, -4),
-    ("fih", 3, 1),
-    ("fiss", 3, 2),
-    ("fissih", 3, 3),
-    ("fississ", 3, 4),
-    ("g", 4, 0),
-    ("geh", 4, -1),
-    ("gess", 4, -2),
-    ("gesseh", 4, -3),
-    ("gessess", 4, -4),
-    ("gih", 4, 1),
-    ("giss", 4, 2),
-    ("gissih", 4, 3),
-    ("gississ", 4, 4),
-    ("h", 6, 0),
-    ("heh", 6, -1),
-    ("hesseh", 6, -3),
-    ("hessess", 6, -4),
-    ("hih", 6, 1),
-    ("hiss", 6, 2),
-    ("hissih", 6, 3),
-    ("hississ", 6, 4),
-];
-
-#[rustfmt::skip]
-static VLAAMS_NAMES: &[(&str, u8, i8)] = &[
-    ("do", 0, 0),
-    ("dob", 0, -2),
-    ("dobb", 0, -4),
-    ("dobhb", 0, -3),
-    ("dohb", 0, -1),
-    ("dohk", 0, 1),
-    ("dok", 0, 2),
-    ("dokhk", 0, 3),
-    ("dokk", 0, 4),
-    ("fa", 3, 0),
-    ("fab", 3, -2),
-    ("fabb", 3, -4),
-    ("fabhb", 3, -3),
-    ("fahb", 3, -1),
-    ("fahk", 3, 1),
-    ("fak", 3, 2),
-    ("fakhk", 3, 3),
-    ("fakk", 3, 4),
-    ("la", 5, 0),
-    ("lab", 5, -2),
-    ("labb", 5, -4),
-    ("labhb", 5, -3),
-    ("lahb", 5, -1),
-    ("lahk", 5, 1),
-    ("lak", 5, 2),
-    ("lakhk", 5, 3),
-    ("lakk", 5, 4),
-    ("mi", 2, 0),
-    ("mib", 2, -2),
-    ("mibb", 2, -4),
-    ("mibhb", 2, -3),
-    ("mihb", 2, -1),
-    ("mihk", 2, 1),
-    ("mik", 2, 2),
-    ("mikhk", 2, 3),
-    ("mikk", 2, 4),
-    ("re", 1, 0),
-    ("reb", 1, -2),
-    ("rebb", 1, -4),
-    ("rebhb", 1, -3),
-    ("rehb", 1, -1),
-    ("rehk", 1, 1),
-    ("rek", 1, 2),
-    ("rekhk", 1, 3),
-    ("rekk", 1, 4),
-    ("si", 6, 0),
-    ("sib", 6, -2),
-    ("sibb", 6, -4),
-    ("sibhb", 6, -3),
-    ("sihb", 6, -1),
-    ("sihk", 6, 1),
-    ("sik", 6, 2),
-    ("sikhk", 6, 3),
-    ("sikk", 6, 4),
-    ("sol", 4, 0),
-    ("solb", 4, -2),
-    ("solbb", 4, -4),
-    ("solbhb", 4, -3),
-    ("solhb", 4, -1),
-    ("solhk", 4, 1),
-    ("solk", 4, 2),
-    ("solkhk", 4, 3),
-    ("solkk", 4, 4),
-];
-
-#[cfg(test)]
-mod tests {
-    use super::Language;
-    use proptest::prelude::*;
-
-    #[test]
-    fn spell_prefers_the_short_form_over_a_spelled_out_alias() {
-        // English lists both `ef` and `e-flat` for e-flat; the terse one wins.
-        // Kept as a literal pin of this specific spelling alongside the
-        // general shortest-spelling property below.
-        assert_eq!(Language::English.spell(2, -2), Some("ef"));
-        assert_eq!(Language::English.spell(0, 2), Some("cs"));
-        // A natural keeps its bare letter, not `e-natural`.
-        assert_eq!(Language::English.spell(2, 0), Some("e"));
+impl NoteNames {
+    /// Reads the note-name languages out of `share_dir`, LilyPond's version-specific share directory (`share/lilypond/2.24.3`) — the same directory [`install::load`](crate::install::load) reads its `.ly` files from.
+    ///
+    /// A file that can't be read leaves the whole set empty rather than failing: like the install layer, we would rather offer a degraded service than none, and [`empty`](Self::empty) degrades quietly — the analyser stops claiming to know what is and isn't a note rather than flagging every note in the score.
+    pub fn read(share_dir: &Path) -> NoteNames {
+        let scm_dir = share_dir.join("scm").join("lily");
+        let (Ok(names), Ok(constants)) = (
+            std::fs::read_to_string(scm_dir.join("define-note-names.scm")),
+            std::fs::read_to_string(scm_dir.join("lily-library.scm")),
+        ) else {
+            return NoteNames::empty();
+        };
+        NoteNames::parse(&names, &constants)
     }
 
-    #[test]
-    fn spell_returns_none_for_a_pitch_no_spelling_covers() {
-        // No language names a pitch this sharp (alteration 6); the tables stop at
-        // the double sharp, +4.
-        assert_eq!(Language::English.spell(0, 6), None);
-    }
+    /// Parses the text of `define-note-names.scm` and of `lily-library.scm`, in that order. Split from [`read`](Self::read) so a test can supply a fixture without a directory to put it in.
+    pub fn parse(note_names: &str, constants: &str) -> NoteNames {
+        let alterations = parse_alterations(constants);
+        let mut languages: HashMap<String, Language> = HashMap::new();
+        // Declaration order, to name the fallback default and to keep the parse a single pass.
+        let mut declared: Vec<String> = Vec::new();
+        let mut current: Option<PartialLanguage> = None;
 
-    /// Every `Language` variant, for sampling and for exhaustive iteration.
-    const ALL_LANGUAGES: [Language; 13] = [
-        Language::Catalan,
-        Language::Deutsch,
-        Language::English,
-        Language::Espanol,
-        Language::Francais,
-        Language::Italiano,
-        Language::Nederlands,
-        Language::Norsk,
-        Language::Portugues,
-        Language::SemiGerman,
-        Language::Suomi,
-        Language::Svenska,
-        Language::Vlaams,
-    ];
-
-    fn language_strategy() -> impl Strategy<Value = Language> {
-        proptest::sample::select(&ALL_LANGUAGES[..])
-    }
-
-    proptest! {
-        /// Spelling a pitch and reading the spelling back must return the
-        /// pitch you started with — otherwise a refactoring that writes a
-        /// spelled note wouldn't be able to trust its own output.
-        #[test]
-        fn spell_and_note_round_trip(
-            language in language_strategy(),
-            note_name in 0u8..7,
-            alteration in -4i8..=4,
-        ) {
-            let Some(spelling) = language.spell(note_name, alteration) else {
-                // Not every language names every pitch; nothing to round-trip.
-                return Ok(());
-            };
-            prop_assert_eq!(language.note(spelling), Some((note_name, alteration)));
+        for line in note_names.lines() {
+            if let Some(name) = language_header(line) {
+                finish(current.take(), &mut languages, &mut declared);
+                current = Some((name.to_string(), Vec::new()));
+            } else if let Some((spelling, note, alteration)) = pitch_entry(line, &alterations)
+                && let Some((_, table)) = current.as_mut()
+            {
+                table.push((spelling.to_string(), note, alteration));
+            }
         }
+        finish(current.take(), &mut languages, &mut declared);
 
-        /// `spell` documents itself as choosing the shortest of several
-        /// spellings for the same pitch (English `ef` over `e-flat`); check
-        /// that against every other table entry sharing that pitch, not just
-        /// the one example the pinned test above covers.
-        #[test]
-        fn spell_returns_the_shortest_entry_for_the_pitch(
-            language in language_strategy(),
-            note_name in 0u8..7,
-            alteration in -4i8..=4,
-        ) {
-            let Some(spelling) = language.spell(note_name, alteration) else {
-                return Ok(());
-            };
-            for &(name, note, alt) in language.table() {
-                if note == note_name && alt == alteration {
-                    prop_assert!(spelling.len() <= name.len());
+        // The aliases come after every language block, so every canonical name they can name is already known.
+        for line in note_names.lines() {
+            for (canonical, alias) in bare_pairs(line) {
+                if let Some(language) = languages.get(canonical).cloned() {
+                    languages.insert(alias.to_string(), language);
                 }
             }
         }
+
+        let default = languages
+            .get(DEFAULT_LANGUAGE)
+            .or_else(|| declared.first().and_then(|name| languages.get(name)))
+            .cloned()
+            .unwrap_or_else(|| NONE_AT_ALL.default.clone());
+        NoteNames { languages, default }
+    }
+
+    /// The set a workspace with no readable installation gets. See [`NONE_AT_ALL`].
+    pub fn empty() -> NoteNames {
+        NoteNames {
+            languages: HashMap::new(),
+            default: NONE_AT_ALL.default.clone(),
+        }
+    }
+
+    /// The shared empty set, for a caller that has a reference to hand out rather than a value to build.
+    pub fn none_at_all() -> &'static NoteNames {
+        &NONE_AT_ALL
+    }
+
+    /// The language a `\language "name"` selects, or `None` if it names none this installation knows. Aliases resolve to the language they alias.
+    pub fn language(&self, name: &str) -> Option<Language> {
+        self.languages.get(name).cloned()
+    }
+
+    /// The language in force before anything selects one — Dutch, in every version so far. See [`DEFAULT_LANGUAGE`].
+    pub fn default_language(&self) -> Language {
+        self.default.clone()
+    }
+
+    /// Every spelling `\language` accepts, with the language it selects, in alphabetical order. Aliases are listed alongside what they alias, since either is a valid thing to write.
+    pub fn accepted_names(&self) -> Vec<(&str, &Language)> {
+        let mut names: Vec<(&str, &Language)> = self
+            .languages
+            .iter()
+            .map(|(name, language)| (name.as_str(), language))
+            .collect();
+        names.sort_by_key(|&(name, _)| name);
+        names
+    }
+
+    /// Whether no language was read at all — the degraded state [`empty`](Self::empty) leaves behind.
+    pub fn is_empty(&self) -> bool {
+        self.languages.is_empty()
+    }
+}
+
+impl Language {
+    /// The canonical name of this language, as `define-note-names.scm` writes it. An alias reports what it aliases, so `\language "catalan"` and `\language "català"` both name `català`.
+    pub fn name(&self) -> &str {
+        &self.0.name
+    }
+
+    /// Whether this language knows no spellings at all — what
+    /// [`NoteNames::default_language`] answers with when there is no
+    /// installation to read. Callers use it to tell "this symbol is not a
+    /// note" from "we have no idea what a note looks like here", which are
+    /// very different things to report to a reader.
+    pub fn is_empty(&self) -> bool {
+        self.0.table.is_empty()
+    }
+
+    /// Resolves a note-name spelling to its `(note name, alteration)`, or `None` if this language has no such note.
+    pub fn note(&self, spelling: &str) -> Option<(u8, i8)> {
+        self.0
+            .table
+            .binary_search_by(|(name, _, _)| name.as_str().cmp(spelling))
+            .ok()
+            .map(|i| {
+                let (_, note, alteration) = self.0.table[i];
+                (note, alteration)
+            })
+    }
+
+    /// A spelling for the pitch `(note name, alteration)` in this language, or `None` if it has no name for it. Where a language gives several spellings (English `ef` and `e-flat`), the shortest is chosen, so callers get the terse form a writer would use rather than the spelled-out alias.
+    pub fn spell(&self, note_name: u8, alteration: i8) -> Option<&str> {
+        self.0
+            .table
+            .iter()
+            .filter(|(_, note, alteration_here)| {
+                *note == note_name && *alteration_here == alteration
+            })
+            .map(|(name, _, _)| name.as_str())
+            .min_by_key(|name| name.len())
+    }
+
+    /// This language's seven naturals, in diatonic order (`c` … `b`), as it spells them — `do, re, mi, …` for the Romance languages, `c, d, e, … h` for the Germanic ones. What completion shows to tell one language from another, since nothing in the data describes a language but the names it gives.
+    pub fn naturals(&self) -> Vec<&str> {
+        (0..7).filter_map(|note| self.spell(note, 0)).collect()
+    }
+}
+
+impl PartialEq for Language {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.name == other.0.name
+    }
+}
+
+impl Eq for Language {}
+
+impl std::fmt::Debug for Language {
+    /// The name alone: a table of a hundred spellings in every `{:?}` of a `MusicContext` would bury whatever the reader was actually looking at.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Language({:?})", self.0.name)
+    }
+}
+
+/// Files away the language just finished, keeping its table sorted by spelling for [`Language::note`]'s binary search and dropping any duplicate spelling in favour of the first — which is LilyPond's own resolution, its parser reading the alist front to back.
+fn finish(
+    language: Option<PartialLanguage>,
+    languages: &mut HashMap<String, Language>,
+    declared: &mut Vec<String>,
+) {
+    let Some((name, mut table)) = language else {
+        return;
+    };
+    table.sort_by(|a, b| a.0.cmp(&b.0));
+    table.dedup_by(|a, b| a.0 == b.0);
+    declared.push(name.clone());
+    languages.insert(
+        name.clone(),
+        Language(Arc::new(LanguageNames { name, table })),
+    );
+}
+
+/// The language a block header opens, if `line` is one: `    (nederlands . (`, and nothing else in the file has that shape.
+fn language_header(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('(')?;
+    let name = rest.strip_suffix(" . (")?;
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
+}
+
+/// The `(spelling . ,(ly:make-pitch -1 <note> <ALTERATION>))` entry on `line`, resolved through the alteration constants read from `lily-library.scm`. `None` for any other line, and for an entry naming an alteration that file doesn't define.
+fn pitch_entry<'a>(line: &'a str, alterations: &HashMap<String, i8>) -> Option<(&'a str, u8, i8)> {
+    let (spelling, rest) = line.trim().strip_prefix('(')?.split_once(" . ")?;
+    let arguments = rest.trim().strip_prefix(",(ly:make-pitch ")?;
+    let mut fields = arguments.trim_end_matches(')').split_whitespace();
+    // The octave is always -1: these tables spell pitches, and the octave a written note lands in comes from its marks, not from here.
+    fields.next()?;
+    let note = fields.next()?.parse().ok()?;
+    let alteration = *alterations.get(fields.next()?)?;
+    (note < 7).then_some((spelling, note, alteration))
+}
+
+/// Every `(one two)` pair of bare words on `line` — the shape the alias list at the tail of `define-note-names.scm` is written in, whether it puts one pair per line (2.26) or all of them on one (2.24).
+///
+/// Deliberately shapeless: a caller keeps only the pairs whose first word already names a language, which is what stops an incidental two-word form elsewhere in the file (`(string->symbol str)`) being taken for an alias.
+fn bare_pairs(line: &str) -> impl Iterator<Item = (&str, &str)> {
+    line.split('(').filter_map(|piece| {
+        let (pair, _) = piece.split_once(')')?;
+        let (first, second) = pair.trim().split_once(' ')?;
+        let bare = |word: &str| {
+            !word.is_empty()
+                && !word.contains(['(', ')', '\'', '.', ','])
+                && !word.contains(char::is_whitespace)
+        };
+        let second = second.trim();
+        (bare(first) && bare(second)).then_some((first, second))
+    })
+}
+
+/// Reads `lily-library.scm`'s `(define-public NAME <rational>)` constants, keeping those whose value is a whole number of quarter tones — every alteration constant, and nothing else that matters here (`CENTER 0` and friends come along harmlessly, under names no pitch entry ever writes).
+fn parse_alterations(constants: &str) -> HashMap<String, i8> {
+    constants
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("(define-public ")?;
+            let (name, value) = rest.trim_end_matches(')').trim().split_once(' ')?;
+            Some((name.to_string(), quarter_tones(value.trim())?))
+        })
+        .collect()
+}
+
+/// A whole-tone alteration written as a Scheme rational (`-3/4`, `1`, `0`) in quarter tones, or `None` if it isn't a rational or doesn't land on a quarter tone.
+fn quarter_tones(value: &str) -> Option<i8> {
+    let (numerator, denominator) = match value.split_once('/') {
+        Some((numerator, denominator)) => (numerator, denominator.parse::<i32>().ok()?),
+        None => (value, 1),
+    };
+    let scaled = numerator.parse::<i32>().ok()? * QUARTER_TONES_PER_WHOLE_TONE;
+    (denominator != 0 && scaled % denominator == 0)
+        .then(|| i8::try_from(scaled / denominator).ok())
+        .flatten()
+}
+
+/// LilyPond's alteration constants, enough of `lily-library.scm` for a test fixture to resolve the twelve-tone spellings [`ENGLISH_FIXTURE`] uses.
+#[cfg(test)]
+pub(crate) const CONSTANTS_FIXTURE: &str = "\
+(define-public DOUBLE-FLAT  -1)
+(define-public FLAT -1/2)
+(define-public NATURAL 0)
+(define-public SHARP 1/2)
+(define-public DOUBLE-SHARP 1)
+";
+
+/// A stand-in for `define-note-names.scm`: English names, twelve-tone only, which is all the unit tests around here need to write a note and read it back.
+///
+/// Being the only language it declares, it is also the default the analyser starts in — so a test written against this fixture writes `cs` and `ef`, not `cis` and `ees`. Anything that turns on a language *switch*, on a quarter tone, or on a spelling only some languages have belongs in an integration test reading a real installation, where the tables are LilyPond's own rather than this abbreviation of them.
+#[cfg(test)]
+pub(crate) const ENGLISH_FIXTURE: &str = "\
+(define-session-public language-pitch-names
+  `(
+    (english . (
+                (cff . ,(ly:make-pitch -1 0 DOUBLE-FLAT))
+                (cf . ,(ly:make-pitch -1 0 FLAT))
+                (c . ,(ly:make-pitch -1 0 NATURAL))
+                (cs . ,(ly:make-pitch -1 0 SHARP))
+                (css . ,(ly:make-pitch -1 0 DOUBLE-SHARP))
+
+                (dff . ,(ly:make-pitch -1 1 DOUBLE-FLAT))
+                (df . ,(ly:make-pitch -1 1 FLAT))
+                (d . ,(ly:make-pitch -1 1 NATURAL))
+                (ds . ,(ly:make-pitch -1 1 SHARP))
+                (dss . ,(ly:make-pitch -1 1 DOUBLE-SHARP))
+
+                (eff . ,(ly:make-pitch -1 2 DOUBLE-FLAT))
+                (ef . ,(ly:make-pitch -1 2 FLAT))
+                (e . ,(ly:make-pitch -1 2 NATURAL))
+                (es . ,(ly:make-pitch -1 2 SHARP))
+                (ess . ,(ly:make-pitch -1 2 DOUBLE-SHARP))
+
+                (fff . ,(ly:make-pitch -1 3 DOUBLE-FLAT))
+                (ff . ,(ly:make-pitch -1 3 FLAT))
+                (f . ,(ly:make-pitch -1 3 NATURAL))
+                (fs . ,(ly:make-pitch -1 3 SHARP))
+                (fss . ,(ly:make-pitch -1 3 DOUBLE-SHARP))
+
+                (gff . ,(ly:make-pitch -1 4 DOUBLE-FLAT))
+                (gf . ,(ly:make-pitch -1 4 FLAT))
+                (g . ,(ly:make-pitch -1 4 NATURAL))
+                (gs . ,(ly:make-pitch -1 4 SHARP))
+                (gss . ,(ly:make-pitch -1 4 DOUBLE-SHARP))
+
+                (aff . ,(ly:make-pitch -1 5 DOUBLE-FLAT))
+                (af . ,(ly:make-pitch -1 5 FLAT))
+                (a . ,(ly:make-pitch -1 5 NATURAL))
+                (as . ,(ly:make-pitch -1 5 SHARP))
+                (ass . ,(ly:make-pitch -1 5 DOUBLE-SHARP))
+
+                (bff . ,(ly:make-pitch -1 6 DOUBLE-FLAT))
+                (bf . ,(ly:make-pitch -1 6 FLAT))
+                (b . ,(ly:make-pitch -1 6 NATURAL))
+                (bs . ,(ly:make-pitch -1 6 SHARP))
+                (bss . ,(ly:make-pitch -1 6 DOUBLE-SHARP))
+                ))
+    ))
+";
+
+/// The fixture set, shared by every unit test in the crate that needs to resolve a pitch. Built once: parsing it per test would be cheap, but a shared set makes every test's [`Language`] the same one, as it is in a real document.
+#[cfg(test)]
+pub(crate) fn fixture() -> Arc<NoteNames> {
+    static FIXTURE: LazyLock<Arc<NoteNames>> =
+        LazyLock::new(|| Arc::new(NoteNames::parse(ENGLISH_FIXTURE, CONSTANTS_FIXTURE)));
+    Arc::clone(&FIXTURE)
+}
+
+/// The one language [`fixture`] holds, for a test that needs a [`Language`] to hand to a parser rather than a whole set.
+#[cfg(test)]
+pub(crate) fn fixture_language() -> Language {
+    fixture().default_language()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn english() -> Language {
+        fixture().language("english").expect("english")
     }
 
     #[test]
-    fn note_agrees_with_every_table_entry() {
-        // Exhaustive rather than random: each language's table is small and
-        // fully enumerable, so checking every entry is strictly stronger
-        // than sampling and just as cheap.
-        for &language in &ALL_LANGUAGES {
-            for &(name, note, alt) in language.table() {
-                assert_eq!(
-                    language.note(name),
-                    Some((note, alt)),
-                    "{language:?} table entry {name:?} did not round-trip through note()"
-                );
-            }
+    fn the_only_language_a_file_declares_is_its_default() {
+        // The fixture has no `nederlands` to be the default, so the first language declared stands in — the rule that keeps a set usable however LilyPond reorganises the file.
+        assert_eq!(fixture().default_language(), english());
+    }
+
+    #[test]
+    fn spellings_resolve_to_note_name_and_alteration() {
+        assert_eq!(english().note("cs"), Some((0, 2)));
+        assert_eq!(english().note("ef"), Some((2, -2)));
+        assert_eq!(english().note("bff"), Some((6, -4)));
+        assert_eq!(
+            english().note("h"),
+            None,
+            "`h` is a German name, not English"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_installation_leaves_a_language_that_knows_nothing() {
+        let empty = NoteNames::empty();
+        assert!(empty.is_empty());
+        let language = empty.default_language();
+        assert!(
+            language.is_empty(),
+            "so that callers can tell `not a note` from `no idea what a note is`"
+        );
+        assert_eq!(language.note("c"), None);
+    }
+
+    #[test]
+    fn alteration_constants_are_read_in_quarter_tones() {
+        let alterations = parse_alterations(
+            "(define-public DOUBLE-FLAT  -1)\n(define-public THREE-Q-FLAT -3/4)\n(define-public SEMI-SHARP 1/4)\n(define-public FIVE-HALF-FLAT -5/2)\n",
+        );
+        assert_eq!(alterations.get("DOUBLE-FLAT"), Some(&-4));
+        assert_eq!(alterations.get("THREE-Q-FLAT"), Some(&-3));
+        assert_eq!(alterations.get("SEMI-SHARP"), Some(&1));
+        // Beyond the usual nine, and read anyway: 2.24's `arabic` writes it.
+        assert_eq!(alterations.get("FIVE-HALF-FLAT"), Some(&-10));
+    }
+
+    #[test]
+    fn an_alias_shares_its_languages_table_and_reports_its_name() {
+        let names = NoteNames::parse(
+            &format!("{ENGLISH_FIXTURE}\n '((english inglese) (nonesuch nothing))"),
+            CONSTANTS_FIXTURE,
+        );
+        let alias = names.language("inglese").expect("the alias resolves");
+        assert_eq!(alias, english());
+        assert_eq!(
+            alias.name(),
+            "english",
+            "an alias answers to its canonical name"
+        );
+        assert_eq!(
+            names.language("nothing"),
+            None,
+            "a pair naming no language is not an alias, whatever else it may be"
+        );
+    }
+
+    #[test]
+    fn naturals_are_the_languages_own_spelling_of_c_to_b() {
+        assert_eq!(english().naturals(), ["c", "d", "e", "f", "g", "a", "b"]);
+    }
+
+    proptest! {
+        /// Spelling a pitch and reading the spelling back must return the pitch you started with — otherwise a refactoring that writes a spelled note wouldn't be able to trust its own output.
+        #[test]
+        fn spell_and_note_round_trip(note_name in 0u8..7, alteration in -4i8..=4) {
+            let language = english();
+            let Some(spelling) = language.spell(note_name, alteration) else {
+                // The fixture is twelve-tone, so it names no quarter tone; nothing to round-trip.
+                return Ok(());
+            };
+            prop_assert_eq!(language.note(spelling), Some((note_name, alteration)));
         }
     }
 }

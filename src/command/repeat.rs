@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::Diagnostic;
 use super::static_command::{StaticCommand, static_command};
 use super::{
     Arg, ArgKind, Candidate, CheckContext, Command, CommandCall, CompletionContext, MusicContext,
-    Param,
+    NoteEntry, Param,
 };
 use crate::vocabulary::Scope;
 
@@ -71,7 +71,7 @@ impl Command for RepeatCommand {
         self.base.documentation()
     }
 
-    // `\repeat`'s base is built with `MusicContext::Inherit`, for which the
+    // `\repeat`'s base is built with `NoteEntry::Inherit`, for which the
     // trait's default (return `ambient` unchanged) and this forward already
     // agree — but relying on that default is what let `\lyricsto` regress
     // silently when its own base turned out to be `NonNote`
@@ -123,7 +123,7 @@ pub(super) fn command() -> RepeatCommand {
         base: static_command(
             "repeat",
             REPEAT_PARAMS,
-            MusicContext::Inherit,
+            NoteEntry::Inherit,
             Some(super::Documentation {
                 markdown: "Repeats `music` `count` times, using `kind` to say how: `volta` for \
                  numbered alternate endings (with a following `\\alternative` supplying \

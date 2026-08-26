@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::command::{self, Command, variable::Variable};
 use crate::context::{ContextInstance, ContextType};
+use crate::note_names::NoteNames;
 
 /// Commands that are valid but absent from `lilypond-words`, so we supply them
 /// ourselves. `discant` is defined in Scheme by
@@ -114,6 +115,13 @@ pub struct Layer {
     commands: Table<Arc<dyn Command>>,
     context_types: Table<ContextType>,
     context_instances: Table<ContextInstance>,
+    /// The note-name languages this layer's source knows, for the one layer
+    /// that has any: the install's, read from its own
+    /// `define-note-names.scm`. Held here rather than beside the commands
+    /// because it isn't a namespace `\name` is looked up in — it answers
+    /// [`Scope::note_names`], the one question the note analyser and
+    /// `\language` ask of a scope that isn't "what does this word mean?".
+    note_names: Option<Arc<NoteNames>>,
 }
 
 impl Layer {
@@ -131,6 +139,7 @@ impl Layer {
             commands: Table::new(commands),
             context_types: Table::empty(),
             context_instances: Table::empty(),
+            note_names: None,
         }
     }
 
@@ -148,6 +157,22 @@ impl Layer {
         context_instances: HashMap<String, ContextInstance>,
     ) -> Self {
         self.context_instances = Table::new(context_instances);
+        self
+    }
+
+    /// Add the `note_names` this layer's source knows — the install layer's
+    /// alone, in practice, since nothing else ships a
+    /// `define-note-names.scm`. See [`Scope::note_names`] for what reads them
+    /// back out.
+    ///
+    /// An empty set is not attached at all, so that an installation whose
+    /// data couldn't be read leaves the layer as silent on the subject as one
+    /// that never had any — and, since [`Scope::note_names`] takes the
+    /// nearest layer that answers, doesn't shadow a set some other layer
+    /// does have.
+    #[must_use]
+    pub fn with_note_names(mut self, note_names: Arc<NoteNames>) -> Self {
+        self.note_names = (!note_names.is_empty()).then_some(note_names);
         self
     }
 
@@ -202,6 +227,7 @@ impl Layer {
         self.commands.is_empty()
             && self.context_types.is_empty()
             && self.context_instances.is_empty()
+            && self.note_names.is_none()
     }
 
     /// How many entries this layer holds, across all three namespaces.
@@ -311,7 +337,40 @@ impl Scope {
     /// and no words list behind them. What a workspace falls back to before
     /// (or without) a successful [`workspace_base`] load.
     pub fn builtins() -> Self {
-        Self::EMPTY.extended_with(Arc::clone(&command::CURATED))
+        Self::under_builtins().extended_with(Arc::clone(&command::CURATED))
+    }
+
+    /// What sits under [`builtins`](Self::builtins): nothing in a production
+    /// build, and in a test build the fixture note names, so that a unit test
+    /// can write a note without a LilyPond installation to read the
+    /// spellings from.
+    ///
+    /// Standing in for the languages [`workspace_base`] would have read, this
+    /// is the one difference between the scope a unit test analyses in and
+    /// the scope production falls back to before (or without) an
+    /// installation. The fixture is English and twelve-tone (see
+    /// [`ENGLISH_FIXTURE`](crate::note_names::ENGLISH_FIXTURE)), so a test
+    /// that turns on a language *switch*, a quarter tone, or LilyPond's real
+    /// spellings belongs in `tests/`, against a real installation, rather
+    /// than in `src/`.
+    /// Built once and shared, like [`command::CURATED`]: a scope's
+    /// [`fingerprint`](Self::fingerprint) hashes its layers' *ids*, so a fresh
+    /// layer per call would make two scopes assembled the same way compare
+    /// unequal and re-analyse every document that reached them.
+    #[cfg(test)]
+    fn under_builtins() -> Self {
+        static NOTE_NAMES: std::sync::LazyLock<Arc<Layer>> = std::sync::LazyLock::new(|| {
+            Arc::new(
+                Layer::new("test-note-names", HashMap::new())
+                    .with_note_names(crate::note_names::fixture()),
+            )
+        });
+        Self::EMPTY.extended_with(Arc::clone(&NOTE_NAMES))
+    }
+
+    #[cfg(not(test))]
+    fn under_builtins() -> Self {
+        Self::EMPTY
     }
 
     /// The scope a document is analysed in: `files` — the document's own layer
@@ -366,6 +425,21 @@ impl Scope {
     /// wins.
     pub fn get(&self, name: &str) -> Option<Known<'_, Arc<dyn Command>>> {
         self.resolve(|layer| layer.get(name))
+    }
+
+    /// The note-name languages visible here: the nearest layer that carries
+    /// any wins, which in practice means the install's, and
+    /// [`NoteNames::none_at_all`] when no install has been read.
+    ///
+    /// This is where the note analyser gets the language it starts in and
+    /// where [`language`](crate::command::language) resolves the name a
+    /// `\language` call gives it, so that both take the tables from the
+    /// installation the document is actually being analysed against.
+    pub fn note_names(&self) -> &NoteNames {
+        match self.layers().find_map(|layer| layer.note_names.as_deref()) {
+            Some(names) => names,
+            None => NoteNames::none_at_all(),
+        }
     }
 
     /// What `Name` refers to: the nearest layer that declares a context type
@@ -514,7 +588,7 @@ pub fn workspace_base(share_dir: &Path) -> std::io::Result<Scope> {
     let text = std::fs::read_to_string(words_path)?;
     let base = Scope::EMPTY
         .extended_with(Arc::new(words_layer(&text)))
-        .extended_with(Arc::new(crate::install::load(&share_dir.join("ly"))));
+        .extended_with(Arc::new(crate::install::load(share_dir)));
     Ok(base.extended_with(Arc::clone(&command::CURATED)))
 }
 

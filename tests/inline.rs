@@ -1,6 +1,7 @@
 use ly_lsp::code_action::CodeAction;
 use ly_lsp::code_action::inline_variable::{InlineAll, InlineHere};
-use ly_lsp::document::Document;
+
+mod common;
 use ly_lsp::line_struct::LineIndex;
 use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
@@ -119,7 +120,7 @@ fn inline_cases() {
         for case in parse_file(&content) {
             let label = format!("{file}:{}", case.line);
             let selection = Range::new(case.cursor, case.cursor);
-            let doc = Document::new(case.source.clone());
+            let doc = common::document(&case.source);
             let (offered, resolved) = match case.which {
                 Which::All => (
                     InlineAll::offer(&doc, selection).is_some(),

@@ -99,7 +99,7 @@ impl DocumentGraph {
         // Once a file is open its live buffer supersedes any on-disk parse we
         // cached while it was merely an include; drop the now-shadowed entry.
         self.cache.remove(&uri);
-        let document = Document::named(file_name(&uri), text);
+        let document = Document::named_in(&self.base(), file_name(&uri), text);
         self.open.insert(uri, document);
     }
 
@@ -658,7 +658,11 @@ impl DocumentGraph {
         }
 
         // Absent or stale: (re)read and parse, then cache.
-        let mut document = Document::named(file_name(uri), std::fs::read_to_string(&path).ok()?);
+        let mut document = Document::named_in(
+            &self.base(),
+            file_name(uri),
+            std::fs::read_to_string(&path).ok()?,
+        );
         let result = f(&mut document);
         self.cache
             .insert(uri.clone(), CachedDocument { modified, document });

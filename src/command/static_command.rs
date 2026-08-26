@@ -1,7 +1,8 @@
 //! The plain-signature layer every hand-written command starts from.
 
 use super::{
-    Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext, Param,
+    Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext, NoteEntry,
+    Param,
 };
 use crate::vocabulary::Scope;
 
@@ -16,12 +17,18 @@ use crate::vocabulary::Scope;
 pub(super) struct StaticCommand {
     pub(super) name: &'static str,
     pub(super) params: &'static [Param],
-    /// `MusicContext::Inherit` for a command that neither establishes nor
+    /// [`NoteEntry::Inherit`] for a command that neither establishes nor
     /// blocks a music context (`\repeat`, `\set`, …, and every command with no
     /// [`Music`](super::ArgKind::Music) parameter at all); a fixed variant for one
     /// that does (`\chordmode` always reads its body as `Chord`, regardless of
     /// what it was itself found in).
-    pub(super) context: MusicContext,
+    ///
+    /// Only the entry mode, never the language: a row is a `'static` table
+    /// and a [`Language`](crate::note_names::Language) is read from an
+    /// installation at runtime, and in any case no plain row switches
+    /// languages — `\language` is the one command that does, and it has an
+    /// impl of its own in [`language`](super::language).
+    pub(super) entry: NoteEntry,
     /// Curated hover prose, where we have any worth showing. `None` for the
     /// majority of rows in the hand-written tables, which say
     /// nothing beyond their signature — padding every mode-switch and
@@ -50,9 +57,9 @@ impl Command for StaticCommand {
         ambient: MusicContext,
         _scope: &Scope,
     ) -> MusicContext {
-        match self.context {
-            MusicContext::Inherit => ambient,
-            fixed => fixed,
+        match self.entry {
+            NoteEntry::Inherit => ambient,
+            fixed => ambient.with_entry(fixed),
         }
     }
 
@@ -73,14 +80,14 @@ impl Command for StaticCommand {
 pub(super) fn static_command(
     name: &'static str,
     params: &'static [Param],
-    context: MusicContext,
+    entry: NoteEntry,
     documentation: Option<Documentation>,
     completions: &'static [&'static [Candidate]],
 ) -> StaticCommand {
     StaticCommand {
         name,
         params,
-        context,
+        entry,
         documentation,
         completions,
     }

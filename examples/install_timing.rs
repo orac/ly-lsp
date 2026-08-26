@@ -32,6 +32,6 @@ fn main() {
     }
     println!(
         "install layer alone defines {} names",
-        install::load(&share_dir.join("ly")).len()
+        install::load(share_dir).len()
     );
 }

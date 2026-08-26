@@ -129,7 +129,7 @@ fn a_documented_music_function_carries_its_docstring_and_signature() {
 #[test]
 fn the_install_layer_clears_a_sensible_lower_bound() {
     for lily in require_installs() {
-        let layer = install::load(&lily.share_dir().join("ly"));
+        let layer = install::load(&lily.share_dir());
         assert!(
             layer.len() >= 300,
             "LilyPond {}: only {} entries in the install layer, expected several hundred",
@@ -193,7 +193,7 @@ fn completion_offers_what_the_installation_says() {
 #[test]
 fn the_hand_written_layers_split_on_what_the_install_defines() {
     for lily in require_installs() {
-        let layer = install::load(&lily.share_dir().join("ly"));
+        let layer = install::load(&lily.share_dir());
 
         for name in command::CURATED.names() {
             assert!(
@@ -219,7 +219,7 @@ fn the_hand_written_layers_split_on_what_the_install_defines() {
 #[test]
 fn install_declares_common_contexts() {
     for lily in require_installs() {
-        let layer = install::load(&lily.share_dir().join("ly"));
+        let layer = install::load(&lily.share_dir());
         for name in [
             "Staff",
             "Voice",
@@ -244,7 +244,7 @@ fn install_declares_common_contexts() {
 #[test]
 fn staff_keeps_its_description_through_the_engraver_performer_merge() {
     for lily in require_installs() {
-        let layer = install::load(&lily.share_dir().join("ly"));
+        let layer = install::load(&lily.share_dir());
         let staff = layer
             .get_context_type("Staff")
             .unwrap_or_else(|| panic!("LilyPond {}: Staff should be declared", lily.version));

@@ -9,7 +9,7 @@
 //! them being a plain [`Row`](super::Row): the [`MusicContext`] their body
 //! reads in isn't fixed, the way `\chordmode`'s always is, but depends on
 //! *which* context type the call names — `\new Lyrics` reads its body as
-//! [`MusicContext::NonNote`], `\new Staff` doesn't. So both get this one
+//! [`NoteEntry::NonNote`], `\new Staff` doesn't. So both get this one
 //! bespoke impl, told apart only by their `name` and their curated doc
 //! string ([`NEW_DOC`](super::NEW_DOC), [`CONTEXT_DOC`](super::CONTEXT_DOC)):
 //! `\context`'s "reuse the context if one of this type and name already
@@ -22,7 +22,7 @@ use std::borrow::Cow;
 use super::static_command::{StaticCommand, curated, static_command};
 use super::{
     Arg, ArgKind, ArgReader, Candidate, Command, CommandCall, CompletionContext, Documentation,
-    MusicContext, Param, context_instance_candidates, context_type_candidates,
+    MusicContext, NoteEntry, Param, context_instance_candidates, context_type_candidates,
 };
 use crate::line_struct::Span;
 use crate::vocabulary::Scope;
@@ -52,7 +52,7 @@ static NEW_CONTEXT_PARAMS: &[Param] = &[
     Param::required("music", ArgKind::Music),
 ];
 
-/// The context types whose body is read as [`MusicContext::NonNote`] rather
+/// The context types whose body is read as [`NoteEntry::NonNote`] rather
 /// than ordinary note music — lyrics, chord names, drum staves and the like,
 /// where a bare symbol means something other than a pitch.
 ///
@@ -172,7 +172,9 @@ impl Command for NewContextCommand {
             _ => None,
         });
         match type_name {
-            Some(type_name) if is_non_note(type_name, scope) => MusicContext::NonNote,
+            Some(type_name) if is_non_note(type_name, scope) => {
+                ambient.with_entry(NoteEntry::NonNote)
+            }
             _ => ambient,
         }
     }
@@ -201,7 +203,7 @@ pub(super) fn command(name: &'static str, doc: &'static str) -> NewContextComman
         base: static_command(
             name,
             NEW_CONTEXT_PARAMS,
-            MusicContext::Inherit,
+            NoteEntry::Inherit,
             curated(doc),
             &[],
         ),

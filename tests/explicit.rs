@@ -3,6 +3,8 @@ use ly_lsp::code_action::make_explicit::{
     MakeBothExplicit, MakeDurationsExplicit, MakePitchesExplicit,
 };
 use ly_lsp::document::Document;
+
+mod common;
 use ly_lsp::line_struct::LineIndex;
 use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
@@ -244,7 +246,7 @@ fn explicit_cases() {
         let file = path.file_name().unwrap().to_string_lossy();
 
         for case in parse_file(&content) {
-            let doc = Document::new(case.source.clone());
+            let doc = common::document(&case.source);
             for which in Which::ALL {
                 let label = format!("{file}:{} [{}]", case.line, which.word());
                 let (offered, resolved) = which.run(&doc, &case.source, case.selection);

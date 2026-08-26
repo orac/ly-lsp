@@ -26,7 +26,7 @@
 
 use super::static_command::{StaticCommand, curated, static_command};
 use super::{
-    Arg, ArgKind, ArgReader, Candidate, Command, CompletionContext, Documentation, MusicContext,
+    Arg, ArgKind, ArgReader, Candidate, Command, CompletionContext, Documentation, NoteEntry,
     Param, context_instance_candidates, context_type_candidates,
 };
 use crate::line_struct::Span;
@@ -127,7 +127,7 @@ pub(super) fn command() -> ChangeCommand {
         base: static_command(
             "change",
             CHANGE_PARAMS,
-            MusicContext::Inherit,
+            NoteEntry::Inherit,
             curated(CHANGE_DOC),
             &[],
         ),
@@ -137,7 +137,7 @@ pub(super) fn command() -> ChangeCommand {
 #[cfg(test)]
 mod tests {
     use crate::command::{self, Arg};
-    use crate::note_names::Language;
+    use crate::note_names::fixture_language;
     use crate::vocabulary::Scope;
     use tree_sitter::{Node, Tree};
 
@@ -158,7 +158,7 @@ mod tests {
             .iter()
             .position(|n| n.kind() == "escaped_word" || n.kind() == "named_context")?;
         let scope = Scope::builtins_only();
-        command::parse(&children, start, src, Language::DEFAULT, &scope).map(|(call, _)| call)
+        command::parse(&children, start, src, &fixture_language(), &scope).map(|(call, _)| call)
     }
 
     #[test]

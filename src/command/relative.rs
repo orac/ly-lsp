@@ -2,7 +2,7 @@
 
 use super::static_command::{StaticCommand, static_command};
 use super::{
-    Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, Param,
+    Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, NoteEntry, Param,
     REFERENCE_PITCH_PARAMS,
 };
 use crate::notes::Pitch;
@@ -17,7 +17,7 @@ const DEFAULT_RELATIVE_REFERENCE: Pitch = Pitch {
 
 /// `\relative [pitch] { … }`. The reference pitch is optional in the grammar
 /// (`\relative { … }` defaults to middle C, matching LilyPond) and, when
-/// present, decides the [`MusicContext::Relative`] the body reads in — the one
+/// present, decides the [`NoteEntry::Relative`] the body reads in — the one
 /// piece of behaviour [`StaticCommand`] can't express, since it needs to read
 /// an argument it just parsed rather than answer with a fixed context. Wraps a
 /// `StaticCommand` for its `name`/`signature`/`documentation`/`completions`
@@ -39,7 +39,7 @@ impl Command for RelativeCommand {
     fn music_context(
         &self,
         call: &CommandCall,
-        _ambient: MusicContext,
+        ambient: MusicContext,
         _scope: &Scope,
     ) -> MusicContext {
         let reference = call
@@ -50,7 +50,7 @@ impl Command for RelativeCommand {
                 _ => None,
             })
             .unwrap_or(DEFAULT_RELATIVE_REFERENCE);
-        MusicContext::Relative(reference)
+        ambient.with_entry(NoteEntry::Relative(reference))
     }
 
     fn documentation(&self) -> Option<&super::Documentation> {
@@ -68,7 +68,7 @@ pub(super) fn command() -> RelativeCommand {
         base: static_command(
             "relative",
             REFERENCE_PITCH_PARAMS,
-            MusicContext::Inherit,
+            NoteEntry::Inherit,
             Some(super::Documentation {
                 markdown: "Reads `music` with octaves written relative to the previous note: each \
                  note is placed in the octave closest to the one before it, starting from \

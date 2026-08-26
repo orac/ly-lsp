@@ -110,6 +110,11 @@ pub struct Document {
     /// be written here?", which completion asks. Cheap to hold: a [`Scope`] is
     /// a shared list of `Arc<Layer>`.
     analysed_in: Scope,
+    /// The layers under this document — the installation's, or the
+    /// hand-written ones alone until one is read. Kept so that a whole-buffer
+    /// change can rebuild the document without losing them, and because the
+    /// note-name languages a pitch is resolved through live down here.
+    base: Scope,
 }
 
 impl Document {
@@ -126,8 +131,21 @@ impl Document {
     /// path — hover wants the short answer, and the long one is a click away
     /// through go-to-definition.
     pub fn named(origin: impl Into<Arc<str>>, text: String) -> Self {
+        Self::named_in(&Scope::builtins(), origin, text)
+    }
+
+    /// A document analysed over `base` — what the installation's layers, once
+    /// read, give a file: its commands, its context types, and the note-name
+    /// languages its pitches are spelled in.
+    ///
+    /// [`named`](Self::named) is this with the hand-written builtins alone,
+    /// which is all a document that reaches us before (or without) an
+    /// installation has to go on: no note names, so no pitch resolves, until
+    /// [`refresh`](Self::refresh) redoes the analysis in a scope that has
+    /// some.
+    pub fn named_in(base: &Scope, origin: impl Into<Arc<str>>, text: String) -> Self {
         let tree = parse(&text, None);
-        Self::from_parts(Arc::from(text), origin.into(), tree)
+        Self::from_parts(Arc::from(text), origin.into(), tree, base.clone())
     }
 
     /// Builds the derived state (line index, symbols, definitions and note
@@ -139,7 +157,7 @@ impl Document {
     /// graph can say what else this document can see. A file that includes
     /// nothing (or nothing that defines a command) is therefore analysed here
     /// and never again.
-    fn from_parts(text: Arc<str>, origin: Arc<str>, tree: Tree) -> Self {
+    fn from_parts(text: Arc<str>, origin: Arc<str>, tree: Tree, base: Scope) -> Self {
         let line_index = LineIndex::new(&text);
         let analysis = extract(&tree, &text);
         let bindings = merge_bindings(&tree, &text, &analysis.definitions);
@@ -165,7 +183,7 @@ impl Document {
                 .with_context_types(context_types)
                 .with_context_instances(context_instances),
         );
-        let scope = own_scope(&commands_defined);
+        let scope = base.for_document(std::slice::from_ref(&commands_defined));
         let notes = note_analyser::analyse(&tree, &text, &scope);
         Self {
             text,
@@ -178,6 +196,7 @@ impl Document {
             commands_defined,
             notes,
             analysed_in: scope,
+            base,
         }
     }
 
@@ -219,7 +238,12 @@ impl Document {
     pub fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {
         let Some(range) = change.range else {
             let tree = parse(&change.text, None);
-            *self = Self::from_parts(Arc::from(change.text), Arc::clone(&self.origin), tree);
+            *self = Self::from_parts(
+                Arc::from(change.text),
+                Arc::clone(&self.origin),
+                tree,
+                self.base.clone(),
+            );
             return;
         };
 
@@ -245,7 +269,7 @@ impl Document {
         });
 
         let tree = parse(&text, Some(&self.tree));
-        *self = Self::from_parts(text, Arc::clone(&self.origin), tree);
+        *self = Self::from_parts(text, Arc::clone(&self.origin), tree, self.base.clone());
     }
 
     /// The document's source text.
@@ -888,14 +912,6 @@ pub(crate) fn parse_bindings(src: &str) -> Vec<Binding> {
     let tree = parse(src, None);
     let analysis = extract(&tree, src);
     merge_bindings(&tree, src, &analysis.definitions)
-}
-
-/// The scope a file makes on its own: the hand-written layers, plus whatever
-/// it defines itself. Assembled by the same [`Scope::for_document`] the graph
-/// uses, so a document with no includes fingerprints identically either way
-/// and is never re-analysed for the sake of it.
-fn own_scope(defined: &Arc<Layer>) -> Scope {
-    Scope::builtins().for_document(std::slice::from_ref(defined))
 }
 
 /// Parses `src`, reusing `old_tree` for incremental reparsing when supplied.

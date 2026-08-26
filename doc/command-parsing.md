@@ -157,15 +157,25 @@ That is the closure in `\include` order, with one omission: **`engraver-init.ly`
 Everything else under `ly/` is deliberately out too, because:
 
 - `init.ly` is the driver LilyPond wraps around the user's own file (via `\maininput`), not a source of definitions.
-- The note-name language files (`english.ly`, `deutsch.ly`, …) are one-line shims that do `\language "…"`; the pitch names themselves are a data table in `scm/lily/define-note-names.scm`, which [`note_names.rs`](../src/note_names.rs) already covers by other means.
+- The note-name language files (`english.ly`, `deutsch.ly`, …) are one-line shims that do `\language "…"`; the pitch names themselves are a data table in `scm/lily/define-note-names.scm`, which [`note_names.rs`](../src/note_names.rs) reads directly — see [Note names](#note-names) below.
 - `predefined-{guitar,mandolin,ukulele}-fretboards.ly` are 24–47 KB of generated chord-shape data yielding a handful of names.
 - `articulate.ly`, `bagpipe.ly`, `gregorian.ly`, `satb.ly`, the `*-tkit.ly` templates and friends are optional features the user `\include`s explicitly — and when they do, the *workspace* layer reads them, as it does any other include. They belong to that layer, not this one.
 
 Writing the closure out rather than following the `\include`s is the point: it lets the command list be trimmed (`engraver-init.ly` and `performer-init.ly`, read for context types alone via `CONTEXT_FILES` instead) and audited, and it keeps install loading out of the include-resolution machinery, which is built around a document graph these files are not in. The staleness that a fixed list risks is answered by a test: **every file in either list must exist in every install the tests find**, so a version that renames or drops one fails loudly instead of quietly losing commands or context types.
 
+### Note names
+
+The install layer carries one thing that is not a command: the note-name languages, read by [`NoteNames::read`](../src/note_names.rs) from `scm/lily/define-note-names.scm` (the spellings) and `scm/lily/lily-library.scm` (the alteration constants those spellings name, rationals in whole tones). They live on the layer beside its commands and context types, and `Scope::note_names` hands out the nearest set, so a pitch is resolved through the tables of the installation the document is actually being analysed against.
+
+Everything that knows a language exists reads them from there: the note analyser starts in the default (Dutch, named in `note_names.rs` because the file doesn't say so) and follows whatever [`command::language`](../src/command/language.rs) returns, and `\language`'s completion offers every name the installation accepts, aliases included, described by that language's own seven naturals. `\language` and a language `\include` share the one `Command` impl, since LilyPond's `english.ly` and its siblings are one-line `\language "english"` shims.
+
+A note-name language differs from an entry mode in *reach*, and `MusicContext` carries both: a `\chordmode`'s reading of its symbols stops at the closing brace, while a `\language` outlives it — LilyPond's parser switches note names for the rest of the parse. `Command::music_context` answers with both halves and the analyser applies each to its own extent.
+
+With no readable installation there are no languages at all, and the analyser then says nothing about what is or is not a note rather than flagging every symbol in the score — the same "degrade quietly" rule the CamelCase context-name fallback follows.
+
 ### Finding the install
 
-The client passes `lilypondShareDir` at `initialize`, pointing at `<share>/lilypond/<version>` — the directory whose children include `ly/` and `vim/syntax/`. Both the words file and the `ly` directory are found by joining onto it directly.
+The client passes `lilypondShareDir` at `initialize`, pointing at `<share>/lilypond/<version>` — the directory whose children include `ly/`, `scm/lily/` and `vim/syntax/`. The words file, the `ly` directory and the note-name data are all found by joining onto it directly.
 
 ### How they're read
 

@@ -27,7 +27,9 @@
 
 use tree_sitter::{Node, Tree};
 
-use crate::command::{self, Arg, CommandCall, Commands, MusicContext, clamp_octave, is_block};
+use crate::command::{
+    self, Arg, CommandCall, Commands, MusicContext, NoteEntry, clamp_octave, is_block,
+};
 use crate::line_struct::Span;
 use crate::note_names::Language;
 use crate::notes::{
@@ -70,42 +72,44 @@ impl Region {
     }
 }
 
-/// The [`MusicContext`] equivalent of the analyser's own (`mode`, `region`)
-/// pair at the point a command is encountered — what a [`Command`](command::Command)
-/// impl's `music_context` calls `ambient`.
+/// The [`NoteEntry`] equivalent of the analyser's own (`mode`, `region`)
+/// pair at the point a command is encountered — the half of what a
+/// [`Command`](command::Command) impl's `music_context` calls `ambient` that
+/// the walk carries; the other half, the active language, is
+/// [`Analyser::language`].
 ///
 /// `Region::NoteContext` (the top level, and any bare block not itself an
 /// event stream) collapses into the same case as `NoteMusic`: a command's own
 /// body is always a concrete music region once entered, so the distinction
 /// only matters for the *bare* blocks [`Region::nested_block`] already
 /// handles, never for a command's `ambient`.
-fn ambient_context(mode: Mode, region: Region) -> MusicContext {
+fn ambient_entry(mode: Mode, region: Region) -> NoteEntry {
     match region {
-        Region::NonNote => MusicContext::NonNote,
-        Region::ChordMusic => MusicContext::Chord,
+        Region::NonNote => NoteEntry::NonNote,
+        Region::ChordMusic => NoteEntry::Chord,
         Region::NoteMusic | Region::NoteContext => match mode {
-            Mode::Absolute => MusicContext::Absolute,
-            Mode::Relative(pitch) => MusicContext::Relative(pitch),
-            Mode::Fixed(offset) => MusicContext::Fixed(clamp_octave(offset)),
+            Mode::Absolute => NoteEntry::Absolute,
+            Mode::Relative(pitch) => NoteEntry::Relative(pitch),
+            Mode::Fixed(offset) => NoteEntry::Fixed(clamp_octave(offset)),
         },
     }
 }
 
-/// The inverse of [`ambient_context`]: the (`mode`, `region`) pair to walk a
-/// command's `Arg::Music` body in, given the [`MusicContext`] its
+/// The inverse of [`ambient_entry`]: the (`mode`, `region`) pair to walk a
+/// command's `Arg::Music` body in, given the [`NoteEntry`] its
 /// `music_context` resolved to. `ambient_mode` supplies the mode for
-/// [`MusicContext::Chord`] and [`MusicContext::NonNote`], neither of which
+/// [`NoteEntry::Chord`] and [`NoteEntry::NonNote`], neither of which
 /// carries one of its own — chord mode and non-note regions change what a
 /// bare symbol means, not the octave-entry mode nested `\relative`/`\fixed`
 /// blocks would still reset.
-fn mode_and_region(context: MusicContext, ambient_mode: Mode) -> (Mode, Region) {
-    match context {
-        MusicContext::Inherit => (ambient_mode, Region::NoteMusic),
-        MusicContext::Absolute => (Mode::Absolute, Region::NoteMusic),
-        MusicContext::Relative(pitch) => (Mode::Relative(pitch), Region::NoteMusic),
-        MusicContext::Fixed(offset) => (Mode::Fixed(offset.into()), Region::NoteMusic),
-        MusicContext::Chord => (ambient_mode, Region::ChordMusic),
-        MusicContext::NonNote => (ambient_mode, Region::NonNote),
+fn mode_and_region(entry: NoteEntry, ambient_mode: Mode) -> (Mode, Region) {
+    match entry {
+        NoteEntry::Inherit => (ambient_mode, Region::NoteMusic),
+        NoteEntry::Absolute => (Mode::Absolute, Region::NoteMusic),
+        NoteEntry::Relative(pitch) => (Mode::Relative(pitch), Region::NoteMusic),
+        NoteEntry::Fixed(offset) => (Mode::Fixed(offset.into()), Region::NoteMusic),
+        NoteEntry::Chord => (ambient_mode, Region::ChordMusic),
+        NoteEntry::NonNote => (ambient_mode, Region::NonNote),
     }
 }
 
@@ -121,7 +125,7 @@ pub fn analyse(tree: &Tree, src: &str, scope: &Scope) -> NoteAnalysis {
         events: Vec::new(),
         problems: Vec::new(),
         commands: Vec::new(),
-        language: Language::DEFAULT,
+        language: scope.note_names().default_language(),
         last_duration: Duration::DEFAULT,
         last_pitch: None,
         last_chord: Vec::new(),
@@ -154,7 +158,15 @@ struct Analyser<'a> {
     problems: Vec<Problem>,
     /// Structured command invocations recognised by the shared command parser, in source order (preorder, so a `\repeat` precedes the `\volta`s nested in its body).
     commands: Vec<CommandCall>,
-    /// Active note-name language; advances on `\language` / language includes.
+    /// Active note-name language, starting from the installation's default
+    /// (Dutch) and advancing whenever a command's
+    /// [`MusicContext`](command::MusicContext) comes back naming another one
+    /// — which is `\language` and a language `\include`, and nothing else.
+    ///
+    /// Running state rather than a parameter of the walk, because a language
+    /// change outlives the block it was written in: LilyPond's parser
+    /// switches note names for the rest of the parse, and a `}` doesn't put
+    /// them back.
     language: Language,
     /// Last duration seen anywhere; inherited by an event that omits its own.
     last_duration: Duration,
@@ -293,25 +305,21 @@ impl<'a> Analyser<'a> {
         region: Region,
     ) -> usize {
         let Some((call, next)) =
-            command::parse(children, start, self.src, self.language, self.scope)
+            command::parse(children, start, self.src, &self.language, self.scope)
         else {
             return start + 1;
         };
 
-        // `\language`/`\include` have a side effect no `Command` method
-        // expresses: switching the active note-name language. Rather than add
-        // a side-effect method solely for these two, we inspect the parsed
-        // call by name here, after the fact — the same string argument the
-        // `Command` impl already consumed as an ordinary `Arg::String`.
-        if matches!(call.name.as_str(), "language" | "include")
-            && let Some(Arg::String { text, .. }) = call.args.first()
-        {
-            self.set_language(Some(text));
-        }
-
-        let ambient = ambient_context(mode, region);
+        let ambient = MusicContext::new(ambient_entry(mode, region), self.language.clone());
         let context = call.cmd.music_context(&call, ambient, self.scope);
-        let (body_mode, body_region) = mode_and_region(context, mode);
+        // The entry mode governs the body and stops at its closing brace; the
+        // language doesn't. LilyPond's parser switches note names for the
+        // rest of the parse, so a language the call came back with is kept
+        // here, outside the body's own (`mode`, `region`) pair. Which
+        // commands can change it is [`language`](command::language)'s
+        // business, not this walk's.
+        self.language = context.language;
+        let (body_mode, body_region) = mode_and_region(context.entry, mode);
         let music_spans: Vec<Span> = call
             .args
             .iter()
@@ -364,14 +372,15 @@ impl<'a> Analyser<'a> {
         }
     }
 
-    /// Switches the active note-name language given a `\language`/include name (with or without a `.ly` suffix), if it names a known language.
-    fn set_language(&mut self, name: Option<&str>) {
-        if let Some(name) = name {
-            let name = name.strip_suffix(".ly").unwrap_or(name);
-            if let Some(language) = Language::from_name(name) {
-                self.language = language;
-            }
+    /// Reports the symbol at `node` as no note name in the active language — unless the active language knows no note names at all, which is what an unreadable (or not yet loaded) installation leaves behind. There the honest answer is silence: we have no idea what a note looks like, so we are in no position to say this isn't one, and flagging every symbol in the score would be a worse lie than flagging none.
+    fn flag_not_a_note(&mut self, node: Node) {
+        if self.language.is_empty() {
+            return;
         }
+        self.problems.push(Problem::NotANote(Span::new(
+            node.start_byte(),
+            node.end_byte(),
+        )));
     }
 
     /// Reads a note/rest/skip/multi-measure-rest/`q` event whose first token is the symbol at `children[start]`, returning the next index.
@@ -407,10 +416,7 @@ impl<'a> Analyser<'a> {
 
         let Some((note_name, alteration)) = self.language.note(name) else {
             // Not a note name in this language: flag it and move on.
-            self.problems.push(Problem::NotANote(Span::new(
-                symbol.start_byte(),
-                symbol.end_byte(),
-            )));
+            self.flag_not_a_note(symbol);
             return start + 1;
         };
 
@@ -677,10 +683,7 @@ impl<'a> Analyser<'a> {
             }
             let begin = node.start_byte();
             let Some((note_name, alteration)) = self.language.note(self.text(node)) else {
-                self.problems.push(Problem::NotANote(Span::new(
-                    node.start_byte(),
-                    node.end_byte(),
-                )));
+                self.flag_not_a_note(node);
                 k += 1;
                 continue;
             };
@@ -974,7 +977,7 @@ mod tests {
 
     #[test]
     fn note_names_and_accidentals() {
-        let analysis = run("{ cis des' ees }");
+        let analysis = run("{ cs df' ef }");
         let alterations: Vec<i8> = analysis
             .events
             .iter()
@@ -983,7 +986,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // cis = c sharp (+2), des = d flat (-2), ees = e flat (-2).
+        // cs = c sharp (+2), df = d flat (-2), ef = e flat (-2).
         assert_eq!(pitches(&analysis), vec![(0, -1), (1, 0), (2, -1)]);
         assert_eq!(alterations, vec![2, -2, -2]);
     }
@@ -1079,29 +1082,9 @@ mod tests {
         assert_eq!(analysis.events[1].duration.log, 3);
     }
 
-    #[test]
-    fn language_switch_changes_note_names() {
-        // In English, `cs` is C sharp; in the default Dutch it is not a note.
-        let analysis = run("\\language \"english\" { cs ef }");
-        assert!(analysis.problems.is_empty());
-        let alterations: Vec<i8> = analysis
-            .events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::Note { pitch, .. } => Some(pitch.alteration),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(alterations, vec![2, -2]);
-    }
-
-    #[test]
-    fn unquoted_language_directive_is_honoured() {
-        // `\language english` without quotes must still switch the language.
-        let analysis = run("\\language english { ef bf }");
-        assert!(analysis.problems.is_empty());
-        assert_eq!(pitches(&analysis), vec![(2, -1), (6, -1)]);
-    }
+    // Switching languages is tested in `tests/note_names.rs`, against a real
+    // installation: the fixture here declares one language, so a `\language`
+    // could only ever switch to what was already in force.
 
     #[test]
     fn command_arguments_are_not_read_as_notes() {

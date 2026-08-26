@@ -2,6 +2,8 @@ use ly_lsp::code_action::CodeAction;
 use ly_lsp::code_action::extract_to_variable::ExtractToVariable;
 use ly_lsp::code_action::inline_variable::InlineAll;
 use ly_lsp::document::Document;
+
+mod common;
 use ly_lsp::line_struct::LineIndex;
 use ly_lsp::notes::EventKind;
 use tower_lsp::lsp_types::{Position, Range, TextEdit};
@@ -169,7 +171,7 @@ fn extract_cases() {
         for case in parse_file(&content) {
             let label = format!("{file}:{}", case.line);
             let rendered = render_with_underline(&case.source, case.selection);
-            let doc = Document::new(case.source.clone());
+            let doc = common::document(&case.source);
             let offered = ExtractToVariable::offer(&doc, case.selection).is_some();
 
             match case.expected {
@@ -288,13 +290,13 @@ fn extract_then_inline_round_trips() {
             }
             let label = format!("{file}:{}", case.line);
 
-            let doc = Document::new(case.source.clone());
+            let doc = common::document(&case.source);
             let Some(extracted) = ExtractToVariable::resolve(&doc, case.selection) else {
                 continue;
             };
             let extracted_src = apply_edits(&case.source, &extracted.edits);
 
-            let extracted_doc = Document::new(extracted_src.clone());
+            let extracted_doc = common::document(&extracted_src);
             let Some(reference) = extracted_doc
                 .references()
                 .iter()
@@ -313,7 +315,7 @@ fn extract_then_inline_round_trips() {
             let round_tripped = apply_edits(&extracted_src, &inlined.edits);
 
             let before = resolved_signature(&doc);
-            let after = resolved_signature(&Document::new(round_tripped.clone()));
+            let after = resolved_signature(&common::document(&round_tripped));
             if before != after {
                 failures.push(format!(
                     "{label}: music changed by round-trip\n--- source ---\n{}\n--- round-tripped ---\n{}\n--- before ---\n{before:?}\n--- after ---\n{after:?}",

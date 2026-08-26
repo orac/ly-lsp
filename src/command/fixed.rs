@@ -2,14 +2,14 @@
 
 use super::static_command::{StaticCommand, static_command};
 use super::{
-    Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, Param,
+    Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, NoteEntry, Param,
     REFERENCE_PITCH_PARAMS, clamp_octave,
 };
 use crate::vocabulary::Scope;
 
 /// `\fixed reference { … }`. Like `\relative`, the body's context depends on
 /// the argument it parses itself: the reference pitch's octave becomes the
-/// [`MusicContext::Fixed`] offset. Absent a reference (a half-typed `\fixed
+/// [`NoteEntry::Fixed`] offset. Absent a reference (a half-typed `\fixed
 /// {`), falls back to `-1`, the offset an unmarked absolute `c` resolves to —
 /// so an incomplete `\fixed` reads its body as plain absolute entry until a
 /// reference is written. Wraps a `StaticCommand` the same way
@@ -30,7 +30,7 @@ impl Command for FixedCommand {
     fn music_context(
         &self,
         call: &CommandCall,
-        _ambient: MusicContext,
+        ambient: MusicContext,
         _scope: &Scope,
     ) -> MusicContext {
         let offset = call
@@ -41,7 +41,7 @@ impl Command for FixedCommand {
                 _ => None,
             })
             .unwrap_or(-1);
-        MusicContext::Fixed(clamp_octave(offset))
+        ambient.with_entry(NoteEntry::Fixed(clamp_octave(offset)))
     }
 
     fn documentation(&self) -> Option<&super::Documentation> {
@@ -59,7 +59,7 @@ pub(super) fn command() -> FixedCommand {
         base: static_command(
             "fixed",
             REFERENCE_PITCH_PARAMS,
-            MusicContext::Inherit,
+            NoteEntry::Inherit,
             Some(super::Documentation {
                 markdown:
                     "Reads `music` with a fixed reference octave: an unmarked note sits in the \

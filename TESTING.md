@@ -4,7 +4,9 @@ Run all the tests with `cargo test`. Alongside the unit tests in `src/`, there a
 
 ## Tests need a real LilyPond installation
 
-The server answers questions about a particular LilyPond version — what commands exist, what the initialisation files in `share/lilypond/<version>/ly` define, what the word list under `vim/syntax` contains. Those answers change from version to version, so the tests read them from a real installation rather than from copies checked into this repository. One consequence is worth stating plainly: **a test run with no LilyPond installed fails**, rather than quietly skipping the tests that need one and reporting success.
+The server answers questions about a particular LilyPond version — what commands exist, what the initialisation files in `share/lilypond/<version>/ly` define, what the word list under `vim/syntax` contains, and what note names `scm/lily/define-note-names.scm` spells. Those answers change from version to version, so the tests read them from a real installation rather than from copies checked into this repository. One consequence is worth stating plainly: **a test run with no LilyPond installed fails**, rather than quietly skipping the tests that need one and reporting success.
+
+The note names put nearly every integration test in that category, since without them not even a bare `c` resolves to a pitch. `common::document(src)` builds a document over `common::install_base()` — the vocabulary of one installation, read once and shared — and every file-based suite goes through it. The unit tests in `src/` are the exception: they analyse against a fixture holding one language, English and twelve-tone, so that a test needing nothing more than "`c` is a note" stays fast and self-contained. A unit test that needs a second language, a quarter tone, or LilyPond's real spellings belongs in `tests/` instead; `tests/note_names.rs` is where the reader itself is checked against every installation found.
 
 `tests/common/mod.rs` does the finding. `require_installs()` returns every installation it can see, oldest first, at most one per version, and a test that depends on a version loops over them:
 

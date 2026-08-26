@@ -95,6 +95,26 @@ pub fn require_installs() -> Vec<LilyPondInstall> {
     installs
 }
 
+/// The scope every document in a test is analysed over, read from the newest installation the machine has: its commands, its context types, and — what a test that writes so much as a `c` depends on — its note-name languages.
+///
+/// One installation rather than every one, unlike [`require_installs`]: the suites that use this turn on spellings (`c`, `cis`, `ees`) that no version has ever changed, so running each case against every installed version would multiply the work without asking a new question. A test whose *subject* is what a version ships still loops.
+///
+/// Built once and shared, because a scope's identity is its layers' and rebuilding it per case would re-read the whole install each time.
+pub fn install_base() -> ly_lsp::vocabulary::Scope {
+    static BASE: std::sync::OnceLock<ly_lsp::vocabulary::Scope> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let install = require_installs().pop().expect("an installation");
+        ly_lsp::vocabulary::workspace_base(&install.share_dir())
+            .expect("the installation's vocabulary is readable")
+    })
+    .clone()
+}
+
+/// A document analysed over [`install_base`] — what `Document::new` would give in the server once a workspace has loaded its LilyPond, and what a test needs for a pitch to resolve at all.
+pub fn document(text: &str) -> ly_lsp::document::Document {
+    ly_lsp::document::Document::named_in(&install_base(), "test.ly", text.to_string())
+}
+
 fn search_locations() -> Vec<PathBuf> {
     if let Some(configured) = env::var_os(INSTALL_DIR_VARIABLE) {
         return vec![PathBuf::from(configured)];

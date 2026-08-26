@@ -14,7 +14,7 @@
 use super::static_command::{StaticCommand, curated, static_command};
 use super::{
     ArgKind, Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext,
-    Param, context_instance_candidates,
+    NoteEntry, Param, context_instance_candidates,
 };
 use crate::vocabulary::Scope;
 
@@ -53,7 +53,7 @@ impl Command for LyricstoCommand {
     }
 
     // `StaticCommand::music_context` reads its own stored `context` (fixed
-    // here at `MusicContext::NonNote`, set below); the trait's default
+    // here at `NoteEntry::NonNote`, set below); the trait's default
     // instead always returns `ambient` unchanged, which is right for
     // `\change`'s `Inherit` (indistinguishable from the default either way)
     // but would silently drop `\lyricsto`'s always-`NonNote` body if left
@@ -84,7 +84,7 @@ pub(super) fn command() -> LyricstoCommand {
         base: static_command(
             "lyricsto",
             LYRICSTO_PARAMS,
-            MusicContext::NonNote,
+            NoteEntry::NonNote,
             curated(LYRICSTO_DOC),
             &[],
         ),
@@ -99,8 +99,8 @@ mod tests {
     // than duplicated here. What's added below is what wasn't covered
     // anywhere: the bare-symbol voice name, and the `music_context` forward
     // this file exists to get right.
-    use crate::command::{self, Arg, MusicContext};
-    use crate::note_names::Language;
+    use crate::command::{self, Arg, MusicContext, NoteEntry};
+    use crate::note_names::fixture_language;
     use crate::vocabulary::Scope;
     use tree_sitter::{Node, Tree};
 
@@ -119,7 +119,7 @@ mod tests {
         let children: Vec<Node> = root.children(&mut cursor).collect();
         let start = children.iter().position(|n| n.kind() == "escaped_word")?;
         let scope = Scope::builtins_only();
-        command::parse(&children, start, src, Language::DEFAULT, &scope).map(|(call, _)| call)
+        command::parse(&children, start, src, &fixture_language(), &scope).map(|(call, _)| call)
     }
 
     #[test]
@@ -135,9 +135,11 @@ mod tests {
         // `ambient` unchanged) instead of `StaticCommand`'s stored
         // `NonNote`, and lyric words were misread as notes.
         let call = call("\\lyricsto \"v\" { la }").expect("a lyricsto call");
-        let context =
-            call.cmd
-                .music_context(&call, MusicContext::Absolute, &Scope::builtins_only());
-        assert_eq!(context, MusicContext::NonNote);
+        let context = call.cmd.music_context(
+            &call,
+            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            &Scope::builtins_only(),
+        );
+        assert_eq!(context.entry, NoteEntry::NonNote);
     }
 }

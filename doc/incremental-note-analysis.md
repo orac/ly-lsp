@@ -492,7 +492,7 @@ approximate — search by the names.
 
 - `Mode` (`note_analyser.rs`) currently derives only `Debug, Clone, Copy`. Add
   `PartialEq, Eq` for the convergence equality check. `Region` already has them;
-  `Pitch`/`Duration`/`ChordNote`/`Language` are already `Eq`.
+  `Pitch`/`Duration`/`ChordNote`/`Language` are already `Eq`. `Language` alone is not `Copy`: it is a refcounted handle on a table read out of the installation, so a checkpoint clones it (an `Arc` bump) rather than copying it, and its `Eq` compares the language's name.
 - A live `Frame` holds `Node<'tree>` (it borrows the tree). A **checkpoint must
   not** — store each frame's `block_start: usize` and re-fetch the live node from
   the new tree on resume (`descendant_for_byte_range(start, start)`). Verify that

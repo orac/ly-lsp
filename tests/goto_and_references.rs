@@ -2,6 +2,8 @@
 //! what the go-to-definition and find-references handlers do.
 
 use ly_lsp::document::Document;
+
+mod common;
 use tower_lsp::lsp_types::{Position, Range};
 
 const SOURCE: &str = "\
@@ -19,7 +21,7 @@ melody = \\relative c' {
 
 /// Returns a `Document` over the shared snippet.
 fn doc() -> Document {
-    Document::new(SOURCE.to_string())
+    common::document(SOURCE)
 }
 
 #[test]
