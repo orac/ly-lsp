@@ -68,7 +68,8 @@ pub(super) fn command() -> RelativeCommand {
         base: static_command(
             "relative",
             REFERENCE_PITCH_PARAMS,
-            NoteEntry::Inherit,
+            None,
+            None,
             Some(super::Documentation {
                 markdown: "Reads `music` with octaves written relative to the previous note: each \
                  note is placed in the octave closest to the one before it, starting from \

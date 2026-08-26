@@ -26,8 +26,8 @@
 
 use super::static_command::{StaticCommand, curated, static_command};
 use super::{
-    Arg, ArgKind, ArgReader, Candidate, Command, CompletionContext, Documentation, NoteEntry,
-    Param, context_instance_candidates, context_type_candidates,
+    Arg, ArgKind, ArgReader, Candidate, Command, CompletionContext, Documentation, Param,
+    context_instance_candidates, context_type_candidates,
 };
 use crate::line_struct::Span;
 
@@ -127,7 +127,8 @@ pub(super) fn command() -> ChangeCommand {
         base: static_command(
             "change",
             CHANGE_PARAMS,
-            NoteEntry::Inherit,
+            None,
+            None,
             curated(CHANGE_DOC),
             &[],
         ),

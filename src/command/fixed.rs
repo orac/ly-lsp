@@ -3,7 +3,7 @@
 use super::static_command::{StaticCommand, static_command};
 use super::{
     Arg, Candidate, Command, CommandCall, CompletionContext, MusicContext, NoteEntry, Param,
-    REFERENCE_PITCH_PARAMS, clamp_octave,
+    REFERENCE_PITCH_PARAMS,
 };
 use crate::vocabulary::Scope;
 
@@ -41,7 +41,7 @@ impl Command for FixedCommand {
                 _ => None,
             })
             .unwrap_or(-1);
-        ambient.with_entry(NoteEntry::Fixed(clamp_octave(offset)))
+        ambient.with_entry(NoteEntry::Fixed(offset))
     }
 
     fn documentation(&self) -> Option<&super::Documentation> {
@@ -59,7 +59,8 @@ pub(super) fn command() -> FixedCommand {
         base: static_command(
             "fixed",
             REFERENCE_PITCH_PARAMS,
-            NoteEntry::Inherit,
+            None,
+            None,
             Some(super::Documentation {
                 markdown:
                     "Reads `music` with a fixed reference octave: an unmarked note sits in the \

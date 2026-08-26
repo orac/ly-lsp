@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::Diagnostic;
 use super::static_command::{StaticCommand, static_command};
 use super::{
     Arg, ArgKind, Candidate, CheckContext, Command, CommandCall, CompletionContext, MusicContext,
-    NoteEntry, Param,
+    Param,
 };
 use crate::vocabulary::Scope;
 
@@ -71,12 +71,13 @@ impl Command for RepeatCommand {
         self.base.documentation()
     }
 
-    // `\repeat`'s base is built with `NoteEntry::Inherit`, for which the
-    // trait's default (return `ambient` unchanged) and this forward already
-    // agree — but relying on that default is what let `\lyricsto` regress
-    // silently when its own base turned out to be `NonNote`
-    // (`super::lyricsto`). Forwarded explicitly so this wrapper can't drift
-    // the same way if `\repeat`'s context ever stops being `Inherit`.
+    // `\repeat`'s base establishes neither an entry mode nor a region, for
+    // which the trait's default (return `ambient` unchanged) and this forward
+    // already agree — but relying on that default is what let `\lyricsto`
+    // regress silently when its own base turned out to establish
+    // `Region::NonNote` (`super::lyricsto`). Forwarded explicitly so this
+    // wrapper can't drift the same way if `\repeat`'s base ever starts
+    // establishing something.
     fn music_context(
         &self,
         call: &CommandCall,
@@ -123,7 +124,8 @@ pub(super) fn command() -> RepeatCommand {
         base: static_command(
             "repeat",
             REPEAT_PARAMS,
-            NoteEntry::Inherit,
+            None,
+            None,
             Some(super::Documentation {
                 markdown: "Repeats `music` `count` times, using `kind` to say how: `volta` for \
                  numbered alternate endings (with a following `\\alternative` supplying \

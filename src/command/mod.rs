@@ -360,85 +360,155 @@ pub enum ArgKind {
     ContextName,
 }
 
-/// How music inside a command's body is to be read: the way its symbols are
-/// entered, and the note-name language they are spelled in.
+/// How music inside a command's body is to be read: whether its symbols are
+/// events at all, how their octaves are written, and the note names they are
+/// spelled in.
 ///
-/// The two travel together because [`Command::music_context`] is the one
-/// place either can change, and a command that changes one usually leaves the
-/// other alone: `\chordmode` re-reads the symbols but keeps the language,
-/// `\language` changes the language and reads the music no differently. Every
-/// impl builds its answer from the `ambient` context it is handed, so
-/// inheriting is the default and replacing is the deliberate act.
+/// The three travel together because [`Command::music_context`] is the one
+/// place any of them can change, and a command that changes one usually
+/// leaves the others alone: `\chordmode` re-reads the symbols but keeps the
+/// octave entry and the language, `\language` changes the language and reads
+/// the music no differently. Every impl builds its answer from the `ambient`
+/// context it is handed, so inheriting is the default and replacing is the
+/// deliberate act — which is why there is no `Inherit`: a command that
+/// establishes nothing returns `ambient` unchanged, as
+/// [`Command::music_context`]'s default body does.
 ///
-/// The two halves differ in *reach*, which is the analyser's business rather
-/// than a command's: an entry mode governs the body and stops at its closing
-/// brace, while a language change outlives it, LilyPond's parser switching
-/// note names for the rest of the parse. See
-/// [`note_analyser::Analyser::handle_command`](crate::note_analyser).
+/// This is exactly the state the note analyser's walk carries, in the same
+/// shape, so the two hand it back and forth by field rather than through a
+/// conversion. It is not, however, all of one *reach*: an entry mode and a
+/// region govern the body and stop at its closing brace, while a language
+/// change outlives it, LilyPond's parser switching note names for the rest of
+/// the parse. Which half goes where is the analyser's business; see
+/// [`note_analyser`](crate::note_analyser)'s `handle_command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MusicContext {
-    /// How to read the symbols: absolute, relative, chord mode, not music at all.
+    /// How the octaves of the symbols here are written.
     pub entry: NoteEntry,
+    /// Whether the symbols here are note events, chord-mode entries, or not
+    /// events at all. Never [`Region::NoteContext`] in a context handed to a
+    /// [`Command`]: see [`Region::in_a_command_body`].
+    pub region: Region,
     /// The note names those symbols are spelled in, as `\language` last left it.
     pub language: Language,
 }
 
 impl MusicContext {
-    /// A context reading `entry`-wise in `language`.
-    pub fn new(entry: NoteEntry, language: Language) -> Self {
-        Self { entry, language }
+    /// A context reading `region`'s symbols `entry`-wise in `language`.
+    pub fn new(entry: NoteEntry, region: Region, language: Language) -> Self {
+        Self {
+            entry,
+            region,
+            language,
+        }
     }
 
-    /// This context with a different [`NoteEntry`], keeping the language — what
-    /// a mode-switching command (`\chordmode`, `\relative`, `\lyricmode`)
-    /// returns for its body.
+    /// This context with a different [`NoteEntry`] — and, with it,
+    /// [`Region::NoteMusic`], since saying how octaves are written is only
+    /// meaningful where the symbols are notes. What `\relative`, `\fixed` and
+    /// `\notemode` return for their bodies.
     #[must_use]
     pub fn with_entry(&self, entry: NoteEntry) -> Self {
         Self {
             entry,
+            region: Region::NoteMusic,
             language: self.language.clone(),
         }
     }
 
-    /// This context with a different [`Language`], keeping the entry mode —
-    /// what [`language`] returns for a `\language` that named one it knows.
+    /// This context with a different [`Region`], keeping the octave entry —
+    /// what `\chordmode` and the non-note commands (`\lyricmode`, `\header`,
+    /// …) return. The entry mode is kept rather than reset because a nested
+    /// `{ … }` that returns to note music should still be read the way the
+    /// enclosing `\relative` was.
+    #[must_use]
+    pub fn with_region(&self, region: Region) -> Self {
+        Self {
+            entry: self.entry,
+            region,
+            language: self.language.clone(),
+        }
+    }
+
+    /// This context with a different [`Language`], keeping how the music is
+    /// read — what [`language`] returns for a `\language` that named one it
+    /// knows.
     #[must_use]
     pub fn with_language(&self, language: Language) -> Self {
         Self {
             entry: self.entry,
+            region: self.region,
             language,
         }
     }
 }
 
-/// How the symbols in a music expression are to be read. Mirrors the
-/// analyser's internal `Mode`/`Region` pair, which collapses into this once
-/// commands stop steering them by hand-written name matches; see
-/// `note_analyser`'s `ambient_context`/`mode_and_region` for the two-way
-/// conversion.
+/// How the octaves of written notes are to be read — LilyPond's "octave
+/// entry", extended with nothing: the three modes here are the three it has.
+///
+/// Carried by [`MusicContext`] and by the analyser's walk alike, which is why
+/// [`Fixed`](Self::Fixed) keeps the `i32` the analyser's octave arithmetic
+/// works in rather than being narrowed for the trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteEntry {
-    /// No opinion: read the body the same way the command itself was reached
-    /// in. Right for the overwhelming majority of commands (`\repeat`,
-    /// `\volta`, `\set`, …), which neither establish nor block a music
-    /// context of their own.
-    Inherit,
-    /// Octave marks are absolute: `c` is `octave -1`.
+    /// Octave marks are absolute: `c` is `octave -1`, and each `'`/`,`
+    /// adjusts from there.
     Absolute,
-    /// `\relative`: octave marks adjust from the previous note, carrying the
-    /// running reference pitch.
+    /// `\relative`: octave marks adjust from the previous note, whose octave
+    /// is otherwise the nearest to it. Carries the running reference pitch.
     Relative(Pitch),
-    /// `\fixed p`: an unmarked note sits in `p`'s octave. Carries that octave
-    /// offset (`i8` rather than `i32` — the analyser's octave arithmetic keeps
-    /// the wider type; this is clamped to it purely for display purposes, and
-    /// no real score writes an octave offset anywhere near either bound).
-    Fixed(i8),
-    /// `\chordmode`: bare symbols are chord-mode entries (a root with a
-    /// `:quality`/`/bass`), not pitches.
-    Chord,
+    /// `\fixed p`: like absolute, but shifted so an unmarked note sits in
+    /// `p`'s octave. Carries that octave offset.
+    Fixed(i32),
+}
+
+/// What the symbols in a stretch of music *mean* — whether they are note
+/// events, chord-mode entries, or not events at all.
+///
+/// Independent of [`NoteEntry`], which says how a note's octave is written:
+/// `\chordmode` inside a `\relative` changes what a bare symbol means without
+/// disturbing how the octaves of the notes around it are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// Bare symbols and chords here are read as note events; nested bare
+    /// blocks stay note-music.
+    NoteMusic,
+    /// `\chordmode`: bare symbols here are chord-mode entries (a root with a
+    /// `:quality`/`/bass`), read for their extent and duration but not their
+    /// pitch; nested bare blocks stay chord-music.
+    ChordMusic,
     /// Lyrics, drums, figures, markup, headers — scanned for nested music and
-    /// directives, but bare symbols are not events.
+    /// directives, but bare symbols are not events, and nested bare blocks
+    /// stay non-note.
     NonNote,
+    /// Not itself an event stream, though its nested bare blocks are
+    /// note-music. The top level of a file, and nothing else: a command's own
+    /// body is always a concrete event stream, so this never reaches a
+    /// [`Command`] — see [`in_a_command_body`](Self::in_a_command_body).
+    NoteContext,
+}
+
+impl Region {
+    /// The region a nested bare block (one with no governing command)
+    /// inherits.
+    pub fn nested_block(self) -> Region {
+        match self {
+            Region::NonNote => Region::NonNote,
+            Region::ChordMusic => Region::ChordMusic,
+            Region::NoteMusic | Region::NoteContext => Region::NoteMusic,
+        }
+    }
+
+    /// This region as a command's body sees it. The one and only difference
+    /// is [`NoteContext`](Self::NoteContext): a command's music argument is
+    /// an event stream even when the command was written at the top level,
+    /// where nothing else is.
+    pub fn in_a_command_body(self) -> Region {
+        match self {
+            Region::NoteContext => Region::NoteMusic,
+            concrete => concrete,
+        }
+    }
 }
 
 /// A cursor over the sibling nodes following a command keyword, shared by
@@ -1447,14 +1517,6 @@ fn is_punct(node: Node, src: &str, text: &str) -> bool {
     node.kind() == "punctuation" && &src[node.start_byte()..node.end_byte()] == text
 }
 
-/// Clamps an octave (the analyser's octave arithmetic is `i32`) to the `i8`
-/// [`NoteEntry::Fixed`] carries. No real score writes a `\fixed` reference
-/// anywhere near either bound; the clamp exists so a pathological one (or a
-/// fuzzer) can't panic instead of just misbehaving cosmetically.
-pub(crate) fn clamp_octave(octave: i32) -> i8 {
-    octave.clamp(i8::MIN as i32, i8::MAX as i32) as i8
-}
-
 static MUSIC_ONLY_PARAMS: &[Param] = &[Param::required("music", ArgKind::Music)];
 static CLEF_PARAMS: &[Param] = &[Param::required("name", ArgKind::String)];
 static PROPERTY_PARAMS: &[Param] = &[Param::required("property", ArgKind::PropertyPath)];
@@ -1570,7 +1632,8 @@ const CONTEXT_DOC: &str = "Finds the existing `type` context, optionally the one
 struct Row(
     &'static [&'static str],
     &'static [Param],
-    NoteEntry,
+    Option<NoteEntry>,
+    Option<Region>,
     Option<&'static str>,
     &'static [&'static [Candidate]],
 );
@@ -1597,25 +1660,26 @@ struct Row(
 /// exists to avoid. Kept hand-aligned instead, one row per line.
 #[rustfmt::skip]
 static RESERVED_ROWS: &[Row] = {
-    use NoteEntry::{Absolute, Chord, Inherit, NonNote};
+    use NoteEntry::Absolute;
+    use Region::{ChordMusic, NonNote};
     &[
-        Row(&["alternative"],           MUSIC_ONLY_PARAMS,       Inherit,  Some(ALTERNATIVE_DOC), &[]),
-        Row(&["notemode", "notes"],     MUSIC_ONLY_PARAMS,       Absolute, None,                  &[]),
-        Row(&["chordmode", "chords"],   MUSIC_ONLY_PARAMS,       Chord,    None,                  &[]),
-        Row(&["drummode", "drums"],     MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["figuremode", "figures"], MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["lyricmode", "lyrics"],   MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["addlyrics"],             MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["markup"],                MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["markuplist"],            MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["header"],                MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["paper"],                 MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["layout"],                MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["midi"],                  MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["with"],                  MUSIC_ONLY_PARAMS,       NonNote,  None,                  &[]),
-        Row(&["set"],                   PROPERTY_PARAMS,         Inherit,  None,                  &[]),
-        Row(&["unset"],                 PROPERTY_PARAMS,         Inherit,  None,                  &[]),
-        Row(&["tempo"],                 TEMPO_PARAMS,            Inherit,  Some(TEMPO_DOC),       &[]),
+        Row(&["alternative"],           MUSIC_ONLY_PARAMS,       None,           None,             Some(ALTERNATIVE_DOC), &[]),
+        Row(&["notemode", "notes"],     MUSIC_ONLY_PARAMS,       Some(Absolute), None,             None,                  &[]),
+        Row(&["chordmode", "chords"],   MUSIC_ONLY_PARAMS,       None,           Some(ChordMusic), None,                  &[]),
+        Row(&["drummode", "drums"],     MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["figuremode", "figures"], MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["lyricmode", "lyrics"],   MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["addlyrics"],             MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["markup"],                MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["markuplist"],            MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["header"],                MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["paper"],                 MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["layout"],                MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["midi"],                  MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["with"],                  MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["set"],                   PROPERTY_PARAMS,         None,           None,             None,                  &[]),
+        Row(&["unset"],                 PROPERTY_PARAMS,         None,           None,             None,                  &[]),
+        Row(&["tempo"],                 TEMPO_PARAMS,            None,           None,             Some(TEMPO_DOC),       &[]),
     ]
 };
 
@@ -1632,12 +1696,11 @@ static RESERVED_ROWS: &[Row] = {
 /// is checked by `install_layer_defines_every_curated_name`.
 #[rustfmt::skip]
 static CURATED_ROWS: &[Row] = {
-    use NoteEntry::Inherit;
     &[
-        Row(&["volta"],                 VOLTA_PARAMS,            Inherit,  Some(VOLTA_DOC),       &[]),
-        Row(&["clef"],                  CLEF_PARAMS,             Inherit,  Some(CLEF_DOC),        CLEF_COMPLETIONS),
-        Row(&["key"],                   KEY_PARAMS,              Inherit,  Some(KEY_DOC),         KEY_COMPLETIONS),
-        Row(&["transpose"],             TRANSPOSE_PARAMS,        Inherit,  Some(TRANSPOSE_DOC),   &[]),
+        Row(&["volta"],                 VOLTA_PARAMS,            None,           None,             Some(VOLTA_DOC),       &[]),
+        Row(&["clef"],                  CLEF_PARAMS,             None,           None,             Some(CLEF_DOC),        CLEF_COMPLETIONS),
+        Row(&["key"],                   KEY_PARAMS,              None,           None,             Some(KEY_DOC),         KEY_COMPLETIONS),
+        Row(&["transpose"],             TRANSPOSE_PARAMS,        None,           None,             Some(TRANSPOSE_DOC),   &[]),
     ]
 };
 
@@ -1653,7 +1716,7 @@ const OURS: &str = "built-in";
 fn table(rows: &[Row], bespoke: Vec<(&str, Arc<dyn Command>)>) -> Layer {
     let mut table: HashMap<String, Arc<dyn Command>> = HashMap::new();
 
-    for Row(names, params, entry, doc, completions) in rows {
+    for Row(names, params, entry, region, doc, completions) in rows {
         for &name in *names {
             table.insert(
                 name.to_string(),
@@ -1661,6 +1724,7 @@ fn table(rows: &[Row], bespoke: Vec<(&str, Arc<dyn Command>)>) -> Layer {
                     name,
                     params,
                     *entry,
+                    *region,
                     doc.and_then(curated),
                     completions,
                 )),
@@ -2471,10 +2535,10 @@ mod tests {
         let call = call("\\new Lyrics { la }").expect("a new call");
         let context = call.cmd.music_context(
             &call,
-            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
             &Scope::builtins_only(),
         );
-        assert_eq!(context.entry, NoteEntry::NonNote);
+        assert_eq!(context.region, Region::NonNote);
     }
 
     #[test]
@@ -2482,10 +2546,10 @@ mod tests {
         let call = call("\\new Staff { c }").expect("a new call");
         let context = call.cmd.music_context(
             &call,
-            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
             &Scope::builtins_only(),
         );
-        assert_eq!(context.entry, NoteEntry::Absolute);
+        assert_eq!(context.region, Region::NoteMusic);
     }
 
     #[test]
@@ -2507,10 +2571,10 @@ mod tests {
         let call = call("\\new MyLyrics { la }").expect("a new call");
         let context = call.cmd.music_context(
             &call,
-            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
             &scope,
         );
-        assert_eq!(context.entry, NoteEntry::NonNote);
+        assert_eq!(context.region, Region::NonNote);
     }
 
     #[test]

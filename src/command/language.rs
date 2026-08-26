@@ -6,8 +6,7 @@
 
 use super::static_command::{StaticCommand, curated, static_command};
 use super::{
-    Arg, Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext,
-    NoteEntry, Param,
+    Arg, Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext, Param,
 };
 use crate::note_names::Language;
 use crate::vocabulary::Scope;
@@ -96,13 +95,7 @@ fn selected(call: &CommandCall, scope: &Scope) -> Option<Language> {
 /// LilyPond's own `ly/`, and a file that binds the name itself means its own.
 pub(super) fn command(params: &'static [Param]) -> LanguageCommand {
     LanguageCommand {
-        base: static_command(
-            "language",
-            params,
-            NoteEntry::Inherit,
-            curated(LANGUAGE_DOC),
-            &[],
-        ),
+        base: static_command("language", params, None, None, curated(LANGUAGE_DOC), &[]),
         offers_language_names: true,
     }
 }
@@ -113,7 +106,7 @@ pub(super) fn command(params: &'static [Param]) -> LanguageCommand {
 /// filename is not a closed set.
 pub(super) fn include(params: &'static [Param]) -> LanguageCommand {
     LanguageCommand {
-        base: static_command("include", params, NoteEntry::Inherit, None, &[]),
+        base: static_command("include", params, None, None, None, &[]),
         offers_language_names: false,
     }
 }

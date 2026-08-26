@@ -2,7 +2,7 @@
 
 use super::{
     Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext, NoteEntry,
-    Param,
+    Param, Region,
 };
 use crate::vocabulary::Scope;
 
@@ -13,22 +13,37 @@ use crate::vocabulary::Scope;
 /// parameter list). One instance per row of the hand-written tables'
 /// table, plus one `base` inside each bespoke wrapper in this module's sibling
 /// files; `\chordmode` and its alias `\chords` are two separate instances
-/// sharing the same `params`/`context` but each reporting its own `name`.
+/// sharing the same `params`/`entry`/`region` but each reporting its own `name`.
+///
+/// Two of a [`MusicContext`]'s three pieces can be set from a row, and never
+/// the third: a row is a `'static` table and a
+/// [`Language`](crate::note_names::Language) is read from an installation at
+/// runtime. In any case no plain row switches languages — `\language` is the
+/// one command that does, and it has an impl of its own in
+/// [`language`](super::language).
 pub(super) struct StaticCommand {
     pub(super) name: &'static str,
     pub(super) params: &'static [Param],
-    /// [`NoteEntry::Inherit`] for a command that neither establishes nor
-    /// blocks a music context (`\repeat`, `\set`, …, and every command with no
-    /// [`Music`](super::ArgKind::Music) parameter at all); a fixed variant for one
-    /// that does (`\chordmode` always reads its body as `Chord`, regardless of
-    /// what it was itself found in).
+    /// The octave entry this command establishes for its body, if it
+    /// establishes one. `Some` for `\notemode` alone among the plain rows;
+    /// `None` for everything else, which inherits whatever the call site was
+    /// read in.
     ///
-    /// Only the entry mode, never the language: a row is a `'static` table
-    /// and a [`Language`](crate::note_names::Language) is read from an
-    /// installation at runtime, and in any case no plain row switches
-    /// languages — `\language` is the one command that does, and it has an
-    /// impl of its own in [`language`](super::language).
-    pub(super) entry: NoteEntry,
+    /// Setting this also puts the body in [`Region::NoteMusic`] — see
+    /// [`MusicContext::with_entry`] — since saying how octaves are written
+    /// is only meaningful where the symbols are notes.
+    pub(super) entry: Option<NoteEntry>,
+    /// The region this command establishes for its body, if it establishes
+    /// one: `\chordmode` always reads its body as chord music and `\header`
+    /// always as non-note, regardless of what either was itself found in.
+    /// `None` for the majority, which neither establish nor block a region of
+    /// their own (`\repeat`, `\set`, …, and every command with no
+    /// [`Music`](super::ArgKind::Music) parameter at all).
+    ///
+    /// Applied after [`entry`](Self::entry), so a row that somehow set both
+    /// would get the region it asked for rather than the `NoteMusic` the
+    /// entry implies. No row does.
+    pub(super) region: Option<Region>,
     /// Curated hover prose, where we have any worth showing. `None` for the
     /// majority of rows in the hand-written tables, which say
     /// nothing beyond their signature — padding every mode-switch and
@@ -57,9 +72,16 @@ impl Command for StaticCommand {
         ambient: MusicContext,
         _scope: &Scope,
     ) -> MusicContext {
-        match self.entry {
-            NoteEntry::Inherit => ambient,
-            fixed => ambient.with_entry(fixed),
+        // Each piece the row has an opinion about replaces the ambient one;
+        // everything else is inherited, which for the overwhelming majority
+        // of rows means all of it.
+        let established = match self.entry {
+            Some(entry) => ambient.with_entry(entry),
+            None => ambient,
+        };
+        match self.region {
+            Some(region) => established.with_region(region),
+            None => established,
         }
     }
 
@@ -80,7 +102,8 @@ impl Command for StaticCommand {
 pub(super) fn static_command(
     name: &'static str,
     params: &'static [Param],
-    entry: NoteEntry,
+    entry: Option<NoteEntry>,
+    region: Option<Region>,
     documentation: Option<Documentation>,
     completions: &'static [&'static [Candidate]],
 ) -> StaticCommand {
@@ -88,6 +111,7 @@ pub(super) fn static_command(
         name,
         params,
         entry,
+        region,
         documentation,
         completions,
     }

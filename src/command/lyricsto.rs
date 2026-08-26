@@ -14,7 +14,7 @@
 use super::static_command::{StaticCommand, curated, static_command};
 use super::{
     ArgKind, Candidate, Command, CommandCall, CompletionContext, Documentation, MusicContext,
-    NoteEntry, Param, context_instance_candidates,
+    Param, Region, context_instance_candidates,
 };
 use crate::vocabulary::Scope;
 
@@ -53,7 +53,7 @@ impl Command for LyricstoCommand {
     }
 
     // `StaticCommand::music_context` reads its own stored `context` (fixed
-    // here at `NoteEntry::NonNote`, set below); the trait's default
+    // here at `Region::NonNote`, set below); the trait's default
     // instead always returns `ambient` unchanged, which is right for
     // `\change`'s `Inherit` (indistinguishable from the default either way)
     // but would silently drop `\lyricsto`'s always-`NonNote` body if left
@@ -84,7 +84,8 @@ pub(super) fn command() -> LyricstoCommand {
         base: static_command(
             "lyricsto",
             LYRICSTO_PARAMS,
-            NoteEntry::NonNote,
+            None,
+            Some(Region::NonNote),
             curated(LYRICSTO_DOC),
             &[],
         ),
@@ -99,7 +100,7 @@ mod tests {
     // than duplicated here. What's added below is what wasn't covered
     // anywhere: the bare-symbol voice name, and the `music_context` forward
     // this file exists to get right.
-    use crate::command::{self, Arg, MusicContext, NoteEntry};
+    use crate::command::{self, Arg, MusicContext, NoteEntry, Region};
     use crate::note_names::fixture_language;
     use crate::vocabulary::Scope;
     use tree_sitter::{Node, Tree};
@@ -137,9 +138,9 @@ mod tests {
         let call = call("\\lyricsto \"v\" { la }").expect("a lyricsto call");
         let context = call.cmd.music_context(
             &call,
-            MusicContext::new(NoteEntry::Absolute, fixture_language()),
+            MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
             &Scope::builtins_only(),
         );
-        assert_eq!(context.entry, NoteEntry::NonNote);
+        assert_eq!(context.region, Region::NonNote);
     }
 }

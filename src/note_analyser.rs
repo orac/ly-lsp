@@ -27,9 +27,7 @@
 
 use tree_sitter::{Node, Tree};
 
-use crate::command::{
-    self, Arg, CommandCall, Commands, MusicContext, NoteEntry, clamp_octave, is_block,
-};
+use crate::command::{self, Arg, CommandCall, Commands, MusicContext, NoteEntry, Region, is_block};
 use crate::line_struct::Span;
 use crate::note_names::Language;
 use crate::notes::{
@@ -37,85 +35,11 @@ use crate::notes::{
 };
 use crate::vocabulary::Scope;
 
-/// The octave-entry mode in force for a span of music. The default at the top level (and inside a plain `{ }`) is [`Mode::Absolute`].
-#[derive(Debug, Clone, Copy)]
-enum Mode {
-    /// Octave marks are absolute: `c` is `octave -1`, each `'`/`,` adjusts it.
-    Absolute,
-    /// `\relative`: octave marks adjust from the previous note, whose octave is otherwise the nearest to it. Carries the running reference pitch.
-    Relative(Pitch),
-    /// `\fixed p`: like absolute, but the bare octave is shifted so an unmarked note sits in `p`'s octave. Carries that octave offset.
-    Fixed(i32),
-}
-
-/// Whether the children being walked form a note-music event stream, and what mode their nested bare blocks inherit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Region {
-    /// Bare symbols and chords here are read as note events; nested bare blocks stay note-music.
-    NoteMusic,
-    /// `\chordmode`: bare symbols here are chord-mode entries (a root with a `:quality`/`/bass`), read for their extent and duration but not their pitch; nested bare blocks stay chord-music.
-    ChordMusic,
-    /// Not itself an event stream (the top level, a music-function argument), but nested bare blocks are note-music.
-    NoteContext,
-    /// A non-note region (`\header`, `\lyricmode`, …); symbols are not events and nested bare blocks stay non-note.
-    NonNote,
-}
-
-impl Region {
-    /// The region a nested bare block (one with no governing command) inherits.
-    fn nested_block(self) -> Region {
-        match self {
-            Region::NonNote => Region::NonNote,
-            Region::ChordMusic => Region::ChordMusic,
-            Region::NoteMusic | Region::NoteContext => Region::NoteMusic,
-        }
-    }
-}
-
-/// The [`NoteEntry`] equivalent of the analyser's own (`mode`, `region`)
-/// pair at the point a command is encountered — the half of what a
-/// [`Command`](command::Command) impl's `music_context` calls `ambient` that
-/// the walk carries; the other half, the active language, is
-/// [`Analyser::language`].
-///
-/// `Region::NoteContext` (the top level, and any bare block not itself an
-/// event stream) collapses into the same case as `NoteMusic`: a command's own
-/// body is always a concrete music region once entered, so the distinction
-/// only matters for the *bare* blocks [`Region::nested_block`] already
-/// handles, never for a command's `ambient`.
-fn ambient_entry(mode: Mode, region: Region) -> NoteEntry {
-    match region {
-        Region::NonNote => NoteEntry::NonNote,
-        Region::ChordMusic => NoteEntry::Chord,
-        Region::NoteMusic | Region::NoteContext => match mode {
-            Mode::Absolute => NoteEntry::Absolute,
-            Mode::Relative(pitch) => NoteEntry::Relative(pitch),
-            Mode::Fixed(offset) => NoteEntry::Fixed(clamp_octave(offset)),
-        },
-    }
-}
-
-/// The inverse of [`ambient_entry`]: the (`mode`, `region`) pair to walk a
-/// command's `Arg::Music` body in, given the [`NoteEntry`] its
-/// `music_context` resolved to. `ambient_mode` supplies the mode for
-/// [`NoteEntry::Chord`] and [`NoteEntry::NonNote`], neither of which
-/// carries one of its own — chord mode and non-note regions change what a
-/// bare symbol means, not the octave-entry mode nested `\relative`/`\fixed`
-/// blocks would still reset.
-fn mode_and_region(entry: NoteEntry, ambient_mode: Mode) -> (Mode, Region) {
-    match entry {
-        NoteEntry::Inherit => (ambient_mode, Region::NoteMusic),
-        NoteEntry::Absolute => (Mode::Absolute, Region::NoteMusic),
-        NoteEntry::Relative(pitch) => (Mode::Relative(pitch), Region::NoteMusic),
-        NoteEntry::Fixed(offset) => (Mode::Fixed(offset.into()), Region::NoteMusic),
-        NoteEntry::Chord => (ambient_mode, Region::ChordMusic),
-        NoteEntry::NonNote => (ambient_mode, Region::NonNote),
-    }
-}
-
 /// Resolves the note state for every music event in `tree`, in source order.
 ///
-/// Walks music blocks left to right, tracking the octave-entry [`Mode`], the running `\relative` reference pitch, the active note-name language, and the last duration seen.
+/// Walks music blocks left to right, tracking the octave-entry [`NoteEntry`] (with the running `\relative` reference pitch inside it), the [`Region`] saying what a bare symbol means, the active note-name language, and the last duration seen.
+///
+/// The first three are the three a [`MusicContext`] carries, in the same types, which is what lets [`handle_command`](Analyser::handle_command) exchange them with a [`Command`](command::Command) by field rather than by conversion. They are held differently only because they *reach* differently: the entry mode and region are parameters of [`walk`](Analyser::walk), so a `}` restores them, while the language is a field on [`Analyser`], because LilyPond's parser keeps a `\language` in force for the rest of the parse.
 ///
 /// `scope` is the set of commands visible from this document — the builtins, plus whatever it and its includes define. It decides which `\foo`s are parsed as calls with arguments, and hence which following blocks are a command's body rather than loose music, so the same source analysed in two different scopes can legitimately give different events: see [`Document::refresh`](crate::document::Document::refresh) for how a document is re-analysed when its scope changes.
 pub fn analyse(tree: &Tree, src: &str, scope: &Scope) -> NoteAnalysis {
@@ -131,7 +55,7 @@ pub fn analyse(tree: &Tree, src: &str, scope: &Scope) -> NoteAnalysis {
         last_chord: Vec::new(),
     };
     // The top level is not itself a music stream, but its bare blocks are music.
-    analyser.walk(tree.root_node(), Mode::Absolute, Region::NoteContext);
+    analyser.walk(tree.root_node(), NoteEntry::Absolute, Region::NoteContext);
 
     // A file is usually mid-edit, so parse errors are normal. Where the tree is broken the structure can't be trusted — a mode block may not have formed, and its contents then read in the wrong mode — so we drop any diagnostic falling inside an error region rather than bury the real syntax error under a flurry of spurious ones.
     let mut error_spans = Vec::new();
@@ -189,7 +113,7 @@ impl<'a> Analyser<'a> {
     }
 
     /// Walks the children of `parent`. In a [`Region::NoteMusic`] region bare symbols and chords are read as music events resolved against `mode`; otherwise the children are scanned only for nested music and directives.
-    fn walk(&mut self, parent: Node, mut mode: Mode, region: Region) {
+    fn walk(&mut self, parent: Node, mut mode: NoteEntry, region: Region) {
         let mut cursor = parent.walk();
         let children: Vec<Node> = parent.children(&mut cursor).collect();
         // Whether the last child read was a music event, so a following bare
@@ -301,7 +225,7 @@ impl<'a> Analyser<'a> {
         &mut self,
         children: &[Node],
         start: usize,
-        mode: Mode,
+        mode: NoteEntry,
         region: Region,
     ) -> usize {
         let Some((call, next)) =
@@ -310,16 +234,20 @@ impl<'a> Analyser<'a> {
             return start + 1;
         };
 
-        let ambient = MusicContext::new(ambient_entry(mode, region), self.language.clone());
+        // The walk's state and a `MusicContext` are the same three things, so
+        // they pass across by field: no conversion, and nothing to keep in
+        // step. The one adjustment is `Region::NoteContext`, which describes
+        // the top level and never a command's body.
+        let ambient = MusicContext::new(mode, region.in_a_command_body(), self.language.clone());
         let context = call.cmd.music_context(&call, ambient, self.scope);
-        // The entry mode governs the body and stops at its closing brace; the
-        // language doesn't. LilyPond's parser switches note names for the
-        // rest of the parse, so a language the call came back with is kept
-        // here, outside the body's own (`mode`, `region`) pair. Which
-        // commands can change it is [`language`](command::language)'s
-        // business, not this walk's.
+        // Two of the three go back the way they came, governing the body and
+        // stopping at its closing brace. The language doesn't: LilyPond's
+        // parser switches note names for the rest of the parse, so a language
+        // the call came back with is kept here instead. Which commands can
+        // change it is [`language`](command::language)'s business, not this
+        // walk's.
         self.language = context.language;
-        let (body_mode, body_region) = mode_and_region(context.entry, mode);
+        let (body_mode, body_region) = (context.entry, context.region);
         let music_spans: Vec<Span> = call
             .args
             .iter()
@@ -348,7 +276,7 @@ impl<'a> Analyser<'a> {
     /// the node by its start byte, which `span.start` always matches: the
     /// command parser only ever produces a `Music` argument starting exactly
     /// on the node it consumed.
-    fn walk_music_arg(&mut self, children: &[Node], span: Span, mode: Mode, region: Region) {
+    fn walk_music_arg(&mut self, children: &[Node], span: Span, mode: NoteEntry, region: Region) {
         let Some(idx) = children.iter().position(|n| n.start_byte() == span.start) else {
             return;
         };
@@ -384,7 +312,7 @@ impl<'a> Analyser<'a> {
     }
 
     /// Reads a note/rest/skip/multi-measure-rest/`q` event whose first token is the symbol at `children[start]`, returning the next index.
-    fn read_symbol(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
+    fn read_symbol(&mut self, children: &[Node], start: usize, mode: &mut NoteEntry) -> usize {
         let symbol = children[start];
         let name = self.text(symbol);
         let begin = symbol.start_byte();
@@ -432,8 +360,8 @@ impl<'a> Analyser<'a> {
         let value_end = self.consume_chord_or_tremolo(children, &mut i, after_duration);
         let end = self.consume_post_events(children, &mut i, value_end);
 
-        if let Mode::Relative(_) = mode {
-            *mode = Mode::Relative(pitch);
+        if let NoteEntry::Relative(_) = mode {
+            *mode = NoteEntry::Relative(pitch);
         }
         self.last_pitch = Some(pitch);
         self.push_event(
@@ -460,7 +388,12 @@ impl<'a> Analyser<'a> {
     /// emitting an event. The first token at `children[start]` is the integer.
     ///
     /// [`Note`]: EventKind::Note
-    fn read_bare_duration(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
+    fn read_bare_duration(
+        &mut self,
+        children: &[Node],
+        start: usize,
+        mode: &mut NoteEntry,
+    ) -> usize {
         let begin = children[start].start_byte();
         let relative = self.relative_ref(*mode);
         let mut i = start;
@@ -474,8 +407,8 @@ impl<'a> Analyser<'a> {
         };
         // The bare duration is a full note at the inherited pitch, so it advances
         // the `\relative` reference — to the same pitch, leaving it unchanged.
-        if let Mode::Relative(_) = mode {
-            *mode = Mode::Relative(pitch);
+        if let NoteEntry::Relative(_) = mode {
+            *mode = NoteEntry::Relative(pitch);
         }
         self.push_event(
             begin,
@@ -494,14 +427,14 @@ impl<'a> Analyser<'a> {
     }
 
     /// Reads a chord whose `<…>` node is at `children[start]`, plus the duration that follows it, returning the next index.
-    fn read_chord(&mut self, children: &[Node], start: usize, mode: &mut Mode) -> usize {
+    fn read_chord(&mut self, children: &[Node], start: usize, mode: &mut NoteEntry) -> usize {
         let chord = children[start];
         let relative = self.relative_ref(*mode);
         let notes = self.read_chord_notes(chord, *mode);
 
         // The reference for the next note is the chord's first note.
-        if let (Mode::Relative(_), Some(first)) = (*mode, notes.first()) {
-            *mode = Mode::Relative(first.pitch);
+        if let (NoteEntry::Relative(_), Some(first)) = (*mode, notes.first()) {
+            *mode = NoteEntry::Relative(first.pitch);
         }
         if !notes.is_empty() {
             self.last_chord = notes.clone();
@@ -665,12 +598,12 @@ impl<'a> Analyser<'a> {
     }
 
     /// Resolves the pitches inside a `<…>` chord node. In relative mode the first note is relative to `mode`'s reference and each subsequent note to the one before it.
-    fn read_chord_notes(&mut self, chord: Node, mode: Mode) -> Vec<ChordNote> {
+    fn read_chord_notes(&mut self, chord: Node, mode: NoteEntry) -> Vec<ChordNote> {
         let mut cursor = chord.walk();
         let inner: Vec<Node> = chord.children(&mut cursor).collect();
         let mut notes = Vec::new();
         let mut reference = match mode {
-            Mode::Relative(pitch) => Some(pitch),
+            NoteEntry::Relative(pitch) => Some(pitch),
             _ => None,
         };
 
@@ -726,14 +659,20 @@ impl<'a> Analyser<'a> {
     }
 
     /// The absolute octave for a note given the mode, written marks, and an optional octave-check override.
-    fn resolve_octave(&self, mode: Mode, note_name: u8, marks: i32, check: Option<i32>) -> i32 {
+    fn resolve_octave(
+        &self,
+        mode: NoteEntry,
+        note_name: u8,
+        marks: i32,
+        check: Option<i32>,
+    ) -> i32 {
         if let Some(checked) = check {
             return checked;
         }
         match mode {
-            Mode::Absolute => marks - 1,
-            Mode::Fixed(offset) => marks + offset,
-            Mode::Relative(reference) => relative_octave(reference, note_name, marks),
+            NoteEntry::Absolute => marks - 1,
+            NoteEntry::Fixed(offset) => marks + offset,
+            NoteEntry::Relative(reference) => relative_octave(reference, note_name, marks),
         }
     }
 
@@ -838,9 +777,9 @@ impl<'a> Analyser<'a> {
 
     /// The `\relative` reference in force in `mode`, spelled in the active
     /// language, or `None` outside `\relative`.
-    fn relative_ref(&self, mode: Mode) -> Option<RelativeRef> {
+    fn relative_ref(&self, mode: NoteEntry) -> Option<RelativeRef> {
         match mode {
-            Mode::Relative(pitch) => Some(RelativeRef {
+            NoteEntry::Relative(pitch) => Some(RelativeRef {
                 pitch,
                 text: self.spell_pitch(pitch),
             }),
