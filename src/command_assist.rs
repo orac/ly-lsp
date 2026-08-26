@@ -51,14 +51,26 @@ fn call_at(doc: &Document, position: Position) -> Option<(usize, CallSite<'_>)> 
 /// [`SignatureHelp::active_parameter`] set from the [`CallSite`]'s
 /// argument index. `None` for a command with no parameters at all (nothing
 /// useful to prompt with) as well as when the cursor isn't in a call.
+///
+/// Also `None` once the cursor is past every parameter — `\time 4/4 ` or
+/// `\include "foo.ly" ` with the cursor in the trailing whitespace
+/// [`covers`] bridges. There is nothing left to prompt for there, and no way
+/// to say so: LSP 3.17 (all `tower-lsp` 0.20 can speak — `3.18`'s
+/// `noActiveParameterSupport` doesn't exist here) specifies an absent or
+/// out-of-range `activeParameter` as *defaulting to 0*, so a signature sent
+/// with no active parameter comes out with its **first** one highlighted —
+/// `\time`'s optional `beat-structure`, `\include`'s `filename`. Sending no
+/// help at all is the only way to show nothing.
+///
+/// [`covers`]: crate::command::Commands::call_site_at
 pub fn signature_help(doc: &Document, position: Position) -> Option<SignatureHelp> {
     let (_offset, site) = call_at(doc, position)?;
     let params = site.call.cmd.signature();
-    if params.is_empty() {
+    if site.index >= params.len() {
         return None;
     }
 
-    let active_parameter = (site.index < params.len()).then_some(site.index as u32);
+    let active_parameter = Some(site.index as u32);
     let signature = SignatureInformation {
         label: signature_label(&site.call.name, params),
         documentation: None,
@@ -1341,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_help_clears_its_active_parameter_right_past_a_closed_string() {
+    fn signature_help_stops_right_past_a_closed_string() {
         // A quoted string's span already ends at its own closing quote, so
         // typing (or just moving the cursor) one more byte past it can never
         // still be extending `filename` — unlike a bareword or number, which
@@ -1349,12 +1361,13 @@ mod tests {
         // sit in the trailing whitespace `covers` bridges (see
         // `call_site_just_past_a_half_typed_argument` in `command::mod`), so
         // getting this right is `align_arg_to_param`'s job, not `covers`'.
+        // `filename` being `\include`'s only parameter, past it is past the
+        // whole signature, so there's no help to show — see `signature_help`
+        // for why showing it with nothing highlighted isn't an option.
         let (doc, pos) = doc_at("\\include \"foo.ly\"|");
-        let help = signature_help(&doc, pos).expect("signature help");
-        assert_eq!(help.active_parameter, None);
+        assert!(signature_help(&doc, pos).is_none());
 
         let (doc, pos) = doc_at("\\include \"foo.ly\" |");
-        let help = signature_help(&doc, pos).expect("signature help");
-        assert_eq!(help.active_parameter, None);
+        assert!(signature_help(&doc, pos).is_none());
     }
 }
