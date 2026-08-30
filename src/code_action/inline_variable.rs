@@ -62,7 +62,7 @@ impl CodeAction for InlineAll {
         });
         Some(Resolved {
             edits,
-            command: None,
+            rename_at: None,
         })
     }
 }
@@ -85,7 +85,7 @@ impl CodeAction for InlineHere {
         let def = find_definition(document, &name)?;
         Some(Resolved {
             edits: inline_at(document, &def, reference)?,
-            command: None,
+            rename_at: None,
         })
     }
 }

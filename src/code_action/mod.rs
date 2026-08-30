@@ -22,8 +22,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::{
-    CodeAction as LspCodeAction, CodeActionKind, CodeActionOrCommand, Command, Range, TextEdit,
-    Url, WorkspaceEdit,
+    CodeAction as LspCodeAction, CodeActionKind, CodeActionOrCommand, Command, Position, Range,
+    TextEdit, Url, WorkspaceEdit,
 };
 
 use crate::document::Document;
@@ -55,11 +55,29 @@ pub struct Offer {
     pub kind: CodeActionKind,
 }
 
-/// The edits that perform an action, plus an optional follow-up command.
+/// The edits that perform an action, plus an optional follow-up rename.
+///
+/// `rename_at` is a position *in the document once `edits` have been applied*.
+/// [`resolve`] turns it into the [`RENAME_COMMAND`] follow-up aimed there, so
+/// the editor opens its rename box on a name the action just introduced (the new
+/// `music` variable, say) instead of wherever the cursor happened to land after
+/// the edit.
 pub struct Resolved {
     pub edits: Vec<TextEdit>,
-    pub command: Option<Command>,
+    pub rename_at: Option<Position>,
 }
+
+/// The client command [`resolve`] attaches to an action that wants the editor
+/// to follow up by renaming something it just inserted (see
+/// [`Resolved::rename_at`]). It takes two arguments, the document URI and the
+/// position to rename at, and the extension turns them into a live
+/// `editor.action.rename` invocation.
+///
+/// The server can't target `editor.action.rename` itself: that command needs a
+/// real editor URI object, and an argument crossing the LSP boundary is only
+/// ever plain JSON, so the round-trip through a client-side command is
+/// unavoidable.
+const RENAME_COMMAND: &str = "lilypondStudio.renameSymbol";
 
 /// Carried in an offered action's `data` so `resolve` can rebuild it: which
 /// action it was, and the document and selection it applied to.
@@ -139,13 +157,23 @@ pub fn resolve(document: &Document, mut action: LspCodeAction) -> LspCodeAction 
     };
 
     if let Some(resolved) = resolved {
+        // Built before `data.uri` is moved into `changes`: the rename command
+        // has to name the same document the edits land in.
+        action.command = resolved.rename_at.map(|position| Command {
+            title: "Rename".to_string(),
+            command: RENAME_COMMAND.to_string(),
+            arguments: Some(vec![
+                serde_json::to_value(&data.uri).expect("uri serialises"),
+                serde_json::to_value(position).expect("position serialises"),
+            ]),
+        });
+
         let mut changes = HashMap::new();
         changes.insert(data.uri, resolved.edits);
         action.edit = Some(WorkspaceEdit {
             changes: Some(changes),
             ..WorkspaceEdit::default()
         });
-        action.command = resolved.command;
     }
     action
 }

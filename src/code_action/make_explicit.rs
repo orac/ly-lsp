@@ -128,7 +128,7 @@ fn resolve_edits(
 
     (!edits.is_empty()).then_some(Resolved {
         edits,
-        command: None,
+        rename_at: None,
     })
 }
 

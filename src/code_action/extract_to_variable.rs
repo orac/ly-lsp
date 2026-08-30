@@ -1,7 +1,7 @@
 //! The "extract to variable" refactoring: turn a selected run of music into a
 //! named top-level definition and a `\name` reference in its place.
 
-use tower_lsp::lsp_types::{CodeActionKind, Command, Range, TextEdit};
+use tower_lsp::lsp_types::{CodeActionKind, Range, TextEdit};
 use tree_sitter::Node;
 
 use crate::document::Document;
@@ -104,13 +104,13 @@ impl CodeAction for ExtractToVariable {
 
         Some(Resolved {
             edits,
-            // Prompt the editor to rename the freshly inserted `music` variable
-            // so the user can give it a meaningful name straight away.
-            command: Some(Command {
-                title: "Rename".to_string(),
-                command: "editor.action.rename".to_string(),
-                arguments: None,
-            }),
+            // Open the rename box on the `music` the new definition introduces so
+            // the user can give it a meaningful name straight away. `insert_before`
+            // is the start of the inserted line, which is the first character of
+            // `music` once the edits apply — aiming the rename there rather than
+            // at the ambient cursor, which lands on the `\` of the `\music`
+            // reference and so renames nothing.
+            rename_at: Some(insert_before),
         })
     }
 }

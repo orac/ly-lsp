@@ -63,7 +63,7 @@ impl CodeAction for InlineRepeats {
         let repeat = repeat_at(document, selection)?;
         Some(Resolved {
             edits: unfold(document, &repeat)?,
-            command: None,
+            rename_at: None,
         })
     }
 }

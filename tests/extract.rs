@@ -32,6 +32,29 @@ fn apply_edits(src: &str, edits: &[TextEdit]) -> String {
     out
 }
 
+// Checks where the follow-up rename would land in the extracted document, and
+// describes the problem if it isn't on the `music` name the extraction inserts.
+// The editor is told to open its rename box there, so being even one column off
+// — onto the `\` of the `\music` reference, say — leaves it renaming nothing.
+fn rename_target_problem(doc: &str, rename_at: Option<Position>) -> Option<String> {
+    let Some(position) = rename_at else {
+        return Some("resolve produced no rename position".to_string());
+    };
+    let offset = LineIndex::new(doc)
+        .offset_at(position)
+        .unwrap_or_else(|| panic!("rename position {position:?} is outside the document"));
+    let tail = &doc[offset..];
+    let on_reference = doc[..offset].ends_with('\\');
+    if tail.starts_with("music") && !on_reference {
+        None
+    } else {
+        let seen: String = tail.chars().take(8).collect();
+        Some(format!(
+            "rename position {position:?} is not on the inserted `music` name (found {seen:?})"
+        ))
+    }
+}
+
 // Renders `source` with the selected region highlighted using ANSI underline.
 // Positions are in LSP (line, UTF-16 char) units; test files are ASCII so
 // char counts equal byte counts.
@@ -203,6 +226,10 @@ fn extract_cases() {
                                     "{label}: output mismatch\n{rendered}\n--- expected ---\n{exp}\n--- actual ---\n{}",
                                     actual.trim_end()
                                 ));
+                            } else if let Some(problem) =
+                                rename_target_problem(&actual, resolved.rename_at)
+                            {
+                                failures.push(format!("{label}: {problem}\n{rendered}"));
                             }
                         }
                     }
