@@ -10,6 +10,7 @@
 //! [`Arg::BareWord`] and [`Arg::Word`] →[`SemanticTokenType::KEYWORD`], as per the `\repeat volta` example above.
 //! [`Arg::ContextType`] → [`SemanticTokenType::TYPE`], e.g. `\new Staff`.
 //! [`Arg::ContextName`] → [`SemanticTokenType::VARIABLE`], e.g. `\new Staff = horns`.
+//! A lyric syllable → [`SemanticTokenType::STRING`], via [`lyric_syllables`]. We can identify these more reliably than the simple TM grammar.
 //!
 //! # What doesn't get a token
 //!
@@ -48,9 +49,10 @@ use tower_lsp::lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokensLegend,
 };
 
-use crate::command::{Arg, flat_args};
+use crate::command::{Arg, Region, flat_args};
 use crate::document::Document;
 use crate::line_struct::{LineIndex, Span};
+use crate::notes::EventKind;
 
 /// The token types this server emits, in legend order. [`token_type_index`]
 /// looks a type's index up by searching this slice rather than a
@@ -60,6 +62,13 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::KEYWORD,
     SemanticTokenType::TYPE,
     SemanticTokenType::VARIABLE,
+    // For lyric syllables. STRING is the nearest standard type, and matches
+    // what the TextMate grammar already scopes them (`string.quoted.other.lyrics`),
+    // so themes colour them the same whether or not the server is up. The
+    // alternative is a custom `lyric` type, which would need a
+    // `contributes.semanticTokenScopes` entry in the extension's package.json
+    // to fall back sanely in themes that have never heard of it.
+    SemanticTokenType::STRING,
 ];
 
 /// No modifiers are used. Declared (empty) rather than omitted because some
@@ -94,6 +103,8 @@ pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
     let context_type = token_type_index(&SemanticTokenType::TYPE);
     let context_name = token_type_index(&SemanticTokenType::VARIABLE);
 
+    let syllable = token_type_index(&SemanticTokenType::STRING);
+
     let mut tagged: Vec<(Span, u32)> = doc
         .commands()
         .iter()
@@ -104,6 +115,7 @@ pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
             Arg::ContextName { span, .. } => Some((*span, context_name)),
             _ => None,
         })
+        .chain(lyric_syllables(doc).into_iter().map(|span| (span, syllable)))
         .collect();
     // This sort keeps a merge of
     // several *kinds* — a `\new Staff` inside a `\repeat volta 2`, or the
@@ -111,6 +123,20 @@ pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
     // interleaves the two kinds' spans for us.
     tagged.sort_by_key(|(span, _)| span.start);
     encode(doc.line_index(), &tagged)
+}
+
+/// Every lyric syllable in `doc`, in no particular order (the caller sorts).
+/// 
+/// This filters the already-collected list of [`EventKind::WordEvent`].
+///
+/// The span stops at [`value_end`](Event::value_end) rather than covering the
+/// whole event, so the TM grammar can colour any duration and articulations.
+fn lyric_syllables(doc: &Document) -> Vec<Span> {
+    doc.notes()
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::WordEvent(Region::Lyrics)))
+        .map(|event| Span::new(event.span.start, event.value_end))
+        .collect()
 }
 
 /// Delta-encodes `tokens` — each a span paired with the semantic token type
@@ -221,7 +247,8 @@ mod tests {
     fn emits_a_variable_token_for_a_context_name() {
         let doc = Document::new("{ \\lyricsto \"vocals\" { la } }".to_string());
         let tokens = semantic_tokens_full(&doc);
-        assert_eq!(tokens.len(), 1);
+        // Two now: the voice name, then `la` as a syllable of the lyric body.
+        assert_eq!(tokens.len(), 2);
         // Unlike `ContextType::name_span` and `ContextInstance::span` (read
         // by `context.rs`, for a different purpose — see their docs),
         // `Arg::ContextName`'s own span is the whole `string` node, quotes
@@ -364,6 +391,7 @@ mod tests {
                         | Arg::ContextName { span, .. } => Some(*span),
                         _ => None,
                     })
+                    .chain(lyric_syllables(&doc))
                     .collect();
                 expected_spans.sort_by_key(|span| span.start);
 

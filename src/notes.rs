@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use crate::command::Commands;
+use crate::command::{Commands, Region};
 use crate::line_struct::Span;
 
 /// A pitch resolved to its absolute value, mirroring LilyPond's internal model
@@ -130,6 +130,8 @@ pub enum EventKind {
     /// and the `:`/`/`, so [`value_end`](Event::value_end) marks the point
     /// before them, not the end of the whole entry.
     ChordModeEvent,
+    /// A word event: like a note but with only a name, no pitch/octave. This is used for lyric, drum, and figure modes, and the `Region` indicates which.
+    WordEvent(Region),
 }
 
 /// The `\relative` reference in force just before an event: the reference

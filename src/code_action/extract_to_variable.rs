@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{CodeActionKind, Range, TextEdit};
 use tree_sitter::Node;
 
 use crate::document::Document;
-use crate::notes::{Duration, Event};
+use crate::notes::{Duration, Event, EventKind};
 
 use super::note_state::{leading_note, octave_fix, pitch_of};
 use super::{CodeAction, Offer, Resolved};
@@ -59,9 +59,16 @@ impl CodeAction for ExtractToVariable {
         // Make the variable's first event carry an explicit duration: once it is
         // detached from its surroundings, an omitted duration would inherit from
         // wherever the variable is defined instead of from the original context.
+        //
+        // Word events are left alone. A lyric syllable inherits a duration like
+        // anything else, but it is almost always the melody it is set against
+        // that carries the rhythm; writing `la4` onto a syllable the user wrote
+        // bare would be a visible edit to preserve something that usually isn't
+        // there to preserve.
         let mut content = text[actual_start..actual_end].to_string();
         if let Some(first) = selected.first()
             && !first.duration_written
+            && !matches!(first.kind, EventKind::WordEvent(_))
         {
             // The duration goes on the note value, before any post-events, so
             // insert at `value_end` rather than the end of the (possibly

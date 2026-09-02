@@ -10,7 +10,7 @@
 //!
 //! At an event position in a music block, any bare `symbol` (not introduced by `\` and not a quoted string) must be either one of the special tokens `r`/`R`/`s`/`q` or a pitch in the [active note-name language](crate::note_names). A `symbol` that is neither is reported as an invalid note (a diagnostic), which surfaces the places this lexical heuristic breaks down.
 //!
-//! The active language follows `\language "…"` and `\include "….ly"` directives as they appear, starting from LilyPond's default (Dutch). Pitch resolution is only attempted in note mode (the default, `\notemode`, `\relative`, `\fixed`); `\chordmode` gives symbols chord meanings rather than pitches, so its entries are recorded for their extent and duration but not resolved to a pitch (an [`EventKind::ChordModeEvent`]). `\drummode` and `\figuremode` give symbols yet other meanings and are left alone for now.
+//! The active language follows `\language "…"` and `\include "….ly"` directives as they appear, starting from LilyPond's default (Dutch). Pitch resolution is only attempted in note mode (the default, `\notemode`, `\relative`, `\fixed`); `\chordmode` gives symbols chord meanings rather than pitches, so its entries are recorded for their extent and duration but not resolved to a pitch (an [`EventKind::ChordModeEvent`]). Lyric mode is the same idea taken further: its note values are *words* — any bare symbol or quoted string — so every syllable is an [`EventKind::WordEvent`] with a duration and no pitch, and no syllable is ever an invalid note name. `\drummode` and `\figuremode` want exactly that treatment with a vocabulary of their own, and are left alone until they get their own [`Region`]s.
 //!
 //! # Known limitations
 //!
@@ -175,6 +175,17 @@ impl<'a> Analyser<'a> {
                 }
                 "symbol" if region == Region::ChordMusic => {
                     i = self.read_chord_mode_event(&children, i);
+                    after_event = false;
+                }
+                // A word-valued region (lyrics now, drums and figures later):
+                // the note value is the word itself. A quoted string counts —
+                // `\lyricmode { "ah" }` is how a syllable containing spaces or
+                // digits is written — which is why this arm takes `string` as
+                // well as `symbol`, unlike every other region.
+                "symbol" | "string" if region.reads_words() => {
+                    i = self.read_word_event(&children, i, region);
+                    // A bare duration inherits a *pitch*, which a word event
+                    // hasn't got, so no run continues from here.
                     after_event = false;
                 }
                 // `\new`/`\context` is a `named_context` node rather than a bare
@@ -482,6 +493,31 @@ impl<'a> Analyser<'a> {
             end,
             value_end,
             EventKind::ChordModeEvent,
+            duration,
+            written,
+            None,
+        );
+        i
+    }
+
+    /// Reads a word event whose value is at `children[start]` — the bare `symbol` or quoted `string` that stands where a note name would in a word-valued `region` — together with its optional duration and any post-events, returning the next index.
+    ///
+    /// Nothing is resolved and nothing is checked: a lyric syllable is an arbitrary word, so there is no vocabulary to look it up in and no such thing as an invalid one. That is the whole reason lyrics needed their own region rather than reading as note music — every syllable of `Hap -- py birth -- day` would otherwise be reported as a bad note name — and equally the reason they are events at all rather than skipped like [`Region::NonNote`]: they carry durations (`la4 la8`), and a refactoring detaching one needs its extent and its inherited duration exactly as it would for a note.
+    fn read_word_event(&mut self, children: &[Node], start: usize, region: Region) -> usize {
+        let value = children[start];
+        let begin = value.start_byte();
+        let mut i = start + 1;
+        let (duration, written) = self.parse_duration(children, &mut i);
+        // `parse_duration` leaves `i` one past whatever it consumed, so the
+        // value ends where the last consumed node does — the word itself when
+        // there was no duration to read.
+        let value_end = children[i - 1].end_byte();
+        let end = self.consume_post_events(children, &mut i, value_end);
+        self.push_event(
+            begin,
+            end,
+            value_end,
+            EventKind::WordEvent(region),
             duration,
             written,
             None,
@@ -867,14 +903,25 @@ mod tests {
             .set_language(&tree_sitter_lilypond::LANGUAGE_LILYPOND.into())
             .expect("load grammar");
         let tree = parser.parse(src, None).expect("parse");
-        // The file's own music functions are in scope, as they are for a real
-        // document; what it *includes* is the document graph's business, not
-        // the analyser's.
-        let defined = std::sync::Arc::new(crate::command::definition::layer(
-            crate::command::scheme::read(&tree, src),
-            std::sync::Arc::from(src),
-            std::sync::Arc::from("test.ly"),
-        ));
+        // The file's own music functions and context types are in scope, as
+        // they are for a real document (`Document::from_parts` builds exactly
+        // this layer); what it *includes* is the document graph's business,
+        // not the analyser's. The context types matter here and not only in
+        // `context.rs`'s own tests: a `\context { \name … \alias Lyrics }`
+        // decides what region `\new` gives its body, and hence whether the
+        // words inside are syllables or bad note names.
+        let context_types = crate::context::read(&tree, src)
+            .into_iter()
+            .map(|context_type| (context_type.name.clone(), context_type))
+            .collect();
+        let defined = std::sync::Arc::new(
+            crate::command::definition::layer(
+                crate::command::scheme::read(&tree, src),
+                std::sync::Arc::from(src),
+                std::sync::Arc::from("test.ly"),
+            )
+            .with_context_types(context_types),
+        );
         analyse(&tree, src, &Scope::builtins().for_document(&[defined]))
     }
 
@@ -896,6 +943,17 @@ mod tests {
             .events
             .iter()
             .map(|e| (e.duration.log, e.duration.dots))
+            .collect()
+    }
+
+    /// The value text of every word event, in order: what a lyric block (and,
+    /// later, a drum or figure one) contributes to the event stream.
+    fn word_values<'a>(src: &'a str, analysis: &NoteAnalysis) -> Vec<&'a str> {
+        analysis
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::WordEvent(_)))
+            .map(|e| &src[e.span.start..e.value_end])
             .collect()
     }
 
@@ -1166,12 +1224,15 @@ mod tests {
     }
 
     #[test]
-    fn lyricsto_voice_name_argument_is_not_a_note() {
+    fn lyricsto_voice_name_argument_is_not_a_syllable() {
         // The voice name after \lyricsto (bare symbol form, as opposed to a
-        // quoted string) must not be read as a note.
-        let analysis = run("\\new Lyrics \\lyricsto v { la la }");
+        // quoted string) is an argument of the command, so it must stay out of
+        // the event stream even though the syllables after it are in it — the
+        // distinction the old "no events at all" assertion here couldn't draw.
+        let src = "\\new Lyrics \\lyricsto v { la la }";
+        let analysis = run(src);
         assert!(analysis.problems.is_empty());
-        assert!(analysis.events.is_empty());
+        assert_eq!(word_values(src, &analysis), vec!["la", "la"]);
     }
 
     #[test]
@@ -1201,19 +1262,55 @@ mod tests {
     }
 
     #[test]
-    fn lyricmode_contents_are_not_read_as_notes() {
+    fn lyricmode_contents_are_word_events_not_notes() {
         // The bare `\lyricmode` keyword itself, as opposed to `\new Lyrics { … }`
         // or `\lyricsto`/`\addlyrics`, which the existing `lyrics_are_not_read_as_notes` covers.
-        let analysis = run("\\lyricmode { wobble blah }");
+        // Syllables are events — they carry durations, and highlighting reads
+        // them out of here — but never notes, and never bad note names.
+        let src = "\\lyricmode { wobble blah }";
+        let analysis = run(src);
         assert!(analysis.problems.is_empty());
-        assert!(analysis.events.is_empty());
+        assert_eq!(word_values(src, &analysis), vec!["wobble", "blah"]);
+        assert!(pitches(&analysis).is_empty());
     }
 
     #[test]
     fn lyrics_alias_behaves_like_lyricmode() {
-        let analysis = run("\\lyrics { wobble blah }");
+        let src = "\\lyrics { wobble blah }";
+        let analysis = run(src);
         assert!(analysis.problems.is_empty());
-        assert!(analysis.events.is_empty());
+        assert_eq!(word_values(src, &analysis), vec!["wobble", "blah"]);
+    }
+
+    #[test]
+    fn a_syllable_carries_its_duration_like_any_other_event() {
+        // The reason syllables are events rather than skipped text: lyrics have
+        // rhythm, and an omitted duration is inherited exactly as a note's is.
+        let src = "\\lyricmode { la4 la la8 }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(word_values(src, &analysis), vec!["la4", "la", "la8"]);
+        assert_eq!(durations(&analysis), vec![(2, 0), (2, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn a_quoted_syllable_is_a_word_event_too() {
+        // How a syllable containing spaces or digits is written.
+        let src = "\\lyricmode { \"Ah!\" oh }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(word_values(src, &analysis), vec!["\"Ah!\"", "oh"]);
+    }
+
+    #[test]
+    fn a_users_own_lyrics_context_reads_its_words_as_syllables() {
+        // The construction no TextMate grammar can reach: a context that is
+        // lyrics only by declared alias. `\new MyLyrics` has to resolve the
+        // alias to know its body is a word-valued region.
+        let src = "\\layout { \\context { \\name MyLyrics \\alias Lyrics } }\n\\new MyLyrics { la la }";
+        let analysis = run(src);
+        assert!(analysis.problems.is_empty());
+        assert_eq!(word_values(src, &analysis), vec!["la", "la"]);
     }
 
     #[test]

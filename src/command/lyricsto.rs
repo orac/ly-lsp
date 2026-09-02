@@ -53,10 +53,10 @@ impl Command for LyricstoCommand {
     }
 
     // `StaticCommand::music_context` reads its own stored `context` (fixed
-    // here at `Region::NonNote`, set below); the trait's default
+    // here at `Region::Lyrics`, set below); the trait's default
     // instead always returns `ambient` unchanged, which is right for
     // `\change`'s `Inherit` (indistinguishable from the default either way)
-    // but would silently drop `\lyricsto`'s always-`NonNote` body if left
+    // but would silently drop `\lyricsto`'s always-`Lyrics` body if left
     // unforwarded here, exactly as an earlier draft of this file did — a
     // half-typed `\lyricsto v { you were found }` then misreads its lyric
     // words as notes. Forwarded explicitly so this bespoke wrapper can never
@@ -85,7 +85,7 @@ pub(super) fn command() -> LyricstoCommand {
             "lyricsto",
             LYRICSTO_PARAMS,
             None,
-            Some(Region::NonNote),
+            Some(Region::Lyrics),
             curated(LYRICSTO_DOC),
             &[],
         ),
@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn music_context_is_non_note_not_the_trait_default() {
+    fn music_context_is_lyrics_not_the_trait_default() {
         // The regression this guards: an earlier draft left `music_context`
         // unforwarded, so it fell back to the trait default (return
         // `ambient` unchanged) instead of `StaticCommand`'s stored
@@ -141,6 +141,6 @@ mod tests {
             MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
             &Scope::builtins_only(),
         );
-        assert_eq!(context.region, Region::NonNote);
+        assert_eq!(context.region, Region::Lyrics);
     }
 }

@@ -54,6 +54,8 @@ Definitions and references have to be told apart by range, and a context instanc
 
 **Semantic tokens.** `Arg::ContextType` and `Arg::ContextName` are emitted as `SemanticTokenType::TYPE` and `VARIABLE` respectively, alongside the `KEYWORD` tokens `command-parsing.md` already describes — the same "the grammar can't tell this bare symbol apart from any other without command context" gap, just for these two namespaces. `Staff` in `\new Staff` is, to the grammar, an ordinary `symbol` node; `"vocals"` in `\lyricsto "vocals"` an ordinary `string`. See [`semantic_tokens.rs`](../src/semantic_tokens.rs)'s module doc for why the other argument kinds don't get their own type.
 
+A `Lyrics` context (or anything aliased to one) also decides that its body is `Region::Lyrics`, whose syllables are emitted as `SemanticTokenType::STRING`. That is the one place a context type changes the highlighting of the music *inside* it rather than of the argument naming it, and the reason the context-root table is region-valued: `NON_NOTE_CONTEXT_ROOTS` pairs each root with the region its body reads in, so `\new MyLyrics` — lyrics only by declared `\alias` — highlights its words as syllables, which no TextMate rule could work out.
+
 **Non-note detection.** `\new`/`\context`'s body isn't always read as ordinary note music — `\new Lyrics { la la la }` and `\new ChordNames { c2:m }` hold words and chord symbols respectively, not pitches. `NewContextCommand::music_context` decides this per call by asking `is_non_note(type_name, scope)`, in [`src/command/new_context.rs`](../src/command/new_context.rs).
 
 ## The hand-maintained non-note list

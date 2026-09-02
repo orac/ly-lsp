@@ -280,6 +280,7 @@ fn resolved_signature(doc: &Document) -> Vec<String> {
                 EventKind::MultiMeasureRest => "mmrest".to_string(),
                 EventKind::Skip => "skip".to_string(),
                 EventKind::ChordModeEvent => "chordmode".to_string(),
+                EventKind::WordEvent(region) => format!("word {region:?}"),
             };
             format!("{kind} dur {}", e.duration)
         })

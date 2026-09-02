@@ -477,7 +477,18 @@ pub enum Region {
     /// `:quality`/`/bass`), read for their extent and duration but not their
     /// pitch; nested bare blocks stay chord-music.
     ChordMusic,
-    /// Lyrics, drums, figures, markup, headers — scanned for nested music and
+    /// `\lyricmode`/`\lyrics`/`\addlyrics`/`\lyricsto`, and a `Lyrics`
+    /// context: a word-valued event stream. Every bare symbol and quoted
+    /// string here is a syllable — an event in its own right, carrying an
+    /// optional duration like any other, but never resolved to a pitch;
+    /// nested bare blocks stay lyrics.
+    ///
+    /// Drums and figures want exactly this treatment with a different
+    /// vocabulary, and should become their own regions rather than special
+    /// cases: everything downstream reads
+    /// [`reads_words`](Self::reads_words), not the variant.
+    Lyrics,
+    /// Drums, figures, markup, headers — scanned for nested music and
     /// directives, but bare symbols are not events, and nested bare blocks
     /// stay non-note.
     NonNote,
@@ -495,8 +506,21 @@ impl Region {
         match self {
             Region::NonNote => Region::NonNote,
             Region::ChordMusic => Region::ChordMusic,
+            Region::Lyrics => Region::Lyrics,
             Region::NoteMusic | Region::NoteContext => Region::NoteMusic,
         }
+    }
+
+    /// Whether a bare `symbol` or quoted `string` here is an event in its own
+    /// right, with a word where a note has a pitch: a lyric syllable now, a
+    /// drum name or a figure once those grow their own regions.
+    ///
+    /// The analyser and everything reading its events branch on this rather
+    /// than on [`Lyrics`](Self::Lyrics) itself, so adding the next word-valued
+    /// mode is one variant and one arm here, not a search for every place
+    /// lyrics were named.
+    pub fn reads_words(self) -> bool {
+        matches!(self, Region::Lyrics)
     }
 
     /// This region as a command's body sees it. The one and only difference
@@ -1661,15 +1685,15 @@ struct Row(
 #[rustfmt::skip]
 static RESERVED_ROWS: &[Row] = {
     use NoteEntry::Absolute;
-    use Region::{ChordMusic, NonNote};
+    use Region::{ChordMusic, Lyrics, NonNote};
     &[
         Row(&["alternative"],           MUSIC_ONLY_PARAMS,       None,           None,             Some(ALTERNATIVE_DOC), &[]),
         Row(&["notemode", "notes"],     MUSIC_ONLY_PARAMS,       Some(Absolute), None,             None,                  &[]),
         Row(&["chordmode", "chords"],   MUSIC_ONLY_PARAMS,       None,           Some(ChordMusic), None,                  &[]),
         Row(&["drummode", "drums"],     MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
         Row(&["figuremode", "figures"], MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
-        Row(&["lyricmode", "lyrics"],   MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
-        Row(&["addlyrics"],             MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
+        Row(&["lyricmode", "lyrics"],   MUSIC_ONLY_PARAMS,       None,           Some(Lyrics),     None,                  &[]),
+        Row(&["addlyrics"],             MUSIC_ONLY_PARAMS,       None,           Some(Lyrics),     None,                  &[]),
         Row(&["markup"],                MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
         Row(&["markuplist"],            MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
         Row(&["header"],                MUSIC_ONLY_PARAMS,       None,           Some(NonNote),    None,                  &[]),
@@ -2527,12 +2551,25 @@ mod tests {
     // by the command.
 
     #[test]
-    fn new_lyrics_reads_as_non_note_music() {
+    fn new_lyrics_reads_as_lyrics() {
         // `Scope::builtins_only()` has no install layer and hence no real
-        // `ContextType` for `Lyrics`, so this exercises `is_non_note`'s
+        // `ContextType` for `Lyrics`, so this exercises `context_region`'s
         // fallback: the type name alone is checked against the hand-written
         // root list.
         let call = call("\\new Lyrics { la }").expect("a new call");
+        let context = call.cmd.music_context(
+            &call,
+            MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
+            &Scope::builtins_only(),
+        );
+        assert_eq!(context.region, Region::Lyrics);
+    }
+
+    #[test]
+    fn new_chord_names_still_reads_as_plain_non_note() {
+        // The context roots are region-valued now, so the ones that aren't
+        // lyrics must not have been swept along with them.
+        let call = call("\\new ChordNames { c }").expect("a new call");
         let context = call.cmd.music_context(
             &call,
             MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
@@ -2553,10 +2590,10 @@ mod tests {
     }
 
     #[test]
-    fn a_users_own_alias_of_lyrics_reads_as_non_note_too() {
+    fn a_users_own_alias_of_lyrics_reads_as_lyrics_too() {
         // `\context { \name MyLyrics \alias Lyrics }` teaches the scope a
         // context type this reader has never heard of by that name; it must
-        // still read as non-note by inheriting from its `\alias`, the same
+        // still read as lyrics by inheriting from its `\alias`, the same
         // way a real `\new Lyrics` does.
         let context_src = "\\layout { \\context { \\name MyLyrics \\alias Lyrics } }";
         let context_types: HashMap<String, crate::context::ContextType> =
@@ -2574,7 +2611,7 @@ mod tests {
             MusicContext::new(NoteEntry::Absolute, Region::NoteMusic, fixture_language()),
             &scope,
         );
-        assert_eq!(context.region, Region::NonNote);
+        assert_eq!(context.region, Region::Lyrics);
     }
 
     #[test]

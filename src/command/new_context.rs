@@ -52,28 +52,37 @@ static NEW_CONTEXT_PARAMS: &[Param] = &[
     Param::required("music", ArgKind::Music),
 ];
 
-/// The context types whose body is read as [`Region::NonNote`] rather
-/// than ordinary note music — lyrics, chord names, drum staves and the like,
-/// where a bare symbol means something other than a pitch.
+/// The context types whose body is read as something other than ordinary
+/// note music — lyrics, chord names, drum staves and the like, where a bare
+/// symbol means something other than a pitch — each paired with the
+/// [`Region`] its body reads in.
 ///
 /// Hand-maintained: LilyPond's own initialisation files don't mark a context
 /// type as "reads its body as music" or not anywhere this reader can find,
 /// so there is no way to derive this list from the install the way
 /// [`ContextType`](crate::context::ContextType)'s other fields are derived.
 /// It names *roots* rather than every possible non-note context, because
-/// [`is_non_note`] also follows a type's declared aliases: a user's own
-/// `\context { \name MyLyrics \alias Lyrics }` is non-note by inheriting
+/// [`context_region`] also follows a type's declared aliases: a user's own
+/// `\context { \name MyLyrics \alias Lyrics }` reads as lyrics by inheriting
 /// from a root here, without needing its own entry.
-const NON_NOTE_CONTEXT_ROOTS: &[&str] = &[
-    "Lyrics",
-    "NullVoice",
-    "ChordNames",
-    "FretBoards",
-    "FiguredBass",
-    "Dynamics",
-    "DrumStaff",
-    "DrumVoice",
+const NON_NOTE_CONTEXT_ROOTS: &[(&str, Region)] = &[
+    ("Lyrics", Region::Lyrics),
+    ("NullVoice", Region::NonNote),
+    ("ChordNames", Region::NonNote),
+    ("FretBoards", Region::NonNote),
+    ("FiguredBass", Region::NonNote),
+    ("Dynamics", Region::NonNote),
+    ("DrumStaff", Region::NonNote),
+    ("DrumVoice", Region::NonNote),
 ];
+
+/// The region named by `type_name` if it is one of [`NON_NOTE_CONTEXT_ROOTS`].
+fn root_region(type_name: &str) -> Option<Region> {
+    NON_NOTE_CONTEXT_ROOTS
+        .iter()
+        .find(|(root, _)| *root == type_name)
+        .map(|(_, region)| *region)
+}
 
 /// Whether `type_name` — a context type as written in a `\new`/`\context`
 /// call — reads its body as non-note music: either it names one of
@@ -91,17 +100,16 @@ const NON_NOTE_CONTEXT_ROOTS: &[&str] = &[
 /// the alias check agree on `false` for it. Gating this on `Scope`'s own
 /// install-failed flag too, to mirror `is_known` exactly, would change no
 /// observable behaviour for that reason, so it isn't done.
-fn is_non_note(type_name: &str, scope: &Scope) -> bool {
+fn context_region(type_name: &str, scope: &Scope) -> Option<Region> {
     match scope.get_context_type(type_name) {
-        Some(known) => {
-            NON_NOTE_CONTEXT_ROOTS.contains(&known.value.name.as_str())
-                || known
-                    .value
-                    .aliases
-                    .iter()
-                    .any(|alias| NON_NOTE_CONTEXT_ROOTS.contains(&alias.as_str()))
-        }
-        None => NON_NOTE_CONTEXT_ROOTS.contains(&type_name),
+        Some(known) => root_region(&known.value.name).or_else(|| {
+            known
+                .value
+                .aliases
+                .iter()
+                .find_map(|alias| root_region(alias))
+        }),
+        None => root_region(type_name),
     }
 }
 
@@ -171,11 +179,9 @@ impl Command for NewContextCommand {
             Arg::ContextType { name, .. } => Some(name.as_str()),
             _ => None,
         });
-        match type_name {
-            Some(type_name) if is_non_note(type_name, scope) => {
-                ambient.with_region(Region::NonNote)
-            }
-            _ => ambient,
+        match type_name.and_then(|type_name| context_region(type_name, scope)) {
+            Some(region) => ambient.with_region(region),
+            None => ambient,
         }
     }
 

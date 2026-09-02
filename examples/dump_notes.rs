@@ -72,6 +72,7 @@ fn main() {
             EventKind::MultiMeasureRest => "multi-measure rest".to_string(),
             EventKind::Skip => "skip".to_string(),
             EventKind::ChordModeEvent => "chord-mode entry".to_string(),
+            EventKind::WordEvent(region) => format!("word event ({region:?})"),
         };
         println!("{text:<16} {kind}  dur {}{inherited}", event.duration);
     }
