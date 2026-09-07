@@ -1307,7 +1307,8 @@ mod tests {
         // The construction no TextMate grammar can reach: a context that is
         // lyrics only by declared alias. `\new MyLyrics` has to resolve the
         // alias to know its body is a word-valued region.
-        let src = "\\layout { \\context { \\name MyLyrics \\alias Lyrics } }\n\\new MyLyrics { la la }";
+        let src =
+            "\\layout { \\context { \\name MyLyrics \\alias Lyrics } }\n\\new MyLyrics { la la }";
         let analysis = run(src);
         assert!(analysis.problems.is_empty());
         assert_eq!(word_values(src, &analysis), vec!["la", "la"]);

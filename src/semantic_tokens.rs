@@ -115,7 +115,11 @@ pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
             Arg::ContextName { span, .. } => Some((*span, context_name)),
             _ => None,
         })
-        .chain(lyric_syllables(doc).into_iter().map(|span| (span, syllable)))
+        .chain(
+            lyric_syllables(doc)
+                .into_iter()
+                .map(|span| (span, syllable)),
+        )
         .collect();
     // This sort keeps a merge of
     // several *kinds* — a `\new Staff` inside a `\repeat volta 2`, or the
@@ -126,7 +130,7 @@ pub fn semantic_tokens_full(doc: &Document) -> Vec<SemanticToken> {
 }
 
 /// Every lyric syllable in `doc`, in no particular order (the caller sorts).
-/// 
+///
 /// This filters the already-collected list of [`EventKind::WordEvent`].
 ///
 /// The span stops at [`value_end`](Event::value_end) rather than covering the
