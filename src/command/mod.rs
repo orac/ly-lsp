@@ -1559,6 +1559,24 @@ static VOLTA_PARAMS: &[Param] = &[
     Param::required("numbers", ArgKind::NumberList),
     Param::required("music", ArgKind::Music),
 ];
+/// Shared by `\%` and `\*`, the 2.26 abbreviations for `\repeat percent` and
+/// `\repeat unfold`.
+static REPEAT_ABBREVIATION_PARAMS: &[Param] = &[
+    Param::required("count", ArgKind::Count),
+    Param::required("music", ArgKind::Music),
+];
+/// `\=`'s two arguments, given the [`ArgKind::Unknown`] shape their
+/// predicates would get anyway if `\=`'s definition were readable at all
+/// (`scheme::arg_kind` maps neither `key?` nor `ly:event?`): `id`, most often
+/// the `unsigned_integer` of `c\=1(`, occasionally a bare symbol instead
+/// (which `Unknown` can't claim — see [`looks_like_a_typed_shape`] — so that
+/// spelling still reads as an unrecognised call, same as before this table
+/// existed); and `event`, the spanner/articulation `\=` labels — `(`, `~`,
+/// `-1`, … — always a single `punctuation` or similar node right after it.
+static ID_EVENT_PARAMS: &[Param] = &[
+    Param::required("id", ArgKind::Unknown(Cow::Borrowed("key?"))),
+    Param::required("event", ArgKind::Unknown(Cow::Borrowed("ly:event?"))),
+];
 /// The `duration = value` clause inside [`TEMPO_PARAMS`], named separately
 /// because a `static`'s initialiser can't hold an inline temporary slice of
 /// non-`Copy` [`Param`]s.
@@ -1628,6 +1646,13 @@ const ALTERNATIVE_DOC: &str = "Supplies the alternate endings for an enclosing `
      or `\\repeat segno`: one `{ … }` block per ending, in order, inside `music`.";
 const VOLTA_DOC: &str = "Marks `music` as belonging to volta (numbered ending) `numbers`, \
      inside an enclosing `\\repeat`.";
+const PERCENT_ABBREVIATION_DOC: &str =
+    "Since LilyPond 2.26: the same as `\\repeat percent count music`.";
+const UNFOLD_ABBREVIATION_DOC: &str =
+    "Since LilyPond 2.26: the same as `\\repeat unfold count music`.";
+const ID_DOC: &str = "Assigns `id` (an integer or symbol) to `event`, the spanner or item it \
+     immediately precedes — `c\\=1( d\\=2( e\\=1) f\\=2)` tells LilyPond which slur start \
+     each stop belongs to when they overlap.";
 const TEMPO_DOC: &str =
     "Sets the tempo. `\\tempo \"Allegro\" 4=120` Either argument may be omitted.";
 const CLEF_DOC: &str =
@@ -1678,6 +1703,22 @@ struct Row(
 /// body from elsewhere in the file, none of which lexical enclosure can see.
 /// So it's a plain row with no validation at all.
 ///
+/// `\%`, `\*` (2.26's abbreviations for `\repeat percent`/`\repeat unfold`)
+/// and `\=` (spanner/item ID assignment) are here rather than in
+/// [`CURATED_ROWS`] for a narrower reason: the
+/// install genuinely defines them in `ly/music-functions-init.ly`, as
+/// ordinary `define-music-function`s — but bound to the *string* `"\\%"`
+/// rather than a bare symbol, which is how LilyPond spells a name its own
+/// grammar can't write as an identifier. Our grammar dependency's
+/// `assignment_lhs` only ever matches `symbol`/`property_expression`
+/// (`tree-sitter-lilypond`'s `rules.js`), so that assignment is invisible to
+/// [`scheme::read`](scheme::read) and [`install::load`](crate::install::load)
+/// alike — reading it would mean patching the vendored grammar, not this
+/// crate. Practically indistinguishable, then, from a name nothing defines,
+/// which is what earns it a place here instead: [`CURATED_ROWS`]'s invariant
+/// (the install must define every name in it) would fail for both on every
+/// install.
+///
 /// `#[rustfmt::skip]`: rustfmt's default heuristics only hold a call onto one
 /// line up to 60% of `max_width`, which would break most of these rows onto
 /// five lines apiece — exactly the wall of near-duplicated shape this table
@@ -1704,6 +1745,9 @@ static RESERVED_ROWS: &[Row] = {
         Row(&["set"],                   PROPERTY_PARAMS,         None,           None,             None,                  &[]),
         Row(&["unset"],                 PROPERTY_PARAMS,         None,           None,             None,                  &[]),
         Row(&["tempo"],                 TEMPO_PARAMS,            None,           None,             Some(TEMPO_DOC),       &[]),
+        Row(&["%"],                     REPEAT_ABBREVIATION_PARAMS, None,        None,             Some(PERCENT_ABBREVIATION_DOC), &[]),
+        Row(&["*"],                     REPEAT_ABBREVIATION_PARAMS, None,        None,             Some(UNFOLD_ABBREVIATION_DOC),  &[]),
+        Row(&["="],                     ID_EVENT_PARAMS,            None,        None,             Some(ID_DOC),                   &[]),
     ]
 };
 
