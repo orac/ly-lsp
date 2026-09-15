@@ -1,13 +1,15 @@
 //! The "unfold repeat" refactoring. With the cursor in a `\repeat <kind> <n>`
-//! header, expand the body into `n` literal copies and drop the `\repeat`
-//! wrapper, processing `\volta` so each filtered copy keeps only the music for
-//! its repeat and distributing an `\alternative` block's endings across the
-//! copies. The `\alternative` may sit inside the body (modern) or follow it
-//! (older), and its endings may be plain `{ }` blocks taken positionally or
-//! `\volta`-tagged with the repeats they belong to. The body may be a `{ … }`
-//! block or a single braceless note or chord (`\repeat percent 4 c2`). When the
-//! body's braces straddle line breaks, the copies are laid out one per line,
-//! indented to match the `\repeat`; otherwise they sit on one line.
+//! header — or `\% <n>`/`\* <n>`, 2.26's abbreviations for `\repeat percent
+//! <n>`/`\repeat unfold <n>` — expand the body into `n` literal copies and
+//! drop the wrapper, processing `\volta` so each filtered copy keeps only the
+//! music for its repeat and distributing an `\alternative` block's endings
+//! across the copies. The `\alternative` may sit inside the body (modern) or
+//! follow it (older), and its endings may be plain `{ }` blocks taken
+//! positionally or `\volta`-tagged with the repeats they belong to. The body
+//! may be a `{ … }` block or a single braceless note or chord (`\repeat
+//! percent 4 c2`). When the body's braces straddle line breaks, the copies
+//! are laid out one per line, indented to match the `\repeat`/`\%`/`\*`;
+//! otherwise they sit on one line.
 //!
 //! The wrinkle is octaves and durations. LilyPond resolves `\relative` (and
 //! duration inheritance) over the *folded* body once, so `\unfoldRepeats`
@@ -88,20 +90,29 @@ struct Repeat {
     block: Option<Span>,
 }
 
-/// Locates and fully validates the repeat the cursor sits in: a `\repeat` whose
-/// header (keyword, kind, count) the cursor is on, of an unfoldable kind, with a
-/// count of at least one and a body. The whole availability check, so `offer`
-/// is just `is_some` and `resolve` re-derives the same thing.
+/// Locates and fully validates the repeat the cursor sits in: a `\repeat`
+/// (or `\%`/`\*`) whose header (keyword, kind, count) the cursor is on, of an
+/// unfoldable kind, with a count of at least one and a body. The whole
+/// availability check, so `offer` is just `is_some` and `resolve` re-derives
+/// the same thing.
 fn repeat_at(document: &Document, selection: Range) -> Option<Repeat> {
     let offset = document.line_index().offset_at(selection.start)?;
     let call = document.commands().iter().find(|call| {
-        call.name == "repeat" && {
+        matches!(call.name.as_str(), "repeat" | "%" | "*") && {
             let header = call.header();
             header.start <= offset && offset <= header.end
         }
     })?;
 
-    let kind = bare_word(call)?;
+    // `\%`/`\*` carry no `kind` bareword of their own — they stand for one
+    // fixed kind each, the same one `\repeat percent`/`\repeat unfold` would
+    // name explicitly.
+    let kind = match call.name.as_str() {
+        "repeat" => bare_word(call)?,
+        "%" => "percent",
+        "*" => "unfold",
+        _ => unreachable!("filtered to these three names above"),
+    };
     if !UNFOLDABLE_KINDS.contains(&kind) {
         return None;
     }

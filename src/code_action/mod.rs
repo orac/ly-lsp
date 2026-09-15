@@ -12,6 +12,7 @@
 //!
 //! [`data`]: tower_lsp::lsp_types::CodeAction::data
 
+pub mod expand_repeat_abbreviation;
 pub mod extract_to_variable;
 pub mod inline_repeats;
 pub mod inline_variable;
@@ -27,6 +28,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::Document;
+use expand_repeat_abbreviation::ExpandRepeatAbbreviation;
 use extract_to_variable::ExtractToVariable;
 use inline_repeats::InlineRepeats;
 use inline_variable::{InlineAll, InlineHere};
@@ -92,6 +94,7 @@ struct ResolveData {
 /// (title and kind only — the edits come later, from [`resolve`]).
 pub fn offer_all(document: &Document, uri: &Url, selection: Range) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
+    offer::<ExpandRepeatAbbreviation>(document, uri, selection, &mut actions);
     offer::<ExtractToVariable>(document, uri, selection, &mut actions);
     offer::<InlineAll>(document, uri, selection, &mut actions);
     offer::<InlineHere>(document, uri, selection, &mut actions);
@@ -146,6 +149,7 @@ pub fn resolve(document: &Document, mut action: LspCodeAction) -> LspCodeAction 
     };
 
     let resolved = match data.id.as_str() {
+        ExpandRepeatAbbreviation::ID => ExpandRepeatAbbreviation::resolve(document, data.selection),
         ExtractToVariable::ID => ExtractToVariable::resolve(document, data.selection),
         InlineAll::ID => InlineAll::resolve(document, data.selection),
         InlineHere::ID => InlineHere::resolve(document, data.selection),
